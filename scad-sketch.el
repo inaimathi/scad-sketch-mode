@@ -1,6 +1,6 @@
 ;;; scad-sketch.el --- Keyboard sketch editor for OpenSCAD arrays -*- lexical-binding: t; -*-
 
-;; Author: Leo Zovic + ChatGPT
+;; Author: inaimathi + Claude + ChatGPT
 ;; Version: 0.2.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: cad, openscad, svg, tools
@@ -511,43 +511,58 @@ Returns plist (:name :beg :end :text)."
   "Return XY shifted by DX, DY."
   (list (+ (float (nth 0 xy)) dx) (+ (float (nth 1 xy)) dy)))
 
-(defun scad-sketch--move-point (dx dy)
-  "Move the cursor by DX, DY."
+(defun scad-sketch--snap-to-grid (v grid)
+  "Round V to the nearest multiple of GRID."
+  (* grid (round (/ v grid))))
+
+(defun scad-sketch--snap-xy (xy grid)
+  "Snap both coordinates of XY to GRID."
+  (list (scad-sketch--snap-to-grid (nth 0 xy) grid)
+        (scad-sketch--snap-to-grid (nth 1 xy) grid)))
+
+(defun scad-sketch--move-point (dx dy &optional snap)
+  "Move the cursor by DX, DY.
+When SNAP is non-nil, snap the result to the session grid."
   (scad-sketch--mutate
    (lambda (s)
-     (setf (scad-sketch-session-point s)
-           (scad-sketch--move-xy (scad-sketch-session-point s) dx dy)))))
+     (let ((new (scad-sketch--move-xy (scad-sketch-session-point s) dx dy)))
+       (setf (scad-sketch-session-point s)
+             (if snap
+                 (scad-sketch--snap-xy new (scad-sketch--grid s))
+               new))))))
 
-(defun scad-sketch--move-selected (dx dy)
-  "Move the selected vertex by DX, DY."
+(defun scad-sketch--move-selected (dx dy &optional snap)
+  "Move the selected vertex by DX, DY.
+When SNAP is non-nil, snap the result to the session grid."
   (scad-sketch--mutate
    (lambda (s)
      (let* ((old    (or (scad-sketch--selected-point s) (user-error "No selected point")))
             (new-xy (scad-sketch--move-xy (scad-sketch--point-xy old) dx dy))
-            (new    (scad-sketch--make-model-point new-xy s old)))
+            (snapped (if snap (scad-sketch--snap-xy new-xy (scad-sketch--grid s)) new-xy))
+            (new    (scad-sketch--make-model-point snapped s old)))
        (scad-sketch--set-selected-point s new)
-       (setf (scad-sketch-session-point s) new-xy)))))
+       (setf (scad-sketch-session-point s) snapped)))))
 
 (defun scad-sketch--grid   (s) (float (scad-sketch-session-grid s)))
 (defun scad-sketch--fine   (s) (float (scad-sketch-session-fine-step s)))
 (defun scad-sketch--coarse (s) (float (scad-sketch-session-coarse-step s)))
 
-(defun scad-sketch-move-point-left ()         (interactive) (scad-sketch--move-point (- (scad-sketch--grid   (scad-sketch--assert-session))) 0))
-(defun scad-sketch-move-point-right ()        (interactive) (scad-sketch--move-point    (scad-sketch--grid   (scad-sketch--assert-session))  0))
-(defun scad-sketch-move-point-up ()           (interactive) (scad-sketch--move-point 0  (scad-sketch--grid   (scad-sketch--assert-session))))
-(defun scad-sketch-move-point-down ()         (interactive) (scad-sketch--move-point 0  (- (scad-sketch--grid   (scad-sketch--assert-session)))))
+(defun scad-sketch-move-point-left ()         (interactive) (scad-sketch--move-point (- (scad-sketch--grid   (scad-sketch--assert-session))) 0 t))
+(defun scad-sketch-move-point-right ()        (interactive) (scad-sketch--move-point    (scad-sketch--grid   (scad-sketch--assert-session))  0 t))
+(defun scad-sketch-move-point-up ()           (interactive) (scad-sketch--move-point 0  (scad-sketch--grid   (scad-sketch--assert-session))    t))
+(defun scad-sketch-move-point-down ()         (interactive) (scad-sketch--move-point 0  (- (scad-sketch--grid   (scad-sketch--assert-session))) t))
 (defun scad-sketch-move-point-fine-left ()    (interactive) (scad-sketch--move-point (- (scad-sketch--fine   (scad-sketch--assert-session))) 0))
 (defun scad-sketch-move-point-fine-right ()   (interactive) (scad-sketch--move-point    (scad-sketch--fine   (scad-sketch--assert-session))  0))
 (defun scad-sketch-move-point-fine-up ()      (interactive) (scad-sketch--move-point 0  (scad-sketch--fine   (scad-sketch--assert-session))))
 (defun scad-sketch-move-point-fine-down ()    (interactive) (scad-sketch--move-point 0  (- (scad-sketch--fine   (scad-sketch--assert-session)))))
-(defun scad-sketch-move-point-coarse-left ()  (interactive) (scad-sketch--move-point (- (scad-sketch--coarse (scad-sketch--assert-session))) 0))
-(defun scad-sketch-move-point-coarse-right () (interactive) (scad-sketch--move-point    (scad-sketch--coarse (scad-sketch--assert-session))  0))
-(defun scad-sketch-move-point-coarse-up ()    (interactive) (scad-sketch--move-point 0  (scad-sketch--coarse (scad-sketch--assert-session))))
-(defun scad-sketch-move-point-coarse-down ()  (interactive) (scad-sketch--move-point 0  (- (scad-sketch--coarse (scad-sketch--assert-session)))))
-(defun scad-sketch-move-selected-left ()      (interactive) (scad-sketch--move-selected (- (scad-sketch--grid (scad-sketch--assert-session))) 0))
-(defun scad-sketch-move-selected-right ()     (interactive) (scad-sketch--move-selected    (scad-sketch--grid (scad-sketch--assert-session))  0))
-(defun scad-sketch-move-selected-up ()        (interactive) (scad-sketch--move-selected 0  (scad-sketch--grid (scad-sketch--assert-session))))
-(defun scad-sketch-move-selected-down ()      (interactive) (scad-sketch--move-selected 0  (- (scad-sketch--grid (scad-sketch--assert-session)))))
+(defun scad-sketch-move-point-coarse-left ()  (interactive) (scad-sketch--move-point (- (scad-sketch--coarse (scad-sketch--assert-session))) 0 t))
+(defun scad-sketch-move-point-coarse-right () (interactive) (scad-sketch--move-point    (scad-sketch--coarse (scad-sketch--assert-session))  0 t))
+(defun scad-sketch-move-point-coarse-up ()    (interactive) (scad-sketch--move-point 0  (scad-sketch--coarse (scad-sketch--assert-session))    t))
+(defun scad-sketch-move-point-coarse-down ()  (interactive) (scad-sketch--move-point 0  (- (scad-sketch--coarse (scad-sketch--assert-session))) t))
+(defun scad-sketch-move-selected-left ()      (interactive) (scad-sketch--move-selected (- (scad-sketch--grid (scad-sketch--assert-session))) 0 t))
+(defun scad-sketch-move-selected-right ()     (interactive) (scad-sketch--move-selected    (scad-sketch--grid (scad-sketch--assert-session))  0 t))
+(defun scad-sketch-move-selected-up ()        (interactive) (scad-sketch--move-selected 0  (scad-sketch--grid (scad-sketch--assert-session))    t))
+(defun scad-sketch-move-selected-down ()      (interactive) (scad-sketch--move-selected 0  (- (scad-sketch--grid (scad-sketch--assert-session))) t))
 
 ;;; Mark commands
 
