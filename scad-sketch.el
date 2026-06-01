@@ -1,48 +1,79 @@
 ;;; scad-sketch.el --- Keyboard sketch editor for OpenSCAD arrays -*- lexical-binding: t; -*-
 
-;; Author: inaimathi + Claude + ChatGPT
-;; Version: 0.2.0
+;; Author: inaimathi, Claude Sonnet
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: cad, openscad, svg, tools
 
 ;;; Commentary:
 
-;; First-cut keyboard/SVG sketch editor for OpenSCAD array literals.
+;; Keyboard-driven SVG sketch editor for OpenSCAD point-array literals.
+;; Supports plain 2D polygons and polyRound-style rounded polygons.
 ;;
-;; Usage in a .scad buffer:
-;;
-;;   // scad-sketch: name=profile kind=2d closed=true grid=1 units=mm
-;;   profile = [
-;;     [0, 0],
-;;     [40, 0],
-;;     [40, 12],
-;;     [0, 12]
-;;   ];
-;;   // end-scad-sketch
-;;
-;; Put point inside the block and run:
+;; QUICK START
+;; -----------
+;; In any .scad buffer, position point inside or at the opening line of a
+;; literal array assignment and run:
 ;;
 ;;   M-x scad-sketch-at-point
 ;;
-;; To open the editor on an existing array, or insert a fresh one if none
-;; is found at point, run:
+;; To open or create: if no array is found at point, a fresh named array is
+;; inserted and opened immediately:
 ;;
-;;   M-x scad-sketch-or-insert-at-point
+;;   M-x scad-sketch-or-insert-at-point   (C-c C-. in scad-sketch-mode)
 ;;
-;; To wrap an existing literal array assignment in scad-sketch comments:
+;; To annotate an existing bare array with scad-sketch metadata comments:
 ;;
-;;   M-x scad-sketch-adopt-array-at-point
+;;   M-x scad-sketch-adopt-array-at-point  (C-c C-a in scad-sketch-mode)
 ;;
-;; Supported kind values:
-;;   kind=2d              -> emits [[x, y], ...]
-;;   kind=2d-with-curves  -> emits [[x, y, r], ...], polyRound-style radii
+;; ARRAY KINDS
+;; -----------
+;; kind=2d              [[x, y], ...]          plain polygon vertices
+;; kind=2d-with-curves  [[x, y, r], ...]       polyRound radii at each vertex
 ;;
-;; Kind is inferred automatically from existing arrays:
-;;   2-column arrays -> kind=2d
-;;   3-column arrays -> kind=2d-with-curves
+;; Kind is inferred automatically when opening bare arrays:
+;;   all 2-column points  ->  kind=2d
+;;   any 3-column points  ->  kind=2d-with-curves
 ;;
-;; This is intentionally not a general SVG editor. SVG is just the view;
-;; OpenSCAD-ish points are the model and output.
+;; METADATA COMMENT FORMAT
+;; -----------------------
+;; Blocks are delimited by:
+;;
+;;   // scad-sketch: name=NAME kind=KIND closed=true grid=1 units=mm
+;;   NAME = [ ... ];
+;;   // end-scad-sketch
+;;
+;; Optional metadata keys: fine=0.1  coarse=5
+;;
+;; EDITOR
+;; ------
+;; The editor buffer shows an SVG canvas with the polygon and a live array
+;; preview below it.  Use `describe-mode' (C-h m) or press `?' to see all
+;; key bindings.
+;;
+;; Key highlights:
+;;   arrows / C-arrows / M-arrows  move cursor (grid / coarse / fine)
+;;   M-arrows go off-grid; arrows and C-arrows snap back to grid
+;;   S-arrows                      move the selected vertex
+;;   TAB / S-TAB                   cycle through vertices
+;;   p / i / k                     append / insert-after-selected / delete vertex
+;;   m / M / ` / ' / C            set / push / pop / jump / clear marks
+;;   i with marks set              inserts mark points then cursor point after selected
+;;   l / r                         line or rectangle from marks
+;;   R                             set polyRound radius on selected vertex
+;;   w / q                         write back to source buffer / quit
+;;
+;; POLYROUND RADII
+;; ---------------
+;; For kind=2d-with-curves, each vertex carries an optional rounding radius
+;; compatible with the Round-Anything/polyround.scad library.  The sketch
+;; renders the actual arc geometry (including edge-length capping) so what
+;; you see matches what OpenSCAD produces.  A dashed circle around each
+;; rounded vertex shows the effective radius; it turns orange and displays
+;; "r=REQ->ACT" when the radius has been capped by a short adjacent edge.
+;;
+;; This is intentionally not a general SVG editor.  SVG is just the view;
+;; OpenSCAD-compatible point arrays are the model and output.
 
 ;;; Code:
 
@@ -102,11 +133,11 @@
 
 (defvar scad-sketch-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-c C-s") #'scad-sketch-at-point)
     (define-key map (kbd "C-c C-a") #'scad-sketch-adopt-array-at-point)
-    (define-key map (kbd "C-c C-o") #'scad-sketch-or-insert-at-point)
+    (define-key map (kbd "C-c C-.") #'scad-sketch-or-insert-at-point)
     map)
-  "Keymap for `scad-sketch-mode'.")
+  "Keymap for `scad-sketch-mode'.
+C-c C-s and C-c C-o are intentionally left free for `scad-mode'.")
 
 ;;;###autoload
 (define-minor-mode scad-sketch-mode
@@ -166,7 +197,56 @@
   "Keymap for `scad-sketch-editor-mode'.")
 
 (define-derived-mode scad-sketch-editor-mode special-mode "SCAD-Sketch"
-  "Major mode for editing one OpenSCAD sketch block."
+  "Major mode for the scad-sketch visual editor.
+
+The buffer shows an SVG canvas followed by a live OpenSCAD array preview.
+
+The canvas displays:
+  - a grid (step set with `g')
+  - the polygon path with arcs where polyRound radii are set
+  - vertex dots numbered from 0; the selected vertex is highlighted in orange
+  - dashed radius circles on rounded vertices (orange = capped by edge length)
+  - the cursor crosshair in blue, marks in green
+  - a status bar: name, kind, grid size, cursor coords, dirty flag
+
+Movement:
+  <arrow>             move cursor one grid step; snaps to grid
+  C-<arrow>           move cursor one coarse step; snaps to grid
+  M-<arrow>           move cursor one fine step; intentionally off-grid
+  S-<arrow>           move selected vertex one grid step
+
+Vertex editing:
+  TAB / S-TAB         select next / previous vertex (cursor jumps to it)
+  p                   append cursor as a new vertex at end of array
+  i                   insert cursor after selected vertex; if marks are set,
+                        inserts each mark (oldest first) then cursor
+  k                   delete the selected vertex
+
+Marks:
+  m                   replace all marks with cursor position
+  M                   push cursor position onto mark stack
+  `                   pop most recent mark and jump cursor there
+  '                   jump cursor to most recent mark (non-destructive)
+  C                   clear all marks
+
+Geometry:
+  x / y               set cursor X or Y coordinate
+  X / Y               set cursor X or Y relative to most recent mark (delta)
+  d                   set distance from mark, preserving angle
+  a                   set angle from mark in degrees, preserving distance
+  R                   set polyRound radius on selected vertex
+  c                   toggle closed / open polygon
+  l                   append marks (oldest first) then cursor as vertices
+  r                   append rectangle from most recent mark to cursor
+  g                   change grid step
+
+Session:
+  w                   write array back to source buffer
+  u                   undo
+  q                   quit (offers to write back if dirty)
+  ?                   key summary in the echo area
+
+\{scad-sketch-editor-mode-map}"
   (setq truncate-lines t)
   (setq buffer-read-only t))
 
@@ -1169,22 +1249,10 @@ on a short edge never produce overlapping/reversed segments."
         (insert-image (svg-image svg :ascent 'center))
         (remove-text-properties beg (point) '(keymap nil)))
       (insert "\n\n")
-      (insert (scad-sketch--status-text session))
+      (insert (scad-sketch--emit-content session))
       (goto-char (point-min)))))
 
-(defun scad-sketch--status-text (session)
-  "Return the text help block."
-  (concat
-   "Keys: arrows=move point  M-arrows=fine  C-arrows=coarse  S-arrows=move selected\n"
-   "      m=set mark  M=push mark  `=pop mark  '=jump to mark  C=clear marks\n"
-   "      p=append point  i=insert after selected (uses marks if set)  k=delete\n"
-   "      l=line from marks  r=rect from mark  c=toggle closed  R=set radius\n"
-   "      TAB/S-TAB=select  x/y=set coord  X/Y=delta from mark  d=distance  a=angle\n"
-   "      g=grid  u=undo  w=write back  q=quit  ?=help\n\n"
-   (format "Source:  %s\n" (buffer-name (scad-sketch-session-source-buffer session)))
-   (format "Points:  %d\n" (length (scad-sketch-session-points session)))
-   (format "Marks:   %d\n" (length (scad-sketch-session-marks session)))
-   (format "Array preview:\n%s" (scad-sketch--emit-content session))))
+
 
 ;;; Output
 
@@ -1251,10 +1319,16 @@ on a short edge never produce overlapping/reversed segments."
   (kill-buffer (current-buffer)))
 
 (defun scad-sketch-help ()
-  "Show key help."
+  "Display a key binding summary in the echo area.
+For full documentation use \\[describe-mode]."
   (interactive)
-  (message "%s" (replace-regexp-in-string "\n" "  "
-                                          (scad-sketch--status-text (scad-sketch--assert-session)))))
+  (scad-sketch--assert-session)
+  (message (concat "arrows=move  C-arrows=coarse  M-arrows=fine(off-grid)  S-arrows=move-vertex | "
+                   "TAB/S-TAB=select  p=append  i=insert  k=delete | "
+                   "m=set-mark  M=push  `=pop  '=jump  C=clear | "
+                   "R=radius  c=closed  l=line  r=rect | "
+                   "x/y=coord  X/Y=delta  d=dist  a=angle  g=grid | "
+                   "w=write  u=undo  q=quit  C-h m=full help")))
 
 ;;; Adopting existing arrays
 
