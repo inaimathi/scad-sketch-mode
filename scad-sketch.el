@@ -864,37 +864,52 @@ The last inserted point becomes the new selection."
       (scad-sketch--svg-line svg transform (list min-x 0) (list max-x 0)
                              :stroke "#d0d0d0" :stroke-width 2))))
 
-(defun scad-sketch--corner-geometry (A B C r)
-  "Compute polyRound arc geometry for a corner at model point B with radius R.
-A and B are the neighbouring model points [x y].
-Returns a plist (:t1 T1 :t2 T2 :sweep S) where T1 is the tangent point on
-BA, T2 is the tangent point on BC, and S is the SVG sweep flag (0 or 1).
-Returns nil when R is zero or the geometry is degenerate."
-  (when (and r (> r 0))
-    (let* ((bx (nth 0 B)) (by (nth 1 B))
-           (ba (list (- (nth 0 A) bx) (- (nth 1 A) by)))
-           (bc (list (- (nth 0 C) bx) (- (nth 1 C) by)))
-           (len-ba (sqrt (+ (* (nth 0 ba) (nth 0 ba)) (* (nth 1 ba) (nth 1 ba)))))
-           (len-bc (sqrt (+ (* (nth 0 bc) (nth 0 bc)) (* (nth 1 bc) (nth 1 bc))))))
-      (when (and (> len-ba 1e-10) (> len-bc 1e-10))
-        (let* ((u (list (/ (nth 0 ba) len-ba) (/ (nth 1 ba) len-ba)))
-               (v (list (/ (nth 0 bc) len-bc) (/ (nth 1 bc) len-bc)))
-               (dot (max -1.0 (min 1.0 (+ (* (nth 0 u) (nth 0 v))
-                                           (* (nth 1 u) (nth 1 v))))))
-               (angle-uv (acos dot))
-               (half (/ angle-uv 2)))
-          (when (> (sin half) 1e-10)
-            (let* ((t-len (min (* r (/ 1.0 (tan half)))
-                               (* len-ba 0.99)
-                               (* len-bc 0.99)))
-                   (actual-r (* t-len (tan half)))
-                   (t1 (list (+ bx (* t-len (nth 0 u))) (+ by (* t-len (nth 1 u)))))
-                   (t2 (list (+ bx (* t-len (nth 0 v))) (+ by (* t-len (nth 1 v)))))
-                   ;; sweep: cross product of u,v > 0 → right turn → CW arc → sweep=1
-                   (cross (- (* (nth 0 u) (nth 1 v)) (* (nth 1 u) (nth 0 v))))
-                   (sweep (if (> cross 0) 1 0)))
-              (list :t1 t1 :t2 t2 :radius actual-r :sweep sweep))))))))
+(defun scad-sketch--corner-unit-vecs (A B C)
+  "Return (U V HALF-ANGLE) for the corner at B, or nil if degenerate."
+  (let* ((bx (nth 0 B)) (by (nth 1 B))
+         (ba (list (- (nth 0 A) bx) (- (nth 1 A) by)))
+         (bc (list (- (nth 0 C) bx) (- (nth 1 C) by)))
+         (len-ba (sqrt (+ (* (nth 0 ba) (nth 0 ba)) (* (nth 1 ba) (nth 1 ba)))))
+         (len-bc (sqrt (+ (* (nth 0 bc) (nth 0 bc)) (* (nth 1 bc) (nth 1 bc))))))
+    (when (and (> len-ba 1e-10) (> len-bc 1e-10))
+      (let* ((u    (list (/ (nth 0 ba) len-ba) (/ (nth 1 ba) len-ba)))
+             (v    (list (/ (nth 0 bc) len-bc) (/ (nth 1 bc) len-bc)))
+             (dot  (max -1.0 (min 1.0 (+ (* (nth 0 u) (nth 0 v))
+                                          (* (nth 1 u) (nth 1 v))))))
+             (half (/ (acos dot) 2)))
+        (when (> (sin half) 1e-10)
+          (list u v half))))))
 
+(defun scad-sketch--corner-geometry-from-tlens (B u v half t1-len t2-len)
+  "Build a corner plist from pre-clamped tangent lengths.
+T1-LEN is the tangent along the incoming edge (toward prev point).
+T2-LEN is the tangent along the outgoing edge (toward next point).
+Uses the minimum to ensure a valid circular arc."
+  (let* ((bx     (nth 0 B)) (by (nth 1 B))
+         (t-len  (min t1-len t2-len))
+         (actual-r (* t-len (tan half)))
+         (t1    (list (+ bx (* t-len (nth 0 u))) (+ by (* t-len (nth 1 u)))))
+         (t2    (list (+ bx (* t-len (nth 0 v))) (+ by (* t-len (nth 1 v)))))
+         (cross (- (* (nth 0 u) (nth 1 v)) (* (nth 1 u) (nth 0 v))))
+         (sweep (if (> cross 0) 1 0)))
+    (list :t1 t1 :t2 t2 :radius actual-r :sweep sweep)))
+
+(defun scad-sketch--corner-geometry (A B C r)
+  "Compute polyRound arc geometry for corner at B with radius R.
+Returns plist (:t1 :t2 :radius :sweep), or nil if degenerate.
+Uses 0.49*edge-length clamping per side.  For path rendering use
+`scad-sketch--polyround-path-d' which does proper edge-pair clamping."
+  (when (and r (> r 0))
+    (let ((uvh (scad-sketch--corner-unit-vecs A B C)))
+      (when uvh
+        (let* ((u    (nth 0 uvh)) (v (nth 1 uvh)) (half (nth 2 uvh))
+               (bx   (nth 0 B))  (by (nth 1 B))
+               (ba   (list (- (nth 0 A) bx) (- (nth 1 A) by)))
+               (bc   (list (- (nth 0 C) bx) (- (nth 1 C) by)))
+               (l-ba (sqrt (+ (* (nth 0 ba) (nth 0 ba)) (* (nth 1 ba) (nth 1 ba)))))
+               (l-bc (sqrt (+ (* (nth 0 bc) (nth 0 bc)) (* (nth 1 bc) (nth 1 bc)))))
+               (t-len (min (/ r (tan half)) (* l-ba 0.49) (* l-bc 0.49))))
+          (scad-sketch--corner-geometry-from-tlens B u v half t-len t-len))))))
 (defun scad-sketch--pixel-radius (model-r transform)
   "Convert model-space radius MODEL-R to screen pixels via TRANSFORM."
   (let* ((o  (funcall transform '(0 0)))
@@ -903,57 +918,96 @@ Returns nil when R is zero or the geometry is degenerate."
          (dy (- (nth 1 r) (nth 1 o))))
     (sqrt (+ (* dx dx) (* dy dy)))))
 
+(defun scad-sketch--edge-len (P Q)
+  "Model-space distance between points P and Q."
+  (let ((dx (- (nth 0 Q) (nth 0 P)))
+        (dy (- (nth 1 Q) (nth 1 P))))
+    (sqrt (+ (* dx dx) (* dy dy)))))
+
 (defun scad-sketch--polyround-path-d (points closed transform)
   "Build an SVG path data string for POINTS with polyRound radii.
 POINTS are model-space [x y r] triples (r may be nil/0).
 CLOSED determines whether to end with Z.
 TRANSFORM converts model [x y] to screen [px py].
-Returns nil if fewer than 2 points."
+Returns nil if fewer than 2 points.
+
+Uses edge-aware tangent-length clamping so that adjacent rounded corners
+on a short edge never produce overlapping/reversed segments."
   (let ((n (length points)))
     (when (>= n 2)
-      (let ((corners (make-vector n nil))
-            (parts   '()))
-        ;; Compute arc geometry for each point with r>0 and valid neighbours.
+      (let* (;; Step 1: compute ideal tangent lengths for each corner on each edge.
+             ;; t-out[i] = ideal t_len from point[i] toward point[i+1]
+             ;; t-in[i]  = ideal t_len from point[i] toward point[i-1]
+             ;; These may overlap on short edges; we clamp in step 2.
+             (t-out (make-vector n 0.0))
+             (t-in  (make-vector n 0.0))
+             (uvh-vec (make-vector n nil)))  ; cached unit vecs + half-angle
+        ;; Compute unit vectors and ideal tangent lengths.
         (dotimes (i n)
           (let ((r (nth 2 (nth i points))))
             (when (and r (> r 0))
-              (let ((prev (cond ((> i 0)      (nth (1- i) points))
-                                (closed        (nth (1- n) points))))
-                    (next (cond ((< i (1- n)) (nth (1+ i) points))
-                                (closed        (nth 0 points)))))
+              (let* ((prev (cond ((> i 0)      (nth (1- i) points))
+                                 (closed        (nth (1- n) points))))
+                     (next (cond ((< i (1- n)) (nth (1+ i) points))
+                                 (closed        (nth 0 points)))))
                 (when (and prev next)
-                  (aset corners i
-                        (scad-sketch--corner-geometry
-                         (scad-sketch--point-xy prev)
-                         (scad-sketch--point-xy (nth i points))
-                         (scad-sketch--point-xy next)
-                         r)))))))
-        ;; Build path string.
-        (let* ((c0       (aref corners 0))
-               (start-xy (if (and c0 closed)
-                             (funcall transform (plist-get c0 :t1))
-                           (funcall transform (scad-sketch--point-xy (nth 0 points)))))
-               (fmt      (lambda (xy)
-                           (format "%.3f %.3f"
-                                   (float (nth 0 xy)) (float (nth 1 xy))))))
-          (push (format "M %s" (funcall fmt start-xy)) parts)
+                  (let* ((A (scad-sketch--point-xy prev))
+                         (B (scad-sketch--point-xy (nth i points)))
+                         (C (scad-sketch--point-xy next))
+                         (uvh (scad-sketch--corner-unit-vecs A B C)))
+                    (when uvh
+                      (aset uvh-vec i uvh)
+                      (let ((t-ideal (/ r (tan (nth 2 uvh)))))
+                        (aset t-in  i t-ideal)   ; toward prev
+                        (aset t-out i t-ideal)))))))))  ; toward next
+        ;; Step 2: for each edge, clamp t-out[i] and t-in[i+1] so they
+        ;; don't sum to more than the edge length (leaving a small gap).
+        (dotimes (i n)
+          (let* ((j    (mod (1+ i) n))
+                 (Pi   (scad-sketch--point-xy (nth i points)))
+                 (Pj   (scad-sketch--point-xy (nth j points)))
+                 (edge (scad-sketch--edge-len Pi Pj))
+                 (sum  (+ (aref t-out i) (aref t-in j))))
+            (when (and (or closed (< i (1- n)))  ; skip last edge of open path
+                       (> sum (* edge 0.999)))
+              (let* ((scale (/ (* edge 0.499) sum)))
+                (aset t-out i (* (aref t-out i) scale))
+                (aset t-in  j (* (aref t-in  j) scale))))))
+        ;; Step 3: build corner geometry using clamped tangent lengths.
+        (let ((corners (make-vector n nil)))
           (dotimes (i n)
-            (let* ((corner (aref corners i))
-                   (pt-s   (funcall transform (scad-sketch--point-xy (nth i points)))))
-              (if corner
-                  (let* ((t1s   (funcall transform (plist-get corner :t1)))
-                         (t2s   (funcall transform (plist-get corner :t2)))
-                         (rs    (scad-sketch--pixel-radius
-                                 (plist-get corner :radius) transform))
-                         (sweep (plist-get corner :sweep)))
-                    (push (format "L %s" (funcall fmt t1s)) parts)
-                    (push (format "A %.3f %.3f 0 0 %d %s"
-                                  rs rs sweep (funcall fmt t2s))
-                          parts))
-                (push (format "L %s" (funcall fmt pt-s)) parts))))
-          (when closed (push "Z" parts)))
-        (mapconcat #'identity (nreverse parts) " ")))))
-
+            (let ((uvh (aref uvh-vec i)))
+              (when uvh
+                (aset corners i
+                      (scad-sketch--corner-geometry-from-tlens
+                       (scad-sketch--point-xy (nth i points))
+                       (nth 0 uvh) (nth 1 uvh) (nth 2 uvh)
+                       (aref t-in i) (aref t-out i))))))
+          ;; Step 4: build SVG path string.
+          (let* ((c0       (aref corners 0))
+                 (start-xy (if (and c0 closed)
+                               (funcall transform (plist-get c0 :t1))
+                             (funcall transform (scad-sketch--point-xy (nth 0 points)))))
+                 (fmt      (lambda (xy)
+                             (format "%.3f %.3f"
+                                     (float (nth 0 xy)) (float (nth 1 xy)))))
+                 (parts    (list (format "M %s" (funcall fmt start-xy)))))
+            (dotimes (i n)
+              (let* ((corner (aref corners i))
+                     (pt-s   (funcall transform (scad-sketch--point-xy (nth i points)))))
+                (if corner
+                    (let* ((t1s   (funcall transform (plist-get corner :t1)))
+                           (t2s   (funcall transform (plist-get corner :t2)))
+                           (rs    (scad-sketch--pixel-radius
+                                   (plist-get corner :radius) transform))
+                           (sweep (plist-get corner :sweep)))
+                      (push (format "L %s" (funcall fmt t1s)) parts)
+                      (push (format "A %.3f %.3f 0 0 %d %s"
+                                    rs rs sweep (funcall fmt t2s))
+                            parts))
+                  (push (format "L %s" (funcall fmt pt-s)) parts))))
+            (when closed (push "Z" parts))
+            (mapconcat #'identity (nreverse parts) " ")))))))
 (defun scad-sketch--draw-path (svg transform session)
   "Draw the polygon path (with arcs for polyRound radii) and vertex circles."
   (let* ((points  (scad-sketch-session-points session))
@@ -979,24 +1033,50 @@ Returns nil if fewer than 2 points."
             (scad-sketch--svg-line svg transform (car (last xy-points)) (car xy-points)
                                    :stroke "#111111" :stroke-width 3)))))
     ;; Draw vertex circles on top of the path.
-    (dolist (pt points)
-      (let* ((xy     (scad-sketch--point-xy pt))
-             (screen (funcall transform xy))
-             (sel    (= idx (or (scad-sketch-session-selected-index session) -1)))
-             (radius (scad-sketch--point-radius pt session)))
-        (svg-circle svg (nth 0 screen) (nth 1 screen) (if sel 7 5)
-                    :stroke (if sel "#d13f00" "#111111") :stroke-width (if sel 3 2)
-                    :fill   (if sel "#fff0e8" "#ffffff"))
-        (svg-text svg (number-to-string idx)
-                  :x (+ (nth 0 screen) 8) :y (- (nth 1 screen) 8)
-                  :font-size 12 :fill "#333333")
-        (when (and radius (> radius 0))
-          ;; Dashed circle showing the polyRound radius visually.
-          (svg-circle svg (nth 0 screen) (nth 1 screen)
-                      (scad-sketch--pixel-radius radius transform)
-                      :stroke "#804000" :stroke-width 1
-                      :stroke-dasharray "3,3" :fill "none")))
-      (setq idx (1+ idx)))))
+    (let* ((n      (length points))
+           (closed (scad-sketch-session-closed session)))
+      (dolist (pt points)
+        (let* ((xy     (scad-sketch--point-xy pt))
+               (screen (funcall transform xy))
+               (sel    (= idx (or (scad-sketch-session-selected-index session) -1)))
+               (radius (scad-sketch--point-radius pt session)))
+          (svg-circle svg (nth 0 screen) (nth 1 screen) (if sel 7 5)
+                      :stroke (if sel "#d13f00" "#111111") :stroke-width (if sel 3 2)
+                      :fill   (if sel "#fff0e8" "#ffffff"))
+          (svg-text svg (number-to-string idx)
+                    :x (+ (nth 0 screen) 8) :y (- (nth 1 screen) 8)
+                    :font-size 12 :fill "#333333")
+          (when (and radius (> radius 0))
+            ;; Recompute corner geometry to get the actual clamped radius,
+            ;; which is what polyRound will use (and what the arc shows).
+            (let* ((prev    (cond ((> idx 0)      (nth (1- idx) points))
+                                  (closed         (nth (1- n)   points))))
+                   (next    (cond ((< idx (1- n)) (nth (1+ idx) points))
+                                  (closed         (nth 0        points))))
+                   (corner  (when (and prev next)
+                              (scad-sketch--corner-geometry
+                               (scad-sketch--point-xy prev)
+                               xy
+                               (scad-sketch--point-xy next)
+                               radius)))
+                   (actual-r (if corner (plist-get corner :radius) radius))
+                   (capped   (and corner (< (+ actual-r 0.001) radius))))
+              ;; Dashed circle at the actual (possibly clamped) radius.
+              (svg-circle svg (nth 0 screen) (nth 1 screen)
+                          (scad-sketch--pixel-radius actual-r transform)
+                          :stroke (if capped "#c04000" "#804000")
+                          :stroke-width 1
+                          :stroke-dasharray "3,3" :fill "none")
+              ;; Label showing actual radius; highlights if capped.
+              (svg-text svg (if capped
+                                (format "r=%s→%s"
+                                        (scad-sketch--fmt-num radius)
+                                        (scad-sketch--fmt-num actual-r))
+                              (format "r=%s" (scad-sketch--fmt-num actual-r)))
+                        :x (+ (nth 0 screen) 8) :y (+ (nth 1 screen) 18)
+                        :font-size 11
+                        :fill (if capped "#c04000" "#804000")))))
+        (setq idx (1+ idx))))))
 
 (defun scad-sketch--draw-point-and-marks (svg transform session)
   "Draw all marks and the cursor point."
