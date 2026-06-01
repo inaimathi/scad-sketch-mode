@@ -348,99 +348,6 @@ Return plist with :metadata-line, :metadata, :content-beg, and :content-end."
      (scad-sketch--block-from-array-assignment
       (scad-sketch--find-array-assignment-at-point)))))
 
-(defun scad-sketch--forward-balanced-bracket (pos)
-  "Return position just after the bracketed form starting at POS."
-  (save-excursion
-    (goto-char pos)
-    (unless (eq (char-after) ?[)
-      (user-error "Expected `[' at array start"))
-    (let ((depth 0)
-          (done nil)
-          (in-string nil)
-          (escape nil)
-          (line-comment nil)
-          (block-comment nil))
-      (while (and (not done) (< (point) (point-max)))
-        (let ((ch (char-after))
-              (next (char-after (1+ (point)))))
-          (cond
-           (line-comment
-            (when (eq ch ?\n)
-              (setq line-comment nil))
-            (forward-char 1))
-           (block-comment
-            (if (and (eq ch ?*) (eq next ?/))
-                (progn
-                  (setq block-comment nil)
-                  (forward-char 2))
-              (forward-char 1)))
-           (in-string
-            (cond
-             (escape
-              (setq escape nil)
-              (forward-char 1))
-             ((eq ch ?\\)
-              (setq escape t)
-              (forward-char 1))
-             ((eq ch ?\")
-              (setq in-string nil)
-              (forward-char 1))
-             (t
-              (forward-char 1))))
-           ((and (eq ch ?/) (eq next ?/))
-            (setq line-comment t)
-            (forward-char 2))
-           ((and (eq ch ?/) (eq next ?*))
-            (setq block-comment t)
-            (forward-char 2))
-           ((eq ch ?\")
-            (setq in-string t)
-            (forward-char 1))
-           ((eq ch ?[)
-            (setq depth (1+ depth))
-            (forward-char 1))
-           ((eq ch ?])
-            (setq depth (1- depth))
-            (forward-char 1)
-            (when (= depth 0)
-              (setq done t)))
-           (t
-            (forward-char 1)))))
-      (unless done
-        (user-error "Malformed array: missing closing `]'"))
-      (point))))
-
-(defun scad-sketch--find-array-assignment-at-point ()
-  "Find a literal SCAD array assignment surrounding point.
-
-Accepts forms like:
-
-  pts = [[1, 2], [3, 4]];
-
-Return plist with :name, :beg, :end, and :text."
-  (let ((origin (point))
-        name beg open end)
-    (save-excursion
-      (unless (re-search-backward
-               "\\_<\\([[:alpha:]_$][[:alnum:]_$]*\\)\\_>[[:space:]\n\r]*=[[:space:]\n\r]*\\["
-               nil t)
-        (user-error "No literal array assignment before point"))
-      (setq name (match-string-no-properties 1))
-      (setq beg (match-beginning 0))
-      (setq open (1- (match-end 0)))
-      (setq end (scad-sketch--forward-balanced-bracket open))
-      (goto-char end)
-      (skip-chars-forward " \t\r\n")
-      (unless (eq (char-after) ?\;)
-        (user-error "Malformed array assignment: expected semicolon after array"))
-      (forward-char 1)
-      (setq end (point))
-      (unless (and (<= beg origin) (<= origin end))
-        (user-error "Point is not inside the nearest literal array assignment"))
-      (list :name name
-            :beg beg
-            :end end
-            :text (buffer-substring-no-properties beg end)))))
 
 (defun scad-sketch--literal-point-dimensions (text)
   "Return point dimensions found in literal point arrays in TEXT."
@@ -742,20 +649,29 @@ When OLD-POINT is non-nil, preserve hidden coordinates/radii where possible."
       session
       (scad-sketch--make-model-point (scad-sketch-session-point session) session)))))
 
+;; AFTER:
 (defun scad-sketch-insert-point-after-selected ()
-  "Insert the current point after the selected point."
+  "Insert the current cursor point after the selected point and select it.
+Move the cursor one grid step to the right so the new vertex is immediately
+distinguishable from its neighbour."
   (interactive)
   (scad-sketch--mutate
    (lambda (session)
      (let* ((idx (or (scad-sketch-session-selected-index session) -1))
             (pt (scad-sketch--make-model-point (scad-sketch-session-point session) session))
             (points (scad-sketch-session-points session))
-            (head (cl-subseq points 0 (min (1+ idx) (length points))))
-            (tail (nthcdr (min (1+ idx) (length points)) points)))
+            (insert-at (min (1+ idx) (length points)))
+            (head (cl-subseq points 0 insert-at))
+            (tail (nthcdr insert-at points))
+            (new-idx (max 0 (1+ idx))))
        (setf (scad-sketch-session-points session)
              (append head (list pt) tail))
-       (setf (scad-sketch-session-selected-index session)
-             (max 0 (1+ idx)))))))
+       (setf (scad-sketch-session-selected-index session) new-idx)
+       ;; Nudge cursor so the freshly-inserted point doesn't sit invisible
+       ;; on top of its predecessor.
+       (setf (scad-sketch-session-point session)
+             (scad-sketch--move-xy (scad-sketch-session-point session)
+                                   (scad-sketch-session-grid session) 0))))))
 
 (defun scad-sketch-delete-selected ()
   "Delete the selected point."
@@ -1327,11 +1243,15 @@ strings, line comments, and block comments."
       (point))))
 
 (defun scad-sketch--find-array-assignment-at-point ()
-  "Find a literal SCAD array assignment surrounding point.
+  "Find a literal SCAD array assignment at or surrounding point.
+Accepts point anywhere from the opening line through the closing semicolon.
 Return plist (:name NAME :beg BEG :end END :open-bracket OPEN :text TEXT)."
   (let ((origin (point))
         name beg open end)
     (save-excursion
+      ;; Search backward from end-of-line so that point sitting anywhere
+      ;; on the `name = [' line (including before leading whitespace) is found.
+      (goto-char (line-end-position))
       (unless (re-search-backward
                (rx (group (+ (any "A-Za-z0-9_$"))) (* space) "=" (* space) "[")
                nil t)
@@ -1341,13 +1261,14 @@ Return plist (:name NAME :beg BEG :end END :open-bracket OPEN :text TEXT)."
       (setq open (1- (match-end 0)))
       (setq end (scad-sketch--forward-balanced-bracket open))
       (goto-char end)
-      (skip-chars-forward "
-")
-      (unless (= (char-after) 59)
+      (skip-chars-forward " \t\r\n")
+      (unless (= (char-after) ?\;)
         (user-error "Array assignment must end with a semicolon"))
       (forward-char 1)
       (setq end (point))
-      (unless (and (<= beg origin) (<= origin end))
+      ;; Only check that origin precedes the end of the assignment;
+      ;; origin may be in leading whitespace before `beg' on the opening line.
+      (unless (<= origin end)
         (user-error "Point is not inside the nearest literal array assignment"))
       (list :name name
             :beg beg
