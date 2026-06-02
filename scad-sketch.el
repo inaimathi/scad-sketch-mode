@@ -151,10 +151,18 @@ C-c C-s and C-c C-o are intentionally left free for `scad-mode'.")
     (define-key map (kbd "C-<up>")    #'scad-sketch-move-point-coarse-up)
     (define-key map (kbd "C-<down>")  #'scad-sketch-move-point-coarse-down)
     ;; Selected vertex movement
-    (define-key map (kbd "S-<left>")  #'scad-sketch-move-selected-left)
-    (define-key map (kbd "S-<right>") #'scad-sketch-move-selected-right)
-    (define-key map (kbd "S-<up>")    #'scad-sketch-move-selected-up)
-    (define-key map (kbd "S-<down>")  #'scad-sketch-move-selected-down)
+    (define-key map (kbd "S-<left>")    #'scad-sketch-move-selected-left)
+    (define-key map (kbd "S-<right>")   #'scad-sketch-move-selected-right)
+    (define-key map (kbd "S-<up>")      #'scad-sketch-move-selected-up)
+    (define-key map (kbd "S-<down>")    #'scad-sketch-move-selected-down)
+    (define-key map (kbd "M-S-<left>")  #'scad-sketch-move-selected-fine-left)
+    (define-key map (kbd "M-S-<right>") #'scad-sketch-move-selected-fine-right)
+    (define-key map (kbd "M-S-<up>")    #'scad-sketch-move-selected-fine-up)
+    (define-key map (kbd "M-S-<down>")  #'scad-sketch-move-selected-fine-down)
+    (define-key map (kbd "C-S-<left>")  #'scad-sketch-move-selected-coarse-left)
+    (define-key map (kbd "C-S-<right>") #'scad-sketch-move-selected-coarse-right)
+    (define-key map (kbd "C-S-<up>")    #'scad-sketch-move-selected-coarse-up)
+    (define-key map (kbd "C-S-<down>")  #'scad-sketch-move-selected-coarse-down)
     ;; Marks
     (define-key map (kbd "m") #'scad-sketch-set-mark)
     (define-key map (kbd "M") #'scad-sketch-push-mark)
@@ -207,6 +215,8 @@ Movement:
   C-<arrow>           move cursor one coarse step; snaps to grid
   M-<arrow>           move cursor one fine step; intentionally off-grid
   S-<arrow>           move selected vertex one grid step
+  M-S-<arrow>         move selected vertex one fine step (off-grid)
+  C-S-<arrow>         move selected vertex one coarse step
 
 Vertex editing:
   TAB / S-TAB         select next / previous vertex (cursor jumps to it)
@@ -533,10 +543,18 @@ Preserves radius from OLD-POINT if provided."
 (defun scad-sketch-move-point-coarse-right () (interactive) (scad-sketch--move-point    (scad-sketch--coarse (scad-sketch--assert-session))  0 t))
 (defun scad-sketch-move-point-coarse-up ()    (interactive) (scad-sketch--move-point 0  (scad-sketch--coarse (scad-sketch--assert-session))    t))
 (defun scad-sketch-move-point-coarse-down ()  (interactive) (scad-sketch--move-point 0  (- (scad-sketch--coarse (scad-sketch--assert-session))) t))
-(defun scad-sketch-move-selected-left ()      (interactive) (scad-sketch--move-selected (- (scad-sketch--grid (scad-sketch--assert-session))) 0 t))
-(defun scad-sketch-move-selected-right ()     (interactive) (scad-sketch--move-selected    (scad-sketch--grid (scad-sketch--assert-session))  0 t))
-(defun scad-sketch-move-selected-up ()        (interactive) (scad-sketch--move-selected 0  (scad-sketch--grid (scad-sketch--assert-session))    t))
-(defun scad-sketch-move-selected-down ()      (interactive) (scad-sketch--move-selected 0  (- (scad-sketch--grid (scad-sketch--assert-session))) t))
+(defun scad-sketch-move-selected-left ()         (interactive) (scad-sketch--move-selected (- (scad-sketch--grid   (scad-sketch--assert-session))) 0 t))
+(defun scad-sketch-move-selected-right ()        (interactive) (scad-sketch--move-selected    (scad-sketch--grid   (scad-sketch--assert-session))  0 t))
+(defun scad-sketch-move-selected-up ()           (interactive) (scad-sketch--move-selected 0  (scad-sketch--grid   (scad-sketch--assert-session))    t))
+(defun scad-sketch-move-selected-down ()         (interactive) (scad-sketch--move-selected 0  (- (scad-sketch--grid   (scad-sketch--assert-session))) t))
+(defun scad-sketch-move-selected-fine-left ()    (interactive) (scad-sketch--move-selected (- (scad-sketch--fine   (scad-sketch--assert-session))) 0))
+(defun scad-sketch-move-selected-fine-right ()   (interactive) (scad-sketch--move-selected    (scad-sketch--fine   (scad-sketch--assert-session))  0))
+(defun scad-sketch-move-selected-fine-up ()      (interactive) (scad-sketch--move-selected 0  (scad-sketch--fine   (scad-sketch--assert-session))))
+(defun scad-sketch-move-selected-fine-down ()    (interactive) (scad-sketch--move-selected 0  (- (scad-sketch--fine   (scad-sketch--assert-session)))))
+(defun scad-sketch-move-selected-coarse-left ()  (interactive) (scad-sketch--move-selected (- (scad-sketch--coarse (scad-sketch--assert-session))) 0 t))
+(defun scad-sketch-move-selected-coarse-right () (interactive) (scad-sketch--move-selected    (scad-sketch--coarse (scad-sketch--assert-session))  0 t))
+(defun scad-sketch-move-selected-coarse-up ()    (interactive) (scad-sketch--move-selected 0  (scad-sketch--coarse (scad-sketch--assert-session))    t))
+(defun scad-sketch-move-selected-coarse-down ()  (interactive) (scad-sketch--move-selected 0  (- (scad-sketch--coarse (scad-sketch--assert-session))) t))
 
 ;;; Mark commands
 
