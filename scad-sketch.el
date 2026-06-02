@@ -1,49 +1,46 @@
 ;;; scad-sketch.el --- Keyboard sketch editor for OpenSCAD arrays -*- lexical-binding: t; -*-
 
 ;; Author: inaimathi, Claude Sonnet
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: cad, openscad, svg, tools
 
 ;;; Commentary:
 
 ;; Keyboard-driven SVG sketch editor for OpenSCAD point-array literals.
-;; Supports plain 2D polygons and polyRound-style rounded polygons.
+;; Supports plain 2D polygons and polyRound-style rounded polygons,
+;; with no annotation or metadata comments required in the source file.
 ;;
 ;; QUICK START
 ;; -----------
 ;; In any .scad buffer, position point inside or at the opening line of a
 ;; literal array assignment and run:
 ;;
-;;   M-x scad-sketch-at-point
-;;
-;; To open or create: if no array is found at point, a fresh named array is
-;; inserted and opened immediately:
-;;
 ;;   M-x scad-sketch-or-insert-at-point   (C-c C-. in scad-sketch-mode)
 ;;
-;; To annotate an existing bare array with scad-sketch metadata comments:
+;; This opens the visual editor if an array is found at point, or prompts
+;; for a name and inserts a fresh empty array if not.
 ;;
-;;   M-x scad-sketch-adopt-array-at-point  (C-c C-a in scad-sketch-mode)
+;; To add scad-sketch-mode to all scad-mode buffers automatically:
 ;;
-;; ARRAY KINDS
-;; -----------
-;; kind=2d              [[x, y], ...]          plain polygon vertices
-;; kind=2d-with-curves  [[x, y, r], ...]       polyRound radii at each vertex
+;;   (add-hook 'scad-mode-hook #'scad-sketch-mode)
 ;;
-;; Kind is inferred automatically when opening bare arrays:
-;;   all 2-column points  ->  kind=2d
-;;   any 3-column points  ->  kind=2d-with-curves
+;; ARRAY FORMAT
+;; ------------
+;; The editor works directly on literal array assignments in the source file:
 ;;
-;; METADATA COMMENT FORMAT
-;; -----------------------
-;; Blocks are delimited by:
+;;   profile = [[0, 0], [40, 0], [40, 12], [0, 12]];
 ;;
-;;   // scad-sketch: name=NAME kind=KIND closed=true grid=1 units=mm
-;;   NAME = [ ... ];
-;;   // end-scad-sketch
+;; For polyRound-style rounded polygons, use three-column points:
 ;;
-;; Optional metadata keys: fine=0.1  coarse=5
+;;   profile = [[0, 0, 3], [40, 0, 3], [40, 12, 3], [0, 12, 3]];
+;;
+;; Two-column and three-column arrays are handled identically inside the
+;; editor.  The third value (rounding radius) defaults to 0.  On write-back,
+;; arrays where every radius is 0 are emitted as two-column; arrays where any
+;; radius is non-zero are emitted as three-column.  Setting a non-zero radius
+;; on any vertex of a plain 2D array automatically promotes it to polyRound
+;; format; clearing all radii back to 0 demotes it again.
 ;;
 ;; EDITOR
 ;; ------
@@ -65,12 +62,12 @@
 ;;
 ;; POLYROUND RADII
 ;; ---------------
-;; For kind=2d-with-curves, each vertex carries an optional rounding radius
-;; compatible with the Round-Anything/polyround.scad library.  The sketch
-;; renders the actual arc geometry (including edge-length capping) so what
-;; you see matches what OpenSCAD produces.  A dashed circle around each
-;; rounded vertex shows the effective radius; it turns orange and displays
-;; "r=REQ->ACT" when the radius has been capped by a short adjacent edge.
+;; Each vertex carries an optional rounding radius compatible with the
+;; Round-Anything/polyround.scad library.  The sketch renders the actual arc
+;; geometry (including edge-length capping) so what you see matches what
+;; OpenSCAD produces.  A dashed circle around each rounded vertex shows the
+;; effective radius; it turns orange and displays "r=REQ->ACT" when the radius
+;; has been capped by a short adjacent edge.
 ;;
 ;; This is intentionally not a general SVG editor.  SVG is just the view;
 ;; OpenSCAD-compatible point arrays are the model and output.
@@ -110,30 +107,22 @@
   "Canvas margin in pixels."
   :type 'integer :group 'scad-sketch)
 
-(defcustom scad-sketch-metadata-regexp
-  "^[[:space:]]*//[[:space:]]*scad-sketch:[[:space:]]*\\(.*\\)$"
-  "Regexp matching a scad-sketch metadata line."
-  :type 'regexp :group 'scad-sketch)
-
-(defcustom scad-sketch-end-regexp
-  "^[[:space:]]*//[[:space:]]*end-scad-sketch[[:space:]]*$"
-  "Regexp matching a scad-sketch end line."
-  :type 'regexp :group 'scad-sketch)
-
 (cl-defstruct scad-sketch-session
-  name kind units grid fine-step coarse-step closed
+  name units grid fine-step coarse-step closed
   points point
   marks          ; list of [x y], newest first; (car marks) is the current mark
   named-marks selected-index
   source-buffer content-beg content-end
-  metadata dirty undo-stack)
+  dirty undo-stack)
 
 (defvar-local scad-sketch--session nil)
+(defvar-local scad-sketch--window-config nil
+  "Window configuration recorded just before the editor buffer was opened.")
 (defvar scad-sketch--editor-buffer-prefix "*scad-sketch: ")
 
 (defvar scad-sketch-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-c C-a") #'scad-sketch-adopt-array-at-point)
+    (define-key map (kbd "C-c C-a") #'scad-sketch-at-point)
     (define-key map (kbd "C-c C-.") #'scad-sketch-or-insert-at-point)
     map)
   "Keymap for `scad-sketch-mode'.
@@ -207,7 +196,11 @@ The canvas displays:
   - vertex dots numbered from 0; the selected vertex is highlighted in orange
   - dashed radius circles on rounded vertices (orange = capped by edge length)
   - the cursor crosshair in blue, marks in green
-  - a status bar: name, kind, grid size, cursor coords, dirty flag
+  - a status bar: name, grid size, cursor coords, dirty flag
+
+Two-column and three-column arrays are handled identically.  The rounding
+radius defaults to 0.  On write-back, if every radius is 0 the array is
+emitted as two-column; if any radius is non-zero it is emitted as three-column.
 
 Movement:
   <arrow>             move cursor one grid step; snaps to grid
@@ -226,7 +219,7 @@ Marks:
   m                   replace all marks with cursor position
   M                   push cursor position onto mark stack
   `                   pop most recent mark and jump cursor there
-  '                   jump cursor to most recent mark (non-destructive)
+  \'                   jump cursor to most recent mark (non-destructive)
   C                   clear all marks
 
 Geometry:
@@ -246,60 +239,11 @@ Session:
   q                   quit (offers to write back if dirty)
   ?                   key summary in the echo area
 
-\{scad-sketch-editor-mode-map}"
+\\{scad-sketch-editor-mode-map}"
   (setq truncate-lines t)
   (setq buffer-read-only t))
 
-;;; Metadata
-
-(defun scad-sketch--metadata-value (value)
-  "Parse metadata VALUE string into a Lisp value."
-  (let ((s (string-trim value)))
-    (cond
-     ((member s '("true" "t" "yes" "on")) t)
-     ((member s '("false" "nil" "no" "off")) nil)
-     ((string-match-p "\\`[-+]?[0-9]*\\.?[0-9]+\\(?:[eE][-+]?[0-9]+\\)?\\'" s)
-      (string-to-number s))
-     (t s))))
-
-(defun scad-sketch--parse-metadata (line)
-  "Parse a scad-sketch metadata LINE into an alist."
-  (unless (string-match scad-sketch-metadata-regexp line)
-    (user-error "Not a scad-sketch metadata line"))
-  (let ((body (match-string 1 line)) result)
-    (dolist (tok (split-string body "[[:space:]]+" t))
-      (when (string-match "\\`\\([^=[:space:]]+\\)=\\(.+\\)\\'" tok)
-        (push (cons (intern (match-string 1 tok))
-                    (scad-sketch--metadata-value (match-string 2 tok)))
-              result)))
-    (nreverse result)))
-
-(defun scad-sketch--meta (metadata key &optional default)
-  "Return KEY from METADATA alist, or DEFAULT."
-  (let ((cell (assq key metadata)))
-    (if cell (cdr cell) default)))
-
-;;; Block finding
-
-(defun scad-sketch--find-block ()
-  "Find the scad-sketch block around point.
-Returns plist with :metadata, :content-beg, :content-end."
-  (save-excursion
-    (let ((origin (point)) meta-beg meta-end meta-line metadata content-beg content-end)
-      (unless (re-search-backward scad-sketch-metadata-regexp nil t)
-        (user-error "No scad-sketch metadata line before point"))
-      (setq meta-beg  (line-beginning-position)
-            meta-end  (line-end-position)
-            meta-line (buffer-substring-no-properties meta-beg meta-end)
-            metadata  (scad-sketch--parse-metadata meta-line)
-            content-beg (min (point-max) (1+ meta-end)))
-      (goto-char content-beg)
-      (unless (re-search-forward scad-sketch-end-regexp nil t)
-        (user-error "No // end-scad-sketch after metadata line"))
-      (setq content-end (line-beginning-position))
-      (unless (and (<= meta-beg origin) (<= origin (match-end 0)))
-        (user-error "Point is not inside the nearest scad-sketch block"))
-      (list :metadata metadata :content-beg content-beg :content-end content-end))))
+;;; Array-assignment finding
 
 (defconst scad-sketch--number-re
   "[-+]?[0-9]*\\.?[0-9]+\\(?:[eE][-+]?[0-9]+\\)?")
@@ -311,59 +255,6 @@ Returns plist with :metadata, :content-beg, :content-end."
                    (substring line 0 (match-beginning 0))
                  line))
              (split-string s "\n") "\n"))
-
-(defun scad-sketch--parse-points (text kind)
-  "Parse literal point arrays from TEXT for KIND."
-  (let* ((clean (scad-sketch--strip-line-comments text))
-         (n scad-sketch--number-re)
-         (re (concat "\\[\\s-*\\(" n "\\)\\s-*,\\s-*\\(" n "\\)"
-                     "\\(?:\\s-*,\\s-*\\(" n "\\)\\)?" "\\s-*\\]"))
-         points)
-    (with-temp-buffer
-      (insert clean)
-      (goto-char (point-min))
-      (while (re-search-forward re nil t)
-        (let ((x (string-to-number (match-string 1)))
-              (y (string-to-number (match-string 2)))
-              (z (when (match-string 3) (string-to-number (match-string 3)))))
-          (push (if (or (string= kind "2d-with-curves")
-                        (string= kind "2d-curves")
-                        (string= kind "2d-polyround"))
-                    (list x y (or z 0))
-                  (list x y))
-                points))))
-    (nreverse points)))
-
-;;; Session construction
-
-(defun scad-sketch--make-session (block)
-  "Create a `scad-sketch-session' from BLOCK plist."
-  (let* ((metadata (plist-get block :metadata))
-         (name   (format "%s" (scad-sketch--meta metadata 'name "sketch")))
-         (kind   (format "%s" (scad-sketch--meta metadata 'kind "2d")))
-         (grid   (float (scad-sketch--meta metadata 'grid scad-sketch-default-grid)))
-         (fine   (float (scad-sketch--meta metadata 'fine scad-sketch-default-fine-step)))
-         (coarse (float (scad-sketch--meta metadata 'coarse scad-sketch-default-coarse-step)))
-         (closed (if (assq 'closed metadata) (scad-sketch--meta metadata 'closed t) t))
-         (units  (format "%s" (scad-sketch--meta metadata 'units "mm")))
-         (content (buffer-substring-no-properties
-                   (plist-get block :content-beg) (plist-get block :content-end)))
-         (points (scad-sketch--parse-points content kind))
-         (beg-marker (copy-marker (plist-get block :content-beg)))
-         (end-marker (copy-marker (plist-get block :content-end) t)))
-    (make-scad-sketch-session
-     :name name :kind kind :units units :grid grid :fine-step fine :coarse-step coarse
-     :closed closed :points points
-     :point (if points
-                (list (float (nth 0 (car points))) (float (nth 1 (car points))))
-              (list 0.0 0.0))
-     :marks nil :named-marks nil
-     :selected-index (if points 0 nil)
-     :source-buffer (current-buffer)
-     :content-beg beg-marker :content-end end-marker
-     :metadata metadata :dirty nil :undo-stack nil)))
-
-;;; Array-assignment finding
 
 (defun scad-sketch--forward-balanced-bracket (pos)
   "Return position just after the `[...]' form starting at POS."
@@ -380,10 +271,10 @@ Returns plist with :metadata, :content-beg, :content-end."
            (block-comment (if (and next (= ch ?*) (= next ?/))
                               (progn (setq block-comment nil) (forward-char 2))
                             (forward-char 1)))
-           (in-string     (cond (escape (setq escape nil) (forward-char 1))
-                                ((= ch ?\\) (setq escape t) (forward-char 1))
-                                ((= ch ?\") (setq in-string nil) (forward-char 1))
-                                (t (forward-char 1))))
+           (in-string (cond (escape (setq escape nil) (forward-char 1))
+                            ((= ch ?\\) (setq escape t) (forward-char 1))
+                            ((= ch ?\") (setq in-string nil) (forward-char 1))
+                            (t (forward-char 1))))
            ((and next (= ch ?/) (= next ?/)) (setq line-comment t)  (forward-char 2))
            ((and next (= ch ?/) (= next ?*)) (setq block-comment t) (forward-char 2))
            ((= ch ?\") (setq in-string t) (forward-char 1))
@@ -419,85 +310,93 @@ Returns plist (:name :beg :end :text)."
       (list :name name :beg beg :end end
             :text (buffer-substring-no-properties beg end)))))
 
-(defun scad-sketch--literal-point-dimensions (text)
-  "Return list of point dimensions (2 or 3) found in TEXT."
+;;; Point parsing — always produces [x y r] triples
+
+(defun scad-sketch--parse-points (text)
+  "Parse all [x, y] or [x, y, r] literals from TEXT.
+Always returns a list of [x y r] triples; r defaults to 0."
   (let* ((clean (scad-sketch--strip-line-comments text))
-         (n scad-sketch--number-re)
-         (re (concat "\\[\\s-*\\(" n "\\)\\s-*,\\s-*\\(" n "\\)"
-                     "\\(?:\\s-*,\\s-*\\(" n "\\)\\)?" "\\s-*\\]"))
-         dims)
+         (n     scad-sketch--number-re)
+         (re    (concat "\\[\\s-*\\(" n "\\)\\s-*,\\s-*\\(" n "\\)"
+                        "\\(?:\\s-*,\\s-*\\(" n "\\)\\)?" "\\s-*\\]"))
+         points)
     (with-temp-buffer
       (insert clean)
       (goto-char (point-min))
       (while (re-search-forward re nil t)
-        (push (if (match-string 3) 3 2) dims)))
-    (nreverse dims)))
+        (push (list (string-to-number (match-string 1))
+                    (string-to-number (match-string 2))
+                    (if (match-string 3) (string-to-number (match-string 3)) 0))
+              points)))
+    (nreverse points)))
 
-(defun scad-sketch--infer-kind (text)
-  "Infer kind from array TEXT: 2-column -> 2d, any 3-column -> 2d-with-curves."
-  (let* ((dims (scad-sketch--literal-point-dimensions text))
-         (uniq (delete-dups (copy-sequence dims))))
-    (unless dims
-      (user-error "No literal [x, y] or [x, y, r] points found"))
-    (if (equal uniq '(2)) "2d" "2d-with-curves")))
+;;; Session construction
 
-(defun scad-sketch--block-from-array-assignment (assignment)
-  "Convert raw ASSIGNMENT plist into a sketch block plist."
-  (let* ((name (plist-get assignment :name))
-         (kind (scad-sketch--infer-kind (plist-get assignment :text)))
-         (metadata `((name . ,name) (kind . ,kind) (closed . t)
-                     (grid . 1) (units . "mm"))))
-    (list :metadata metadata
-          :content-beg (plist-get assignment :beg)
-          :content-end (plist-get assignment :end))))
-
-(defun scad-sketch--find-target-at-point ()
-  "Find a scad-sketch block or array assignment at point."
-  (condition-case nil
-      (scad-sketch--find-block)
-    (user-error
-     (scad-sketch--block-from-array-assignment
-      (scad-sketch--find-array-assignment-at-point)))))
+(defun scad-sketch--make-session (name points beg-marker end-marker)
+  "Create a session for array NAME with POINTS between BEG-MARKER and END-MARKER."
+  (let ((init-pt (if points
+                     (list (float (nth 0 (car points)))
+                           (float (nth 1 (car points))))
+                   (list 0.0 0.0))))
+    (make-scad-sketch-session
+     :name name
+     :units "mm"
+     :grid (float scad-sketch-default-grid)
+     :fine-step (float scad-sketch-default-fine-step)
+     :coarse-step (float scad-sketch-default-coarse-step)
+     :closed t
+     :points points
+     :point init-pt
+     :marks nil
+     :named-marks nil
+     :selected-index (if points 0 nil)
+     :source-buffer (current-buffer)
+     :content-beg beg-marker
+     :content-end end-marker
+     :dirty nil
+     :undo-stack nil)))
 
 ;;; Opening the editor
 
 (defun scad-sketch--open-session (session)
-  "Open an editor buffer for SESSION."
-  (let ((buf (get-buffer-create
-              (format "%s%s*" scad-sketch--editor-buffer-prefix
-                      (scad-sketch-session-name session)))))
+  "Open an editor buffer for SESSION, saving the current window configuration."
+  (let ((wconf (current-window-configuration))
+        (buf   (get-buffer-create
+                (format "%s%s*" scad-sketch--editor-buffer-prefix
+                        (scad-sketch-session-name session)))))
     (with-current-buffer buf
       (scad-sketch-editor-mode)
       (setq-local scad-sketch--session session)
+      (setq-local scad-sketch--window-config wconf)
       (scad-sketch--render))
     (pop-to-buffer buf)))
 
 ;;;###autoload
 (defun scad-sketch-at-point ()
-  "Open the sketch editor for the array or scad-sketch block at point."
+  "Open the sketch editor for the array at point."
   (interactive)
   (unless (image-type-available-p 'svg)
     (user-error "This Emacs was not built with SVG image support"))
-  (scad-sketch--open-session
-   (scad-sketch--make-session (scad-sketch--find-target-at-point))))
+  (let* ((assignment (scad-sketch--find-array-assignment-at-point))
+         (name   (plist-get assignment :name))
+         (points (scad-sketch--parse-points (plist-get assignment :text)))
+         (beg    (copy-marker (plist-get assignment :beg)))
+         (end    (copy-marker (plist-get assignment :end) t)))
+    (scad-sketch--open-session
+     (scad-sketch--make-session name points beg end))))
 
 ;;;###autoload
 (defun scad-sketch-insert-array-at-point (name)
-  "Insert a new empty named 2D array at point and open the sketch editor."
+  "Insert a new empty named array at point and open the sketch editor."
   (interactive "sArray name: ")
   (unless (image-type-available-p 'svg)
     (user-error "This Emacs was not built with SVG image support"))
-  (insert (format "// scad-sketch: name=%s kind=2d closed=true grid=1 units=mm\n" name))
-  (let ((content-beg (point-marker)))
+  (let (beg end)
+    (setq beg (point-marker))
     (insert (format "%s = [\n];\n" name))
-    (let ((content-end (copy-marker (point) t)))
-      (insert "// end-scad-sketch\n")
-      (scad-sketch--open-session
-       (scad-sketch--make-session
-        (list :metadata `((name . ,name) (kind . "2d") (closed . t)
-                          (grid . 1) (units . "mm"))
-              :content-beg content-beg
-              :content-end content-end))))))
+    (setq end (copy-marker (point) t))
+    (scad-sketch--open-session
+     (scad-sketch--make-session name nil beg end))))
 
 ;;;###autoload
 (defun scad-sketch-or-insert-at-point ()
@@ -518,26 +417,21 @@ Returns plist (:name :beg :end :text)."
     (user-error "No active scad-sketch session"))
   scad-sketch--session)
 
-(defun scad-sketch--curve-kind-p (session)
-  "Non-nil if SESSION uses polyRound-style [x y r] points."
-  (member (scad-sketch-session-kind session)
-          '("2d-with-curves" "2d-curves" "2d-polyround")))
-
 (defun scad-sketch--point-xy (point)
   "Return the visible [x y] of model POINT."
   (list (float (or (nth 0 point) 0))
         (float (or (nth 1 point) 0))))
 
-(defun scad-sketch--point-radius (point session)
-  "Return polyRound radius for POINT in SESSION, or nil."
-  (when (scad-sketch--curve-kind-p session) (or (nth 2 point) 0)))
+(defun scad-sketch--point-radius (point)
+  "Return the polyRound radius of POINT, or 0."
+  (or (nth 2 point) 0))
 
-(defun scad-sketch--make-model-point (xy session &optional old-point)
-  "Build a model point from visible XY, preserving radius from OLD-POINT."
-  (let ((x (float (nth 0 xy))) (y (float (nth 1 xy))))
-    (if (scad-sketch--curve-kind-p session)
-        (list x y (float (or (nth 2 old-point) 0)))
-      (list x y))))
+(defun scad-sketch--make-model-point (xy &optional old-point)
+  "Build a model [x y r] point from visible XY.
+Preserves radius from OLD-POINT if provided."
+  (list (float (nth 0 xy))
+        (float (nth 1 xy))
+        (float (or (nth 2 old-point) 0))))
 
 (defun scad-sketch--replace-nth (n value list)
   "Return LIST with element N replaced by VALUE."
@@ -574,16 +468,19 @@ Returns plist (:name :beg :end :text)."
 (defun scad-sketch--selected-point (session)
   "Return the currently selected model point, or nil."
   (let ((idx (scad-sketch-session-selected-index session)))
-    (when (and idx (>= idx 0) (< idx (length (scad-sketch-session-points session))))
+    (when (and idx (>= idx 0)
+               (< idx (length (scad-sketch-session-points session))))
       (nth idx (scad-sketch-session-points session)))))
 
 (defun scad-sketch--set-selected-point (session point)
   "Replace the selected model point in SESSION with POINT."
   (let ((idx (scad-sketch-session-selected-index session)))
-    (unless (and idx (>= idx 0) (< idx (length (scad-sketch-session-points session))))
+    (unless (and idx (>= idx 0)
+                 (< idx (length (scad-sketch-session-points session))))
       (user-error "No selected point"))
     (setf (scad-sketch-session-points session)
-          (scad-sketch--replace-nth idx point (scad-sketch-session-points session)))))
+          (scad-sketch--replace-nth idx point
+                                    (scad-sketch-session-points session)))))
 
 ;;; Movement
 
@@ -601,25 +498,22 @@ Returns plist (:name :beg :end :text)."
         (scad-sketch--snap-to-grid (nth 1 xy) grid)))
 
 (defun scad-sketch--move-point (dx dy &optional snap)
-  "Move the cursor by DX, DY.
-When SNAP is non-nil, snap the result to the session grid."
+  "Move cursor by DX, DY; snap to grid when SNAP is non-nil."
   (scad-sketch--mutate
    (lambda (s)
      (let ((new (scad-sketch--move-xy (scad-sketch-session-point s) dx dy)))
        (setf (scad-sketch-session-point s)
-             (if snap
-                 (scad-sketch--snap-xy new (scad-sketch--grid s))
-               new))))))
+             (if snap (scad-sketch--snap-xy new (scad-sketch--grid s)) new))))))
 
 (defun scad-sketch--move-selected (dx dy &optional snap)
-  "Move the selected vertex by DX, DY.
-When SNAP is non-nil, snap the result to the session grid."
+  "Move selected vertex by DX, DY; snap to grid when SNAP is non-nil."
   (scad-sketch--mutate
    (lambda (s)
-     (let* ((old    (or (scad-sketch--selected-point s) (user-error "No selected point")))
+     (let* ((old    (or (scad-sketch--selected-point s)
+                        (user-error "No selected point")))
             (new-xy (scad-sketch--move-xy (scad-sketch--point-xy old) dx dy))
             (snapped (if snap (scad-sketch--snap-xy new-xy (scad-sketch--grid s)) new-xy))
-            (new    (scad-sketch--make-model-point snapped s old)))
+            (new    (scad-sketch--make-model-point snapped old)))
        (scad-sketch--set-selected-point s new)
        (setf (scad-sketch-session-point s) snapped)))))
 
@@ -647,7 +541,7 @@ When SNAP is non-nil, snap the result to the session grid."
 ;;; Mark commands
 
 (defun scad-sketch-set-mark ()
-  "Replace all marks with just the current cursor point."
+  "Replace all marks with the current cursor position."
   (interactive)
   (scad-sketch--mutate
    (lambda (s)
@@ -655,7 +549,7 @@ When SNAP is non-nil, snap the result to the session grid."
            (list (copy-sequence (scad-sketch-session-point s)))))))
 
 (defun scad-sketch-push-mark ()
-  "Push the current cursor point onto the marks list."
+  "Push the current cursor position onto the mark stack."
   (interactive)
   (scad-sketch--mutate
    (lambda (s)
@@ -698,28 +592,26 @@ When SNAP is non-nil, snap the result to the session grid."
         (1- (length (scad-sketch-session-points session)))))
 
 (defun scad-sketch-append-point ()
-  "Append the cursor point to the array."
+  "Append the cursor position as a new vertex."
   (interactive)
   (scad-sketch--mutate
    (lambda (s)
      (scad-sketch--append-model-point
-      s (scad-sketch--make-model-point (scad-sketch-session-point s) s)))))
+      s (scad-sketch--make-model-point (scad-sketch-session-point s))))))
 
 (defun scad-sketch-insert-point-after-selected ()
   "Insert points after the selected vertex.
-If marks are set, inserts one point per mark (oldest first) then the cursor
-point.  With no marks, inserts only the cursor point.
-The last inserted point becomes the new selection."
+With marks set, inserts each mark (oldest first) then the cursor.
+Without marks, inserts only the cursor."
   (interactive)
   (scad-sketch--mutate
    (lambda (s)
      (let* ((idx       (or (scad-sketch-session-selected-index s) -1))
             (points    (scad-sketch-session-points s))
             (insert-at (min (1+ idx) (length points)))
-            ;; marks list is newest-first; reverse to get oldest-first order
-            (mark-pts  (mapcar (lambda (m) (scad-sketch--make-model-point m s))
+            (mark-pts  (mapcar (lambda (m) (scad-sketch--make-model-point m))
                                (reverse (scad-sketch-session-marks s))))
-            (cursor-pt (scad-sketch--make-model-point (scad-sketch-session-point s) s))
+            (cursor-pt (scad-sketch--make-model-point (scad-sketch-session-point s)))
             (new-pts   (append mark-pts (list cursor-pt)))
             (new-idx   (+ insert-at (length new-pts) -1)))
        (setf (scad-sketch-session-points s)
@@ -746,18 +638,18 @@ The last inserted point becomes the new selection."
                    (t idx)))))))
 
 (defun scad-sketch-line-from-mark ()
-  "Append marks (oldest first) then cursor point as new vertices."
+  "Append marks (oldest first) then cursor as new vertices."
   (interactive)
   (scad-sketch--mutate
    (lambda (s)
      (unless (scad-sketch-session-marks s) (user-error "No marks set"))
      (dolist (m (reverse (scad-sketch-session-marks s)))
-       (scad-sketch--append-model-point s (scad-sketch--make-model-point m s)))
+       (scad-sketch--append-model-point s (scad-sketch--make-model-point m)))
      (scad-sketch--append-model-point
-      s (scad-sketch--make-model-point (scad-sketch-session-point s) s)))))
+      s (scad-sketch--make-model-point (scad-sketch-session-point s))))))
 
 (defun scad-sketch-rectangle-from-mark ()
-  "Append a rectangle from the most recent mark to the cursor point."
+  "Append rectangle corners from most recent mark to cursor."
   (interactive)
   (scad-sketch--mutate
    (lambda (s)
@@ -767,24 +659,23 @@ The last inserted point becomes the new selection."
              (x2 (nth 0 pt))   (y2 (nth 1 pt)))
          (dolist (xy (list (list x1 y1) (list x2 y1) (list x2 y2) (list x1 y2)))
            (scad-sketch--append-model-point
-            s (scad-sketch--make-model-point xy s))))))))
+            s (scad-sketch--make-model-point xy))))))))
 
 (defun scad-sketch-toggle-closed ()
   "Toggle the closed flag."
   (interactive)
   (scad-sketch--mutate
-   (lambda (s) (setf (scad-sketch-session-closed s) (not (scad-sketch-session-closed s))))))
+   (lambda (s)
+     (setf (scad-sketch-session-closed s) (not (scad-sketch-session-closed s))))))
 
 (defun scad-sketch-set-radius (radius)
   "Set the polyRound radius of the selected vertex."
   (interactive (list (read-number "Radius: " 0)))
-  (let ((session (scad-sketch--assert-session)))
-    (unless (scad-sketch--curve-kind-p session)
-      (user-error "Radius is only meaningful for kind=2d-with-curves")))
   (scad-sketch--mutate
    (lambda (s)
      (let ((pt (or (scad-sketch--selected-point s) (user-error "No selected point"))))
-       (scad-sketch--set-selected-point s (list (nth 0 pt) (nth 1 pt) (float radius)))))))
+       (scad-sketch--set-selected-point
+        s (list (nth 0 pt) (nth 1 pt) (float radius)))))))
 
 (defun scad-sketch-next-point ()
   "Select the next vertex, moving cursor to it."
@@ -815,7 +706,7 @@ The last inserted point becomes the new selection."
 ;;; Coordinate commands
 
 (defun scad-sketch--set-point-axis (axis value)
-  "Set cursor coordinate AXIS (0=x 1=y) to VALUE."
+  "Set cursor coordinate AXIS (0=x, 1=y) to VALUE."
   (scad-sketch--mutate
    (lambda (s)
      (let ((pt (copy-sequence (scad-sketch-session-point s))))
@@ -850,7 +741,7 @@ The last inserted point becomes the new selection."
   (scad-sketch--set-delta-axis 1 dy))
 
 (defun scad-sketch-set-distance-from-mark (distance)
-  "Set distance from the most recent mark to cursor, keeping the angle."
+  "Set distance from most recent mark to cursor, preserving angle."
   (interactive (list (read-number "Distance from mark: " 0)))
   (let ((session (scad-sketch--assert-session)))
     (unless (scad-sketch-session-marks session) (user-error "No marks set")))
@@ -864,7 +755,7 @@ The last inserted point becomes the new selection."
                    (+ (nth 1 m) (* (float distance) (sin angle)))))))))
 
 (defun scad-sketch-set-angle-from-mark (degrees)
-  "Set angle from the most recent mark to cursor in DEGREES, keeping distance."
+  "Set angle from most recent mark to cursor in DEGREES, preserving distance."
   (interactive (list (read-number "Angle degrees from mark: " 0)))
   (let ((session (scad-sketch--assert-session)))
     (unless (scad-sketch-session-marks session) (user-error "No marks set")))
@@ -906,7 +797,7 @@ The last inserted point becomes the new selection."
 ;;; Rendering
 
 (defun scad-sketch--bounds (session)
-  "Return (min-x max-x min-y max-y) encompassing all points, marks, cursor."
+  "Return (min-x max-x min-y max-y) for all points, marks, and cursor."
   (let* ((pts   (mapcar #'scad-sketch--point-xy (scad-sketch-session-points session)))
          (extra (delq nil (cons (scad-sketch-session-point session)
                                 (scad-sketch-session-marks session))))
@@ -934,12 +825,12 @@ The last inserted point becomes the new selection."
               (- h (+ m (* (- (nth 1 xy) min-y) scale))))))))
 
 (defun scad-sketch--svg-line (svg transform a b &rest args)
-  "Draw a model-space line A→B."
+  "Draw a model-space line A→B on SVG."
   (let ((pa (funcall transform a)) (pb (funcall transform b)))
     (apply #'svg-line svg (nth 0 pa) (nth 1 pa) (nth 0 pb) (nth 1 pb) args)))
 
 (defun scad-sketch--draw-grid (svg bounds transform session)
-  "Draw the grid."
+  "Draw the background grid."
   (pcase-let ((`(,min-x ,max-x ,min-y ,max-y) bounds))
     (let* ((grid (max 0.0001 (scad-sketch-session-grid session)))
            (x (* grid (floor (/ min-x grid))))
@@ -959,6 +850,8 @@ The last inserted point becomes the new selection."
       (scad-sketch--svg-line svg transform (list min-x 0) (list max-x 0)
                              :stroke "#d0d0d0" :stroke-width 2))))
 
+;;; polyRound arc geometry
+
 (defun scad-sketch--corner-unit-vecs (A B C)
   "Return (U V HALF-ANGLE) for the corner at B, or nil if degenerate."
   (let* ((bx (nth 0 B)) (by (nth 1 B))
@@ -976,12 +869,9 @@ The last inserted point becomes the new selection."
           (list u v half))))))
 
 (defun scad-sketch--corner-geometry-from-tlens (B u v half t1-len t2-len)
-  "Build a corner plist from pre-clamped tangent lengths.
-T1-LEN is the tangent along the incoming edge (toward prev point).
-T2-LEN is the tangent along the outgoing edge (toward next point).
-Uses the minimum to ensure a valid circular arc."
-  (let* ((bx     (nth 0 B)) (by (nth 1 B))
-         (t-len  (min t1-len t2-len))
+  "Build a corner plist from pre-clamped tangent lengths."
+  (let* ((bx (nth 0 B)) (by (nth 1 B))
+         (t-len   (min t1-len t2-len))
          (actual-r (* t-len (tan half)))
          (t1    (list (+ bx (* t-len (nth 0 u))) (+ by (* t-len (nth 1 u)))))
          (t2    (list (+ bx (* t-len (nth 0 v))) (+ by (* t-len (nth 1 v)))))
@@ -991,9 +881,7 @@ Uses the minimum to ensure a valid circular arc."
 
 (defun scad-sketch--corner-geometry (A B C r)
   "Compute polyRound arc geometry for corner at B with radius R.
-Returns plist (:t1 :t2 :radius :sweep), or nil if degenerate.
-Uses 0.49*edge-length clamping per side.  For path rendering use
-`scad-sketch--polyround-path-d' which does proper edge-pair clamping."
+Returns plist (:t1 :t2 :radius :sweep), or nil if degenerate."
   (when (and r (> r 0))
     (let ((uvh (scad-sketch--corner-unit-vecs A B C)))
       (when uvh
@@ -1005,6 +893,7 @@ Uses 0.49*edge-length clamping per side.  For path rendering use
                (l-bc (sqrt (+ (* (nth 0 bc) (nth 0 bc)) (* (nth 1 bc) (nth 1 bc)))))
                (t-len (min (/ r (tan half)) (* l-ba 0.49) (* l-bc 0.49))))
           (scad-sketch--corner-geometry-from-tlens B u v half t-len t-len))))))
+
 (defun scad-sketch--pixel-radius (model-r transform)
   "Convert model-space radius MODEL-R to screen pixels via TRANSFORM."
   (let* ((o  (funcall transform '(0 0)))
@@ -1019,25 +908,18 @@ Uses 0.49*edge-length clamping per side.  For path rendering use
         (dy (- (nth 1 Q) (nth 1 P))))
     (sqrt (+ (* dx dx) (* dy dy)))))
 
+(defun scad-sketch--any-radius-p (points)
+  "Return non-nil if any point in POINTS has a non-zero radius."
+  (cl-some (lambda (p) (and (nth 2 p) (> (nth 2 p) 0))) points))
+
 (defun scad-sketch--polyround-path-d (points closed transform)
   "Build an SVG path data string for POINTS with polyRound radii.
-POINTS are model-space [x y r] triples (r may be nil/0).
-CLOSED determines whether to end with Z.
-TRANSFORM converts model [x y] to screen [px py].
-Returns nil if fewer than 2 points.
-
-Uses edge-aware tangent-length clamping so that adjacent rounded corners
-on a short edge never produce overlapping/reversed segments."
+Uses edge-aware tangent-length clamping to avoid crossed segments."
   (let ((n (length points)))
     (when (>= n 2)
-      (let* (;; Step 1: compute ideal tangent lengths for each corner on each edge.
-             ;; t-out[i] = ideal t_len from point[i] toward point[i+1]
-             ;; t-in[i]  = ideal t_len from point[i] toward point[i-1]
-             ;; These may overlap on short edges; we clamp in step 2.
-             (t-out (make-vector n 0.0))
+      (let* ((t-out (make-vector n 0.0))
              (t-in  (make-vector n 0.0))
-             (uvh-vec (make-vector n nil)))  ; cached unit vecs + half-angle
-        ;; Compute unit vectors and ideal tangent lengths.
+             (uvh-vec (make-vector n nil)))
         (dotimes (i n)
           (let ((r (nth 2 (nth i points))))
             (when (and r (> r 0))
@@ -1046,29 +928,26 @@ on a short edge never produce overlapping/reversed segments."
                      (next (cond ((< i (1- n)) (nth (1+ i) points))
                                  (closed        (nth 0 points)))))
                 (when (and prev next)
-                  (let* ((A (scad-sketch--point-xy prev))
-                         (B (scad-sketch--point-xy (nth i points)))
-                         (C (scad-sketch--point-xy next))
+                  (let* ((A   (scad-sketch--point-xy prev))
+                         (B   (scad-sketch--point-xy (nth i points)))
+                         (C   (scad-sketch--point-xy next))
                          (uvh (scad-sketch--corner-unit-vecs A B C)))
                     (when uvh
                       (aset uvh-vec i uvh)
                       (let ((t-ideal (/ r (tan (nth 2 uvh)))))
-                        (aset t-in  i t-ideal)   ; toward prev
-                        (aset t-out i t-ideal)))))))))  ; toward next
-        ;; Step 2: for each edge, clamp t-out[i] and t-in[i+1] so they
-        ;; don't sum to more than the edge length (leaving a small gap).
+                        (aset t-in  i t-ideal)
+                        (aset t-out i t-ideal)))))))))
         (dotimes (i n)
           (let* ((j    (mod (1+ i) n))
                  (Pi   (scad-sketch--point-xy (nth i points)))
                  (Pj   (scad-sketch--point-xy (nth j points)))
                  (edge (scad-sketch--edge-len Pi Pj))
                  (sum  (+ (aref t-out i) (aref t-in j))))
-            (when (and (or closed (< i (1- n)))  ; skip last edge of open path
+            (when (and (or closed (< i (1- n)))
                        (> sum (* edge 0.999)))
-              (let* ((scale (/ (* edge 0.499) sum)))
+              (let ((scale (/ (* edge 0.499) sum)))
                 (aset t-out i (* (aref t-out i) scale))
                 (aset t-in  j (* (aref t-in  j) scale))))))
-        ;; Step 3: build corner geometry using clamped tangent lengths.
         (let ((corners (make-vector n nil)))
           (dotimes (i n)
             (let ((uvh (aref uvh-vec i)))
@@ -1078,14 +957,12 @@ on a short edge never produce overlapping/reversed segments."
                        (scad-sketch--point-xy (nth i points))
                        (nth 0 uvh) (nth 1 uvh) (nth 2 uvh)
                        (aref t-in i) (aref t-out i))))))
-          ;; Step 4: build SVG path string.
           (let* ((c0       (aref corners 0))
                  (start-xy (if (and c0 closed)
                                (funcall transform (plist-get c0 :t1))
                              (funcall transform (scad-sketch--point-xy (nth 0 points)))))
                  (fmt      (lambda (xy)
-                             (format "%.3f %.3f"
-                                     (float (nth 0 xy)) (float (nth 1 xy)))))
+                             (format "%.3f %.3f" (float (nth 0 xy)) (float (nth 1 xy)))))
                  (parts    (list (format "M %s" (funcall fmt start-xy)))))
             (dotimes (i n)
               (let* ((corner (aref corners i))
@@ -1097,29 +974,22 @@ on a short edge never produce overlapping/reversed segments."
                                    (plist-get corner :radius) transform))
                            (sweep (plist-get corner :sweep)))
                       (push (format "L %s" (funcall fmt t1s)) parts)
-                      (push (format "A %.3f %.3f 0 0 %d %s"
-                                    rs rs sweep (funcall fmt t2s))
-                            parts))
+                      (push (format "A %.3f %.3f 0 0 %d %s" rs rs sweep (funcall fmt t2s)) parts))
                   (push (format "L %s" (funcall fmt pt-s)) parts))))
             (when closed (push "Z" parts))
             (mapconcat #'identity (nreverse parts) " ")))))))
+
 (defun scad-sketch--draw-path (svg transform session)
-  "Draw the polygon path (with arcs for polyRound radii) and vertex circles."
+  "Draw the polygon path and vertex circles."
   (let* ((points  (scad-sketch-session-points session))
          (closed  (scad-sketch-session-closed session))
-         (curve-p (scad-sketch--curve-kind-p session))
          (n       (length points))
          (idx     0))
-    ;; Draw the path outline.
     (when (>= n 2)
-      (if curve-p
-          ;; polyRound: build a single SVG path with arcs.
+      (if (scad-sketch--any-radius-p points)
           (let ((d (scad-sketch--polyround-path-d points closed transform)))
             (when d
-              (svg-node svg 'path :d d
-                        :stroke "#111111" :stroke-width 3
-                        :fill "none")))
-        ;; Plain 2d: straight lines.
+              (svg-node svg 'path :d d :stroke "#111111" :stroke-width 3 :fill "none")))
         (let ((xy-points (mapcar #'scad-sketch--point-xy points)))
           (cl-loop for a on xy-points for b = (cadr a) when b do
                    (scad-sketch--svg-line svg transform (car a) b
@@ -1127,23 +997,20 @@ on a short edge never produce overlapping/reversed segments."
           (when (and closed (> n 2))
             (scad-sketch--svg-line svg transform (car (last xy-points)) (car xy-points)
                                    :stroke "#111111" :stroke-width 3)))))
-    ;; Draw vertex circles on top of the path.
     (let* ((n      (length points))
            (closed (scad-sketch-session-closed session)))
       (dolist (pt points)
         (let* ((xy     (scad-sketch--point-xy pt))
                (screen (funcall transform xy))
                (sel    (= idx (or (scad-sketch-session-selected-index session) -1)))
-               (radius (scad-sketch--point-radius pt session)))
+               (radius (scad-sketch--point-radius pt)))
           (svg-circle svg (nth 0 screen) (nth 1 screen) (if sel 7 5)
                       :stroke (if sel "#d13f00" "#111111") :stroke-width (if sel 3 2)
                       :fill   (if sel "#fff0e8" "#ffffff"))
           (svg-text svg (number-to-string idx)
                     :x (+ (nth 0 screen) 8) :y (- (nth 1 screen) 8)
                     :font-size 12 :fill "#333333")
-          (when (and radius (> radius 0))
-            ;; Recompute corner geometry to get the actual clamped radius,
-            ;; which is what polyRound will use (and what the arc shows).
+          (when (> radius 0)
             (let* ((prev    (cond ((> idx 0)      (nth (1- idx) points))
                                   (closed         (nth (1- n)   points))))
                    (next    (cond ((< idx (1- n)) (nth (1+ idx) points))
@@ -1156,38 +1023,30 @@ on a short edge never produce overlapping/reversed segments."
                                radius)))
                    (actual-r (if corner (plist-get corner :radius) radius))
                    (capped   (and corner (< (+ actual-r 0.001) radius))))
-              ;; Dashed circle at the actual (possibly clamped) radius.
               (svg-circle svg (nth 0 screen) (nth 1 screen)
                           (scad-sketch--pixel-radius actual-r transform)
                           :stroke (if capped "#c04000" "#804000")
-                          :stroke-width 1
-                          :stroke-dasharray "3,3" :fill "none")
-              ;; Label showing actual radius; highlights if capped.
+                          :stroke-width 1 :stroke-dasharray "3,3" :fill "none")
               (svg-text svg (if capped
-                                (format "r=%s→%s"
+                                (format "r=%s\u2192%s"
                                         (scad-sketch--fmt-num radius)
                                         (scad-sketch--fmt-num actual-r))
                               (format "r=%s" (scad-sketch--fmt-num actual-r)))
                         :x (+ (nth 0 screen) 8) :y (+ (nth 1 screen) 18)
-                        :font-size 11
-                        :fill (if capped "#c04000" "#804000")))))
+                        :font-size 11 :fill (if capped "#c04000" "#804000")))))
         (setq idx (1+ idx))))))
 
 (defun scad-sketch--draw-point-and-marks (svg transform session)
   "Draw all marks and the cursor point."
   (let* ((marks  (scad-sketch-session-marks session))
          (cursor (scad-sketch-session-point session)))
-    ;; Dashed lines: oldest→...→newest mark→cursor, forming a chain.
-    ;; marks is newest-first, so reverse it to get oldest-first, then
-    ;; walk consecutive pairs and finally connect newest mark to cursor.
-    (let ((ordered (reverse marks)))  ; oldest first
+    (let ((ordered (reverse marks)))
       (cl-loop for a on ordered for b = (cadr a) when b do
                (scad-sketch--svg-line svg transform (car a) b
                                       :stroke "#008a2e" :stroke-width 1 :stroke-dasharray "4,4"))
       (when ordered
         (scad-sketch--svg-line svg transform (car (last ordered)) cursor
                                :stroke "#008a2e" :stroke-width 1 :stroke-dasharray "4,4")))
-    ;; Marks: oldest drawn first so newest (car) is on top.
     (dolist (m (reverse marks))
       (let* ((screen  (funcall transform m))
              (current (equal m (car marks)))
@@ -1197,7 +1056,6 @@ on a short edge never produce overlapping/reversed segments."
         (when current
           (svg-text svg "mark" :x (+ (nth 0 screen) 10) :y (+ (nth 1 screen) 4)
                     :font-size 12 :fill color))))
-    ;; Cursor on top.
     (let ((p (funcall transform cursor)))
       (svg-circle svg (nth 0 p) (nth 1 p) 5
                   :stroke "#0057c2" :stroke-width 2 :fill "#dfefff")
@@ -1209,7 +1067,7 @@ on a short edge never produce overlapping/reversed segments."
                 :font-size 12 :fill "#0057c2"))))
 
 (defun scad-sketch--fmt-xy (xy)
-  "Format XY pair."
+  "Format XY pair compactly."
   (format "(%s, %s)" (scad-sketch--fmt-num (nth 0 xy)) (scad-sketch--fmt-num (nth 1 xy))))
 
 (defun scad-sketch--draw-hud (svg session)
@@ -1220,9 +1078,8 @@ on a short edge never produce overlapping/reversed segments."
                          ((= 1 (length marks)) (scad-sketch--fmt-xy (car marks)))
                          (t (format "%s (+%d)" (scad-sketch--fmt-xy (car marks))
                                     (1- (length marks))))))
-         (text (format "%s  kind=%s  grid=%s%s  point=%s  mark=%s  sel=%s  %s"
+         (text (format "%s  grid=%s%s  point=%s  mark=%s  sel=%s  %s"
                        (scad-sketch-session-name session)
-                       (scad-sketch-session-kind session)
                        (scad-sketch--fmt-num (scad-sketch-session-grid session))
                        (scad-sketch-session-units session)
                        (scad-sketch--fmt-xy (scad-sketch-session-point session))
@@ -1252,12 +1109,10 @@ on a short edge never produce overlapping/reversed segments."
       (insert (scad-sketch--emit-content session))
       (goto-char (point-min)))))
 
-
-
 ;;; Output
 
 (defun scad-sketch--fmt-num (n)
-  "Format N compactly."
+  "Format N compactly for OpenSCAD."
   (let ((x (float n)))
     (if (< (abs (- x (round x))) 0.000001)
         (number-to-string (round x))
@@ -1266,9 +1121,9 @@ on a short edge never produce overlapping/reversed segments."
         (setq s (replace-regexp-in-string "\\.\\'" "" s))
         (if (or (string= s "-0") (string= s "")) "0" s)))))
 
-(defun scad-sketch--emit-point (point session)
-  "Format one model POINT for OpenSCAD."
-  (if (scad-sketch--curve-kind-p session)
+(defun scad-sketch--emit-point (point use-radii)
+  "Format one model POINT.  When USE-RADII is non-nil emit [x, y, r]."
+  (if use-radii
       (format "[%s, %s, %s]"
               (scad-sketch--fmt-num (nth 0 point))
               (scad-sketch--fmt-num (nth 1 point))
@@ -1278,10 +1133,14 @@ on a short edge never produce overlapping/reversed segments."
             (scad-sketch--fmt-num (nth 1 point)))))
 
 (defun scad-sketch--emit-content (session)
-  "Emit the full SCAD array assignment."
-  (let* ((name  (scad-sketch-session-name session))
-         (lines (mapcar (lambda (p) (concat "  " (scad-sketch--emit-point p session)))
-                        (scad-sketch-session-points session))))
+  "Emit the full SCAD array assignment for SESSION.
+Emits two-column format if all radii are zero; three-column otherwise."
+  (let* ((name      (scad-sketch-session-name session))
+         (points    (scad-sketch-session-points session))
+         (use-radii (scad-sketch--any-radius-p points))
+         (lines     (mapcar (lambda (p)
+                              (concat "  " (scad-sketch--emit-point p use-radii)))
+                            points)))
     (concat name " = [\n"
             (mapconcat #'identity lines ",\n")
             (if lines "\n" "")
@@ -1310,13 +1169,16 @@ on a short edge never produce overlapping/reversed segments."
              (scad-sketch-session-name session) (buffer-name source))))
 
 (defun scad-sketch-quit ()
-  "Quit the sketch editor."
+  "Quit the sketch editor and restore the window configuration."
   (interactive)
-  (let ((session (scad-sketch--assert-session)))
+  (let ((session (scad-sketch--assert-session))
+        (wconf   scad-sketch--window-config))
     (when (and (scad-sketch-session-dirty session)
                (y-or-n-p "Sketch has unwritten edits. Write back first? "))
-      (scad-sketch-write-back)))
-  (kill-buffer (current-buffer)))
+      (scad-sketch-write-back))
+    (kill-buffer (current-buffer))
+    (when wconf
+      (set-window-configuration wconf))))
 
 (defun scad-sketch-help ()
   "Display a key binding summary in the echo area.
@@ -1329,66 +1191,6 @@ For full documentation use \\[describe-mode]."
                    "R=radius  c=closed  l=line  r=rect | "
                    "x/y=coord  X/Y=delta  d=dist  a=angle  g=grid | "
                    "w=write  u=undo  q=quit  C-h m=full help")))
-
-;;; Adopting existing arrays
-
-(defun scad-sketch--inside-existing-block-p (&optional pos)
-  "Return non-nil if POS is inside a scad-sketch block."
-  (let ((origin (or pos (point))))
-    (save-excursion
-      (goto-char origin)
-      (when (re-search-backward scad-sketch-metadata-regexp nil t)
-        (let ((beg (line-beginning-position)))
-          (goto-char (line-end-position))
-          (and (re-search-forward scad-sketch-end-regexp nil t)
-               (<= beg origin) (<= origin (match-end 0))))))))
-
-(defun scad-sketch--metadata-for-adopted-array (name kind)
-  "Build a metadata comment for adopted NAME/KIND."
-  (let* ((closed (if (y-or-n-p "Mark sketch as closed? ") "true" "false"))
-         (grid   (read-number "Grid step: " scad-sketch-default-grid))
-         (units  (read-string "Units: " "mm")))
-    (format "// scad-sketch: name=%s kind=%s closed=%s grid=%s units=%s"
-            name kind closed (scad-sketch--fmt-num grid) units)))
-
-;;;###autoload
-(defun scad-sketch-adopt-array-at-point ()
-  "Wrap the array at point in scad-sketch comments.
-Kind is inferred: 2-column -> 2d, 3-column -> 2d-with-curves."
-  (interactive)
-  (when (scad-sketch--inside-existing-block-p)
-    (user-error "Already inside a scad-sketch block"))
-  (let* ((assignment (scad-sketch--find-array-assignment-at-point))
-         (name       (plist-get assignment :name))
-         (kind       (scad-sketch--infer-kind (plist-get assignment :text)))
-         (metadata   (scad-sketch--metadata-for-adopted-array name kind))
-         (beg        (plist-get assignment :beg))
-         (end        (copy-marker (plist-get assignment :end) t))
-         (origin     (copy-marker (point) t)))
-    (save-excursion
-      (goto-char end) (end-of-line)
-      (insert "\n// end-scad-sketch")
-      (goto-char beg) (beginning-of-line)
-      (insert metadata "\n"))
-    (goto-char origin)
-    (message "Adopted `%s' as scad-sketch kind=%s. Run M-x scad-sketch-at-point to edit."
-             name kind)))
-
-;;; Convenience snippets
-
-;;;###autoload
-(defun scad-sketch-insert-2d-block (name)
-  "Insert a new empty 2D scad-sketch block named NAME."
-  (interactive "sSketch name: ")
-  (insert (format "// scad-sketch: name=%s kind=2d closed=true grid=1 units=mm\n%s = [\n];\n// end-scad-sketch\n"
-                  name name)))
-
-;;;###autoload
-(defun scad-sketch-insert-polyround-block (name)
-  "Insert a new empty 2D-with-curves scad-sketch block named NAME."
-  (interactive "sSketch name: ")
-  (insert (format "// scad-sketch: name=%s kind=2d-with-curves closed=true grid=1 units=mm\n%s = [\n];\n// end-scad-sketch\n"
-                  name name)))
 
 (provide 'scad-sketch)
 ;;; scad-sketch.el ends here
