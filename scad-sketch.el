@@ -606,32 +606,40 @@ restricted to the currently focused subtree."
                   (< (scad-sketch--node-bbox-area a session)
                      (scad-sketch--node-bbox-area b session))))))
 
+
 (defun scad-sketch--point-in-node-p (x y node session)
   "Return non-nil if (X Y) is geometrically inside NODE."
-  (pcase (plist-get node :type)
-    ('circle
-     (let* ((cx (plist-get node :cx)) (cy (plist-get node :cy))
-            (r  (plist-get node :r))
-            (dx (- x cx)) (dy (- y cy)))
-       (< (+ (* dx dx) (* dy dy)) (* r r))))
-    ('square
-     (let ((sx (plist-get node :x)) (sy (plist-get node :y))
-           (sw (plist-get node :w)) (sh (plist-get node :h)))
-       (and (>= x sx) (<= x (+ sx sw))
-            (>= y sy) (<= y (+ sy sh)))))
-    ((or 'polygon 'array)
-     (let ((pts (or (scad-sketch--polygon-points node session) '())))
-       (scad-sketch--point-in-polygon-p x y pts)))
-    ((or 'difference 'union 'intersection)
-     ;; Hover the composition if cursor is within any child's bounding box.
-     (cl-some (lambda (c) (scad-sketch--point-in-node-p x y c session))
-              (plist-get node :children)))
-    ('translate
-     (scad-sketch--point-in-node-p
-      (- x (plist-get node :tx))
-      (- y (plist-get node :ty))
-      (plist-get node :child) session))
-    (_ nil)))
+  (let ((type (plist-get node :type)))
+    (cond
+     ((eq type 'circle)
+      (let* ((cx (plist-get node :cx))
+             (cy (plist-get node :cy))
+             (r  (plist-get node :r))
+             (dx (- x cx))
+             (dy (- y cy)))
+        (< (+ (* dx dx) (* dy dy)) (* r r))))
+     ((eq type 'square)
+      (let ((sx (plist-get node :x))
+            (sy (plist-get node :y))
+            (sw (plist-get node :w))
+            (sh (plist-get node :h)))
+        (and (>= x sx) (<= x (+ sx sw))
+             (>= y sy) (<= y (+ sy sh)))))
+     ((memq type '(polygon array))
+      (let ((pts (or (scad-sketch--polygon-points node session) '())))
+        (scad-sketch--point-in-polygon-p x y pts)))
+     ((memq type '(difference union intersection))
+      ;; Hover the composition if cursor is within any child's geometry.
+      (cl-some (lambda (c)
+                 (scad-sketch--point-in-node-p x y c session))
+               (plist-get node :children)))
+     ((eq type 'translate)
+      (scad-sketch--point-in-node-p
+       (- x (plist-get node :tx))
+       (- y (plist-get node :ty))
+       (plist-get node :child)
+       session))
+     (t nil))))
 
 (defun scad-sketch--point-in-polygon-p (x y pts)
   "Ray-casting polygon containment test for point (X Y) in PTS."
@@ -648,39 +656,46 @@ restricted to the currently focused subtree."
           (setq j i))))
     inside))
 
+
 (defun scad-sketch--node-bbox (node session)
   "Return (min-x max-x min-y max-y) bounding box for NODE."
-  (pcase (plist-get node :type)
-    ('circle
-     (let ((cx (plist-get node :cx)) (cy (plist-get node :cy))
-           (r  (plist-get node :r)))
-       (list (- cx r) (+ cx r) (- cy r) (+ cy r))))
-    ('square
-     (list (plist-get node :x)
-           (+ (plist-get node :x) (plist-get node :w))
-           (plist-get node :y)
-           (+ (plist-get node :y) (plist-get node :h))))
-    ((or 'polygon 'array)
-     (let ((pts (or (scad-sketch--polygon-points node session) '())))
-       (if pts
-           (list (apply #'min (mapcar #'car pts))
-                 (apply #'max (mapcar #'car pts))
-                 (apply #'min (mapcar #'cadr pts))
-                 (apply #'max (mapcar #'cadr pts)))
-         (list 0 1 0 1))))
-    ((or 'difference 'union 'intersection)
-     (let ((boxes (mapcar (lambda (c) (scad-sketch--node-bbox c session))
-                          (plist-get node :children))))
-       (list (apply #'min (mapcar #'car  boxes))
-             (apply #'max (mapcar #'cadr boxes))
-             (apply #'min (mapcar #'caddr boxes))
-             (apply #'max (mapcar #'cadddr boxes)))))
-    ('translate
-     (let ((box (scad-sketch--node-bbox (plist-get node :child) session))
-           (tx (plist-get node :tx)) (ty (plist-get node :ty)))
-       (list (+ (nth 0 box) tx) (+ (nth 1 box) tx)
-             (+ (nth 2 box) ty) (+ (nth 3 box) ty))))
-    (_ (list 0 1 0 1))))
+  (let ((type (plist-get node :type)))
+    (cond
+     ((eq type 'circle)
+      (let ((cx (plist-get node :cx))
+            (cy (plist-get node :cy))
+            (r  (plist-get node :r)))
+        (list (- cx r) (+ cx r) (- cy r) (+ cy r))))
+     ((eq type 'square)
+      (list (plist-get node :x)
+            (+ (plist-get node :x) (plist-get node :w))
+            (plist-get node :y)
+            (+ (plist-get node :y) (plist-get node :h))))
+     ((memq type '(polygon array))
+      (let ((pts (or (scad-sketch--polygon-points node session) '())))
+        (if pts
+            (list (apply #'min (mapcar #'car pts))
+                  (apply #'max (mapcar #'car pts))
+                  (apply #'min (mapcar #'cadr pts))
+                  (apply #'max (mapcar #'cadr pts)))
+          (list 0 1 0 1))))
+     ((memq type '(difference union intersection))
+      (let ((boxes (mapcar (lambda (c)
+                             (scad-sketch--node-bbox c session))
+                           (plist-get node :children))))
+        (if boxes
+            (list (apply #'min (mapcar #'car boxes))
+                  (apply #'max (mapcar #'cadr boxes))
+                  (apply #'min (mapcar #'caddr boxes))
+                  (apply #'max (mapcar #'cadddr boxes)))
+          (list 0 1 0 1))))
+     ((eq type 'translate)
+      (let ((box (scad-sketch--node-bbox (plist-get node :child) session))
+            (tx (plist-get node :tx))
+            (ty (plist-get node :ty)))
+        (list (+ (nth 0 box) tx) (+ (nth 1 box) tx)
+              (+ (nth 2 box) ty) (+ (nth 3 box) ty))))
+     (t (list 0 1 0 1)))))
 
 (defun scad-sketch--node-bbox-area (node session)
   "Return bounding box area of NODE (for hover sorting)."
@@ -989,6 +1004,7 @@ With a polygon focused: cycle through its vertices."
 
 ;;;; Rendering
 
+
 (defun scad-sketch--all-points (session)
   "Collect all visible [x y] coords for auto-zoom bounds."
   (let (pts)
@@ -996,18 +1012,22 @@ With a polygon focused: cycle through its vertices."
       (scad-sketch-parse--walk
        node
        (lambda (n)
-         (pcase (plist-get n :type)
-           ((or 'polygon 'array)
-            (dolist (p (or (scad-sketch--polygon-points n session) '()))
-              (push (list (nth 0 p) (nth 1 p)) pts)))
-           ('circle
-            (let ((cx (plist-get n :cx)) (cy (plist-get n :cy)) (r (plist-get n :r)))
-              (push (list (- cx r) (- cy r)) pts)
-              (push (list (+ cx r) (+ cy r)) pts)))
-           ('square
-            (push (list (plist-get n :x) (plist-get n :y)) pts)
-            (push (list (+ (plist-get n :x) (plist-get n :w))
-                        (+ (plist-get n :y) (plist-get n :h))) pts))))))
+         (let ((type (plist-get n :type)))
+           (cond
+            ((memq type '(polygon array))
+             (dolist (p (or (scad-sketch--polygon-points n session) '()))
+               (push (list (nth 0 p) (nth 1 p)) pts)))
+            ((eq type 'circle)
+             (let ((cx (plist-get n :cx))
+                   (cy (plist-get n :cy))
+                   (r  (plist-get n :r)))
+               (push (list (- cx r) (- cy r)) pts)
+               (push (list (+ cx r) (+ cy r)) pts)))
+            ((eq type 'square)
+             (push (list (plist-get n :x) (plist-get n :y)) pts)
+             (push (list (+ (plist-get n :x) (plist-get n :w))
+                         (+ (plist-get n :y) (plist-get n :h)))
+                   pts)))))))
     pts))
 
 (defun scad-sketch--bounds (session)
@@ -1027,10 +1047,15 @@ With a polygon focused: cycle through its vertices."
               (py (max 1 (* 0.15 (- max-y min-y)))))
           (list (- min-x px) (+ max-x px) (- min-y py) (+ max-y py)))))))
 
+
 (defun scad-sketch--transform (bounds)
   "Return a model→pixel transform closure for BOUNDS."
-  (pcase-let ((`(,min-x ,max-x ,min-y ,max-y) bounds))
-    (let* ((w scad-sketch-canvas-width) (h scad-sketch-canvas-height)
+  (let ((min-x (nth 0 bounds))
+        (max-x (nth 1 bounds))
+        (min-y (nth 2 bounds))
+        (max-y (nth 3 bounds)))
+    (let* ((w scad-sketch-canvas-width)
+           (h scad-sketch-canvas-height)
            (m scad-sketch-margin)
            (scale (min (/ (- w (* 2 m)) (- max-x min-x))
                        (/ (- h (* 2 m)) (- max-y min-y)))))
@@ -1043,9 +1068,13 @@ With a polygon focused: cycle through its vertices."
   (let ((pa (funcall tf a)) (pb (funcall tf b)))
     (apply #'svg-line svg (nth 0 pa) (nth 1 pa) (nth 0 pb) (nth 1 pb) args)))
 
+
 (defun scad-sketch--draw-grid (svg bounds tf session)
   "Draw the background grid."
-  (pcase-let ((`(,min-x ,max-x ,min-y ,max-y) bounds))
+  (let ((min-x (nth 0 bounds))
+        (max-x (nth 1 bounds))
+        (min-y (nth 2 bounds))
+        (max-y (nth 3 bounds)))
     (let* ((g (max 0.0001 (scad-sketch-session-grid session)))
            (x (* g (floor (/ min-x g))))
            (y (* g (floor (/ min-y g)))))
@@ -1197,141 +1226,148 @@ With a polygon focused: cycle through its vertices."
       :selected)
      (t :normal))))
 
+
 (defun scad-sketch--state-colors (state)
   "Return (stroke fill stroke-width) for a visual STATE."
-  (pcase state
-    (:focused  '("#111111" "none" 3))
-    (:hovered  '("#0057c2" "none" 2))
-    (:selected '("#d13f00" "none" 2))
-    (:context  '("#cccccc" "none" 1))
-    (_         '("#555555" "none" 1))))
+  (cond
+   ((eq state :focused)  '("#111111" "none" 3))
+   ((eq state :hovered)  '("#0057c2" "none" 2))
+   ((eq state :selected) '("#d13f00" "none" 2))
+   ((eq state :context)  '("#cccccc" "none" 1))
+   (t                    '("#555555" "none" 1))))
+
 
 (defun scad-sketch--draw-node (svg tf session node)
   "Render NODE onto SVG using transform TF."
   (let* ((state  (scad-sketch--node-visual-state node session))
          (colors (scad-sketch--state-colors state))
          (stroke (nth 0 colors))
-         (sw     (nth 2 colors)))
-    (pcase (plist-get node :type)
-      ;; Polygon / array
-      ((or 'polygon 'array)
-       (let* ((pts    (or (scad-sketch--polygon-points node session) '()))
-              (closed (if (eq (plist-get node :type) 'array)
-                          t
-                        (scad-sketch--poly-closed session node)))
-              (focused (scad-sketch--focused-node session))
-              (is-focused (eq node focused)))
-         (when (>= (length pts) 2)
-           (if (scad-sketch--any-radius-p pts)
-               (let ((d (scad-sketch--polyround-path-d pts closed tf)))
-                 (when d (svg-node svg 'path :d d :stroke stroke :stroke-width sw :fill "none")))
-             (let ((xys (mapcar (lambda (p) (list (float (nth 0 p)) (float (nth 1 p)))) pts)))
-               (cl-loop for a on xys for b = (cadr a) when b do
-                        (scad-sketch--svg-line svg tf (car a) b :stroke stroke :stroke-width sw))
-               (when (and closed (> (length xys) 2))
-                 (scad-sketch--svg-line svg tf (car (last xys)) (car xys) :stroke stroke :stroke-width sw)))))
-         ;; Draw vertex dots when this polygon is focused
-         (when is-focused
-           (let ((sel-idx (scad-sketch--poly-selected-index session node))
-                 (n (length pts)))
-             (dotimes (i n)
-               (let* ((p      (nth i pts))
-                      (xy     (list (float (nth 0 p)) (float (nth 1 p))))
-                      (screen (funcall tf xy))
-                      (sel    (= i (or sel-idx -1)))
-                      (r-val  (or (nth 2 p) 0)))
-                 (svg-circle svg (nth 0 screen) (nth 1 screen) (if sel 7 5)
-                             :stroke (if sel "#d13f00" "#111111")
-                             :stroke-width (if sel 3 2)
-                             :fill (if sel "#fff0e8" "#ffffff"))
-                 (svg-text svg (number-to-string i)
-                           :x (+ (nth 0 screen) 8) :y (- (nth 1 screen) 8)
-                           :font-size 12 :fill "#333333")
-                 (when (> r-val 0)
-                   (let* ((prev    (cond ((> i 0)     (nth (1- i) pts))
+         (sw     (nth 2 colors))
+         (type   (plist-get node :type)))
+    (cond
+     ;; Polygon / array
+     ((memq type '(polygon array))
+      (let* ((pts    (or (scad-sketch--polygon-points node session) '()))
+             (closed (if (eq type 'array)
+                         t
+                       (scad-sketch--poly-closed session node)))
+             (focused (scad-sketch--focused-node session))
+             (is-focused (eq node focused)))
+        (when (>= (length pts) 2)
+          (if (scad-sketch--any-radius-p pts)
+              (let ((d (scad-sketch--polyround-path-d pts closed tf)))
+                (when d (svg-node svg 'path :d d :stroke stroke :stroke-width sw :fill "none")))
+            (let ((xys (mapcar (lambda (p) (list (float (nth 0 p)) (float (nth 1 p)))) pts)))
+              (cl-loop for a on xys for b = (cadr a) when b do
+                       (scad-sketch--svg-line svg tf (car a) b :stroke stroke :stroke-width sw))
+              (when (and closed (> (length xys) 2))
+                (scad-sketch--svg-line svg tf (car (last xys)) (car xys) :stroke stroke :stroke-width sw)))))
+        ;; Draw vertex dots when this polygon is focused
+        (when is-focused
+          (let ((sel-idx (scad-sketch--poly-selected-index session node))
+                (n (length pts)))
+            (dotimes (i n)
+              (let* ((p      (nth i pts))
+                     (xy     (list (float (nth 0 p)) (float (nth 1 p))))
+                     (screen (funcall tf xy))
+                     (sel    (= i (or sel-idx -1)))
+                     (r-val  (or (nth 2 p) 0)))
+                (svg-circle svg (nth 0 screen) (nth 1 screen) (if sel 7 5)
+                            :stroke (if sel "#d13f00" "#111111")
+                            :stroke-width (if sel 3 2)
+                            :fill (if sel "#fff0e8" "#ffffff"))
+                (svg-text svg (number-to-string i)
+                          :x (+ (nth 0 screen) 8) :y (- (nth 1 screen) 8)
+                          :font-size 12 :fill "#333333")
+                (when (> r-val 0)
+                  (let* ((prev    (cond ((> i 0)     (nth (1- i) pts))
                                         (closed       (nth (1- n) pts))))
-                          (next    (cond ((< i (1- n)) (nth (1+ i) pts))
+                         (next    (cond ((< i (1- n)) (nth (1+ i) pts))
                                         (closed       (nth 0 pts))))
-                          (corner  (when (and prev next)
-                                     (scad-sketch--corner-geometry
-                                      (list (float (nth 0 prev)) (float (nth 1 prev)))
-                                      xy
-                                      (list (float (nth 0 next)) (float (nth 1 next)))
-                                      r-val)))
-                          (act-r   (if corner (plist-get corner :radius) r-val))
-                          (capped  (and corner (< (+ act-r 0.001) r-val))))
-                     (svg-circle svg (nth 0 screen) (nth 1 screen)
-                                 (scad-sketch--pixel-radius act-r tf)
-                                 :stroke (if capped "#c04000" "#804000")
-                                 :stroke-width 1 :stroke-dasharray "3,3" :fill "none")
-                     (svg-text svg (if capped
-                                       (format "r=%s\u2192%s"
-                                               (scad-sketch--fmt-num r-val)
-                                               (scad-sketch--fmt-num act-r))
-                                     (format "r=%s" (scad-sketch--fmt-num r-val)))
-                               :x (+ (nth 0 screen) 8) :y (+ (nth 1 screen) 18)
-                               :font-size 11 :fill (if capped "#c04000" "#804000"))))))))
-       ;; Shape label when not focused
-       (when (not (eq node (scad-sketch--focused-node session)))
-         (let* ((bbox   (scad-sketch--node-bbox node session))
-                (cx     (/ (+ (nth 0 bbox) (nth 1 bbox)) 2.0))
-                (cy     (/ (+ (nth 2 bbox) (nth 3 bbox)) 2.0))
-                (screen (funcall tf (list cx cy))))
-           (svg-text svg "poly"
-                     :x (nth 0 screen) :y (nth 1 screen)
-                     :font-size 10 :fill stroke :text-anchor "middle"))))
+                         (corner  (when (and prev next)
+                                    (scad-sketch--corner-geometry
+                                     (list (float (nth 0 prev)) (float (nth 1 prev)))
+                                     xy
+                                     (list (float (nth 0 next)) (float (nth 1 next)))
+                                     r-val)))
+                         (act-r   (if corner (plist-get corner :radius) r-val))
+                         (capped  (and corner (< (+ act-r 0.001) r-val))))
+                    (svg-circle svg (nth 0 screen) (nth 1 screen)
+                                (scad-sketch--pixel-radius act-r tf)
+                                :stroke (if capped "#c04000" "#804000")
+                                :stroke-width 1 :stroke-dasharray "3,3" :fill "none")
+                    (svg-text svg (if capped
+                                      (format "r=%s→%s"
+                                              (scad-sketch--fmt-num r-val)
+                                              (scad-sketch--fmt-num act-r))
+                                    (format "r=%s" (scad-sketch--fmt-num r-val)))
+                              :x (+ (nth 0 screen) 8) :y (+ (nth 1 screen) 18)
+                              :font-size 11 :fill (if capped "#c04000" "#804000"))))))))
+        ;; Shape label when not focused
+        (when (not (eq node (scad-sketch--focused-node session)))
+          (let* ((bbox   (scad-sketch--node-bbox node session))
+                 (cx     (/ (+ (nth 0 bbox) (nth 1 bbox)) 2.0))
+                 (cy     (/ (+ (nth 2 bbox) (nth 3 bbox)) 2.0))
+                 (screen (funcall tf (list cx cy))))
+            (svg-text svg "poly"
+                      :x (nth 0 screen) :y (nth 1 screen)
+                      :font-size 10 :fill stroke :text-anchor "middle")))))
 
-      ;; Circle
-      ('circle
-       (let* ((cx (plist-get node :cx)) (cy (plist-get node :cy))
-              (r  (plist-get node :r))
-              (sc (funcall tf (list cx cy)))
-              (pr (scad-sketch--pixel-radius r tf)))
-         (svg-circle svg (nth 0 sc) (nth 1 sc) pr
-                     :stroke stroke :stroke-width sw :fill "none")
-         (svg-circle svg (nth 0 sc) (nth 1 sc) 3
-                     :stroke stroke :stroke-width 1 :fill stroke)
-         (svg-text svg (format "r=%s" (scad-sketch--fmt-num r))
-                   :x (+ (nth 0 sc) (+ pr 4)) :y (nth 1 sc)
-                   :font-size 10 :fill stroke)))
+     ;; Circle
+     ((eq type 'circle)
+      (let* ((cx (plist-get node :cx))
+             (cy (plist-get node :cy))
+             (r  (plist-get node :r))
+             (sc (funcall tf (list cx cy)))
+             (pr (scad-sketch--pixel-radius r tf)))
+        (svg-circle svg (nth 0 sc) (nth 1 sc) pr
+                    :stroke stroke :stroke-width sw :fill "none")
+        (svg-circle svg (nth 0 sc) (nth 1 sc) 3
+                    :stroke stroke :stroke-width 1 :fill stroke)
+        (svg-text svg (format "r=%s" (scad-sketch--fmt-num r))
+                  :x (+ (nth 0 sc) (+ pr 4)) :y (nth 1 sc)
+                  :font-size 10 :fill stroke)))
 
-      ;; Square
-      ('square
-       (let* ((x (plist-get node :x)) (y (plist-get node :y))
-              (w (plist-get node :w)) (h (plist-get node :h))
-              (corners (list (list x y) (list (+ x w) y)
-                             (list (+ x w) (+ y h)) (list x (+ y h))))
-              (xys (mapcar tf corners)))
-         (cl-loop for a on xys for b = (cadr a) when b do
-                  (apply #'svg-line svg
-                         (nth 0 (car a)) (nth 1 (car a)) (nth 0 b) (nth 1 b)
-                         (list :stroke stroke :stroke-width sw)))
-         (apply #'svg-line svg
-                (nth 0 (car (last xys))) (nth 1 (car (last xys)))
-                (nth 0 (car xys)) (nth 1 (car xys))
-                (list :stroke stroke :stroke-width sw))))
+     ;; Square
+     ((eq type 'square)
+      (let* ((x (plist-get node :x))
+             (y (plist-get node :y))
+             (w (plist-get node :w))
+             (h (plist-get node :h))
+             (corners (list (list x y) (list (+ x w) y)
+                            (list (+ x w) (+ y h)) (list x (+ y h))))
+             (xys (mapcar tf corners)))
+        (cl-loop for a on xys for b = (cadr a) when b do
+                 (apply #'svg-line svg
+                        (nth 0 (car a)) (nth 1 (car a)) (nth 0 b) (nth 1 b)
+                        (list :stroke stroke :stroke-width sw)))
+        (apply #'svg-line svg
+               (nth 0 (car (last xys))) (nth 1 (car (last xys)))
+               (nth 0 (car xys)) (nth 1 (car xys))
+               (list :stroke stroke :stroke-width sw))))
 
-      ;; Text
-      ('text
-       (let* ((sc (funcall tf (list (plist-get node :x) (plist-get node :y))))
-              (sz (scad-sketch--pixel-radius (plist-get node :size) tf)))
-         (svg-text svg (plist-get node :str)
-                   :x (nth 0 sc) :y (nth 1 sc)
-                   :font-size sz :fill stroke)))
+     ;; Text
+     ((eq type 'text)
+      (let* ((sc (funcall tf (list (plist-get node :x) (plist-get node :y))))
+             (sz (scad-sketch--pixel-radius (plist-get node :size) tf)))
+        (svg-text svg (plist-get node :str)
+                  :x (nth 0 sc) :y (nth 1 sc)
+                  :font-size sz :fill stroke)))
 
-      ;; Compositions — draw a label near centroid, children drawn separately
-      ((or 'difference 'union 'intersection)
-       (let* ((bbox   (scad-sketch--node-bbox node session))
-              (cx     (/ (+ (nth 0 bbox) (nth 1 bbox)) 2.0))
-              (cy     (/ (+ (nth 2 bbox) (nth 3 bbox)) 2.0))
-              (screen (funcall tf (list cx cy))))
-         (svg-text svg (symbol-name (plist-get node :type))
-                   :x (nth 0 screen) :y (- (nth 1 screen) 8)
-                   :font-size 10 :fill stroke :text-anchor "middle")))
+     ;; Compositions — draw a label near centroid, children drawn separately
+     ((memq type '(difference union intersection))
+      (let* ((bbox   (scad-sketch--node-bbox node session))
+             (cx     (/ (+ (nth 0 bbox) (nth 1 bbox)) 2.0))
+             (cy     (/ (+ (nth 2 bbox) (nth 3 bbox)) 2.0))
+             (screen (funcall tf (list cx cy))))
+        (svg-text svg (symbol-name type)
+                  :x (nth 0 screen) :y (- (nth 1 screen) 8)
+                  :font-size 10 :fill stroke :text-anchor "middle")))
 
-      ;; Transforms — just draw child (with a small annotation)
-      ((or 'translate 'rotate 'scale 'mirror)
-       nil))))) ; children rendered separately by the walk below
+     ;; Transforms — children are rendered separately by the tree walk.
+     ((memq type '(translate rotate scale mirror))
+      nil)
+     (t nil)))) ; children rendered separately by the walk below
 
 (defun scad-sketch--draw-tree (svg tf session)
   "Draw all nodes in the session tree."
