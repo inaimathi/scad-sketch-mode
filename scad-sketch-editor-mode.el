@@ -698,40 +698,20 @@ Without marks, inserts only the cursor."
 
 
 (defun scad-sketch--emit-content (session)
-  "Emit the full SCAD array assignment for SESSION.
-Emits two-column format if all radii are zero; three-column otherwise."
-  (let* ((name      (scad-sketch-session-name session))
-         (points    (scad-sketch-session-points session))
-         (use-radii (scad-sketch--any-radius-p points))
-         (lines     (mapcar (lambda (p)
-                              (concat "  " (scad-sketch--emit-point p use-radii)))
-                            points)))
-    (concat name " = [\n"
-            (mapconcat #'identity lines ",\n")
-            (if lines "\n" "")
-            "];\n")))
+  "Return the live source preview for SESSION."
+  (scad-sketch-session-preview session))
 
 ;;; Write-back / quit
-
 (defun scad-sketch-write-back ()
-  "Write the edited array back to the source buffer."
+  "Write the edited sketch back to the source buffer."
   (interactive)
   (let* ((session (scad-sketch--assert-session))
-         (source  (scad-sketch-session-source-buffer session))
-         (beg     (scad-sketch-session-content-beg session))
-         (end     (scad-sketch-session-content-end session))
-         (content (scad-sketch--emit-content session)))
-    (unless (buffer-live-p source) (user-error "Source buffer is gone"))
-    (with-current-buffer source
-      (save-excursion
-        (goto-char beg)
-        (delete-region beg end)
-        (insert content)
-        (set-marker end (point))))
-    (setf (scad-sketch-session-dirty session) nil)
+         (source  (scad-sketch-session-source-buffer session)))
+    (scad-sketch-session-write-back session)
     (scad-sketch--render)
     (message "Wrote scad-sketch `%s' back to %s"
-             (scad-sketch-session-name session) (buffer-name source))))
+             (scad-sketch-session-name session)
+             (if (buffer-live-p source) (buffer-name source) "<dead buffer>"))))
 
 (defun scad-sketch-quit ()
   "Quit the sketch editor and restore the window configuration."
