@@ -1,49 +1,20 @@
-;;; scad-sketch-session.el --- Session struct and entry points for scad-sketch -*- lexical-binding: t; -*-
+;;; scad-sketch-session.el --- Session construction for scad-sketch -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
-;; Defines the `scad-sketch-session' struct that carries all editor state,
-;; the functions that construct a session from an OpenSCAD source buffer,
-;; the `scad-sketch-mode' minor mode that adds key bindings to .scad buffers,
-;; and the top-level interactive entry points (`scad-sketch-at-point',
-;; `scad-sketch-or-insert-at-point').
+;; Session and source-buffer discovery layer for scad-sketch.
 ;;
-;; DEPENDENCY ORDER
-;;   scad-sketch-parse  ←  scad-sketch-geometry  ←  scad-sketch-session
-;;                                                 ↑
-;;                                        scad-sketch-editor-mode  (requires this file)
-;;
-;; SESSION STRUCT SLOTS
-;; --------------------
-;;   tree             list of top-level AST nodes (scad-sketch-parse output)
-;;   source-text      original source string (for variable resolution)
-;;   focused-path     nil or (i j …) path from root to the focused node
-;;   hover-stack      list of nodes under cursor, deepest first (recomputed each render)
-;;   selection        list of selection-ref plists (:kind :path :index)
-;;   point            [x y] cursor position in model space
-;;   marks            list of [x y], newest first
-;;   named-marks      hash-table: polygon-node → (selected-index . closed)
-;;                    (repurposed from the original per-polygon edit-state table)
-;;   grid             current grid step (float)
-;;   fine-step        fine movement step (float)
-;;   coarse-step      coarse movement step (float)
-;;   units            display unit string, e.g. "mm"
-;;   source-buffer    the Emacs buffer being edited
-;;   content-beg      marker: start of the editable region in source-buffer
-;;   content-end      marker: end of the editable region (moves with inserts)
-;;   dirty            non-nil when the tree differs from source-buffer content
-;;   undo-stack       list of saved state plists
+;; This file intentionally still uses the pre-parser array-assignment scanner.
+;; The parser-backed target/region resolver belongs here next, but this split
+;; preserves the existing behavior first.
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 'scad-sketch-parse)
-(require 'scad-sketch-geometry)
-
-;;;; ── Customization ───────────────────────────────────────────────────────────
+(require 'subr-x)
 
 (defgroup scad-sketch nil
-  "Keyboard sketch editor for OpenSCAD 2D forms."
+  "Keyboard sketch editor for OpenSCAD array literals."
   :group 'tools
   :prefix "scad-sketch-")
 
@@ -52,242 +23,166 @@
   :type 'number :group 'scad-sketch)
 
 (defcustom scad-sketch-default-fine-step 0.1
-  "Default fine movement step."
+  "Default fine movement step in sketch units."
   :type 'number :group 'scad-sketch)
 
 (defcustom scad-sketch-default-coarse-step 5.0
-  "Default coarse movement step."
+  "Default coarse movement step in sketch units."
   :type 'number :group 'scad-sketch)
 
-(defcustom scad-sketch-canvas-width 900
-  "Canvas width in pixels."
-  :type 'integer :group 'scad-sketch)
 
-(defcustom scad-sketch-canvas-height 650
-  "Canvas height in pixels."
-  :type 'integer :group 'scad-sketch)
-
-(defcustom scad-sketch-margin 48
-  "Canvas margin in pixels."
-  :type 'integer :group 'scad-sketch)
-
-;;;; ── Session struct ─────────────────────────────────────────────────────────
 
 (cl-defstruct scad-sketch-session
-  ;; Tree and source
-  tree
-  source-text
-  focused-path
-  hover-stack
-  selection
-  ;; Cursor and marks
-  point
-  marks
-  named-marks                           ; hash-table: node → (sel-idx . closed)
-  grid
-  fine-step
-  coarse-step
-  units
-  ;; Source buffer linkage
-  source-buffer
-  content-beg
-  content-end
-  dirty
-  undo-stack)
+  name units grid fine-step coarse-step closed
+  points point
+  marks          ; list of [x y], newest first; (car marks) is the current mark
+  named-marks selected-index
+  source-buffer content-beg content-end
+  dirty undo-stack)
 
-;;;; ── Minor mode (source buffer side) ────────────────────────────────────────
+(defvar-local scad-sketch--session nil)
 
-(defvar scad-sketch-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-c C-a") #'scad-sketch-at-point)
-    (define-key map (kbd "C-c C-.") #'scad-sketch-or-insert-at-point)
-    map)
-  "Keymap for `scad-sketch-mode'.
-C-c C-a  – open sketch editor on the form at point.
-C-c C-.  – open editor, or insert a new named array if none found.")
+(defun scad-sketch--assert-session ()
+  "Return the current sketch session or signal an error."
+  (unless (and (boundp 'scad-sketch--session) scad-sketch--session)
+    (user-error "No active scad-sketch session"))
+  scad-sketch--session)
 
-;;;###autoload
-(define-minor-mode scad-sketch-mode
-  "Minor mode that adds sketch-editor key bindings to OpenSCAD source buffers.
+;;; Array-assignment finding
 
-\\{scad-sketch-mode-map}"
-  :lighter " Sketch"
-  :keymap scad-sketch-mode-map)
+(defconst scad-sketch--number-re
+  "[-+]?[0-9]*\\.?[0-9]+\\(?:[eE][-+]?[0-9]+\\)?")
 
-;;;; ── Internal: editor buffer constants ─────────────────────────────────────
+(defun scad-sketch--strip-line-comments (s)
+  "Remove // line comments from each line of S."
+  (mapconcat (lambda (line)
+               (if (string-match "//" line)
+                   (substring line 0 (match-beginning 0))
+                 line))
+             (split-string s "\n") "\n"))
 
-(defconst scad-sketch--editor-buffer-prefix "*scad-sketch: "
-  "Prefix for editor buffer names.")
+(defun scad-sketch--forward-balanced-bracket (pos)
+  "Return position just after the `[...]' form starting at POS."
+  (save-excursion
+    (goto-char pos)
+    (unless (= (char-after) ?\[)
+      (user-error "Expected `[' at array start"))
+    (let ((depth 0) done in-string escape line-comment block-comment)
+      (while (and (not done) (< (point) (point-max)))
+        (let ((ch   (char-after))
+              (next (char-after (1+ (point)))))
+          (cond
+           (line-comment  (when (= ch ?\n) (setq line-comment nil)) (forward-char 1))
+           (block-comment (if (and next (= ch ?*) (= next ?/))
+                              (progn (setq block-comment nil) (forward-char 2))
+                            (forward-char 1)))
+           (in-string (cond (escape (setq escape nil) (forward-char 1))
+                            ((= ch ?\\) (setq escape t) (forward-char 1))
+                            ((= ch ?\") (setq in-string nil) (forward-char 1))
+                            (t (forward-char 1))))
+           ((and next (= ch ?/) (= next ?/)) (setq line-comment t)  (forward-char 2))
+           ((and next (= ch ?/) (= next ?*)) (setq block-comment t) (forward-char 2))
+           ((= ch ?\") (setq in-string t) (forward-char 1))
+           ((= ch ?\[) (setq depth (1+ depth)) (forward-char 1))
+           ((= ch ?\]) (setq depth (1- depth)) (forward-char 1)
+            (when (= depth 0) (setq done t)))
+           (t (forward-char 1)))))
+      (unless done (user-error "Could not find the end of this array literal"))
+      (point))))
 
-;;;; ── Session construction helpers ──────────────────────────────────────────
+(defun scad-sketch--find-array-assignment-at-point ()
+  "Find a literal SCAD array assignment at or surrounding point.
+Returns plist (:name :beg :end :text)."
+  (let ((origin (point)) name beg open end)
+    (save-excursion
+      (goto-char (line-end-position))
+      (unless (re-search-backward
+               (rx (group (+ (any "A-Za-z0-9_$"))) (* space) "=" (* space) "[")
+               nil t)
+        (user-error "No literal array assignment before point"))
+      (setq name (match-string-no-properties 1)
+            beg  (match-beginning 0)
+            open (1- (match-end 0))
+            end  (scad-sketch--forward-balanced-bracket open))
+      (goto-char end)
+      (skip-chars-forward " \t\r\n")
+      (unless (= (char-after) ?\;)
+        (user-error "Array assignment must end with a semicolon"))
+      (forward-char 1)
+      (setq end (point))
+      (unless (<= origin end)
+        (user-error "Point is not inside the nearest literal array assignment"))
+      (list :name name :beg beg :end end
+            :text (buffer-substring-no-properties beg end)))))
 
-(defun scad-sketch--path-in-list (nodes target)
-  "Return the path (list of child indices from root) to TARGET in NODES.
-NODES is the flat top-level list from `scad-sketch-parse'.
-Returns nil if TARGET is not found."
-  (cl-labels ((search (node-list prefix)
-                (cl-loop for n in node-list
-                         for i from 0
-                         when (eq n target)
-                           return (append prefix (list i))
-                         thereis
-                           (when (scad-sketch-parse--node-children n)
-                             (search (scad-sketch-parse--node-children n)
-                                     (append prefix (list i)))))))
-    (search nodes nil)))
+;;; Point parsing — always produces [x y r] triples
 
-(defun scad-sketch--bbox-of (nodes node source-text)
-  "Return bounding box (min-x max-x min-y max-y) for NODE in NODES context.
-Constructs a minimal stub session so `scad-sketch-geo--node-bbox' can
-resolve polygon variable references."
-  ;; We build a minimal stub rather than importing the full editor-mode
-  ;; machinery.  The polygon-points resolver only needs :tree and :source-text.
-  (let ((stub (make-scad-sketch-session
-               :tree nodes :source-text source-text
-               :focused-path nil :hover-stack nil :selection nil
-               :point '(0 0) :marks nil :named-marks nil
-               :grid 1 :fine-step 0.1 :coarse-step 5 :units "mm"
-               :source-buffer nil :content-beg nil :content-end nil
-               :dirty nil :undo-stack nil)))
-    (scad-sketch-geo--node-bbox
-     node
-     (lambda (n)
-       (let ((pts (plist-get n :points))
-             (src (plist-get n :source)))
-         (if (and (null pts) src)
-             (or (scad-sketch-parse--lookup-variable
-                  src (scad-sketch-session-source-text stub) (plist-get n :beg))
-                 pts)
-           pts))))))
+(defun scad-sketch--parse-points (text)
+  "Parse all [x, y] or [x, y, r] literals from TEXT.
+Always returns a list of [x y r] triples; r defaults to 0."
+  (let* ((clean (scad-sketch--strip-line-comments text))
+         (n     scad-sketch--number-re)
+         (re    (concat "\\[\\s-*\\(" n "\\)\\s-*,\\s-*\\(" n "\\)"
+                        "\\(?:\\s-*,\\s-*\\(" n "\\)\\)?" "\\s-*\\]"))
+         points)
+    (with-temp-buffer
+      (insert clean)
+      (goto-char (point-min))
+      (while (re-search-forward re nil t)
+        (push (list (string-to-number (match-string 1))
+                    (string-to-number (match-string 2))
+                    (if (match-string 3) (string-to-number (match-string 3)) 0))
+              points)))
+    (nreverse points)))
 
-;;;; ── Public: session constructor ────────────────────────────────────────────
+;;; Session construction
 
-(defun scad-sketch-make-session (source-text origin-offset source-buffer beg end)
-  "Parse SOURCE-TEXT and create a `scad-sketch-session' targeting ORIGIN-OFFSET.
-
-SOURCE-BUFFER is the Emacs buffer being edited.  BEG and END are markers
-bracketing the region that will be overwritten on write-back.
-
-The session's initial focus is set to the deepest primitive (polygon, array,
-circle, square, or text) that contains ORIGIN-OFFSET, if any.  Compositions
-and transforms are left unfocused so the root view is shown first."
-  (let* ((nodes        (scad-sketch-parse source-text))
-         (target-node  (scad-sketch-parse-node-at nodes origin-offset))
-         (target-path  (when target-node
-                         (scad-sketch--path-in-list nodes target-node)))
-         (focused-path (when (and target-node
-                                  (memq (plist-get target-node :type)
-                                        '(polygon array circle square text)))
-                         target-path))
-         (init-pt      (if target-node
-                           (let ((bbox (scad-sketch--bbox-of
-                                        nodes target-node source-text)))
-                             (list (/ (+ (nth 0 bbox) (nth 1 bbox)) 2.0)
-                                   (/ (+ (nth 2 bbox) (nth 3 bbox)) 2.0)))
-                         (list 0.0 0.0))))
+(defun scad-sketch--make-session (name points beg-marker end-marker)
+  "Create a session for array NAME with POINTS between BEG-MARKER and END-MARKER."
+  (let ((init-pt (if points
+                     (list (float (nth 0 (car points)))
+                           (float (nth 1 (car points))))
+                   (list 0.0 0.0))))
     (make-scad-sketch-session
-     :tree          nodes
-     :source-text   source-text
-     :focused-path  focused-path
-     :hover-stack   nil
-     :selection     nil
-     :point         init-pt
-     :marks         nil
-     :named-marks   nil
-     :grid          (float scad-sketch-default-grid)
-     :fine-step     (float scad-sketch-default-fine-step)
-     :coarse-step   (float scad-sketch-default-coarse-step)
-     :units         "mm"
-     :source-buffer source-buffer
-     :content-beg   beg
-     :content-end   end
-     :dirty         nil
-     :undo-stack    nil)))
+     :name name
+     :units "mm"
+     :grid (float scad-sketch-default-grid)
+     :fine-step (float scad-sketch-default-fine-step)
+     :coarse-step (float scad-sketch-default-coarse-step)
+     :closed t
+     :points points
+     :point init-pt
+     :marks nil
+     :named-marks nil
+     :selected-index (if points 0 nil)
+     :source-buffer (current-buffer)
+     :content-beg beg-marker
+     :content-end end-marker
+     :dirty nil
+     :undo-stack nil)))
 
-;;;; ── Public: open an editor buffer for a session ────────────────────────────
 
-(defun scad-sketch-open-session (session)
-  "Open (or reuse) an editor buffer for SESSION and switch to it.
-The editor buffer is put into `scad-sketch-editor-mode', which is defined
-in `scad-sketch-editor-mode.el' and required at load time."
-  (require 'scad-sketch-editor-mode)
-  (let* ((wconf (current-window-configuration))
-         ;; Derive a human-readable buffer name from the focused node, if any.
-         (name  (let ((path (scad-sketch-session-focused-path session)))
-                  (if path
-                      (let* ((tree (scad-sketch-session-tree session))
-                             (node (nth (car path) tree)))
-                        (or (plist-get node :name)
-                            (symbol-name (plist-get node :type))))
-                    "sketch")))
-         (buf   (get-buffer-create
-                 (format "%s%s*" scad-sketch--editor-buffer-prefix name))))
-    (with-current-buffer buf
-      (scad-sketch-editor-mode)
-      (setq-local scad-sketch--session session)
-      (setq-local scad-sketch--window-config wconf)
-      (scad-sketch--render))
-    (pop-to-buffer buf)))
+(defun scad-sketch-session-at-point ()
+  "Build a sketch session for the literal array assignment at point.
+This is the current non-parser implementation.  The parser-backed resolver
+should replace the internals of this function while keeping the return value
+as a `scad-sketch-session'."
+  (let* ((assignment (scad-sketch--find-array-assignment-at-point))
+         (name   (plist-get assignment :name))
+         (points (scad-sketch--parse-points (plist-get assignment :text)))
+         (beg    (copy-marker (plist-get assignment :beg)))
+         (end    (copy-marker (plist-get assignment :end) t)))
+    (scad-sketch--make-session name points beg end)))
 
-;;;; ── Interactive entry points ───────────────────────────────────────────────
-
-;;;###autoload
-(defun scad-sketch-at-point ()
-  "Open the sketch editor for the 2D OpenSCAD form at point.
-
-The entire buffer is parsed (unknown constructs are silently skipped), so
-variable references such as `polygon(pts)' can be resolved.  The editor
-focuses on the most specific recognised primitive at point, if any.
-
-Signals `user-error' if SVG support is absent or no 2D forms are found."
-  (interactive)
-  (unless (image-type-available-p 'svg)
-    (user-error "This Emacs was not built with SVG image support"))
-  (let* ((source-text (buffer-substring-no-properties (point-min) (point-max)))
-         (origin-off  (1- (point)))
-         (beg         (copy-marker (point-min)))
-         (end         (copy-marker (point-max) t))
-         (session     (condition-case err
-                          (scad-sketch-make-session
-                           source-text origin-off (current-buffer) beg end)
-                        (user-error
-                         (user-error "scad-sketch: %s" (cadr err))))))
-    (unless (scad-sketch-session-tree session)
-      (user-error "scad-sketch: no recognizable 2D forms found at or near point"))
-    (scad-sketch-open-session session)))
-
-;;;###autoload
-(defun scad-sketch-insert-array-at-point (name)
-  "Insert a new empty named array at point and open the sketch editor.
-Prompts for a variable NAME, inserts `NAME = [];' at point, then opens
-the editor with that array as the initial focus."
-  (interactive "sArray name: ")
-  (unless (image-type-available-p 'svg)
-    (user-error "This Emacs was not built with SVG image support"))
-  (let ((insert-pos (point)))
-    (insert (format "%s = [];\n" name))
-    (let* ((source-text (buffer-substring-no-properties (point-min) (point-max)))
-           (origin-off  (1- insert-pos))
-           (beg         (copy-marker (point-min)))
-           (end         (copy-marker (point-max) t))
-           (session     (scad-sketch-make-session
-                         source-text origin-off (current-buffer) beg end)))
-      (scad-sketch-open-session session))))
-
-;;;###autoload
-(defun scad-sketch-or-insert-at-point ()
-  "Edit the SCAD form at point, or insert a new array if none is found.
-
-Tries `scad-sketch-at-point' first.  If that signals a `user-error'
-(typically because no 2D form was found at point), falls back to
-`scad-sketch-insert-array-at-point', prompting for a variable name."
-  (interactive)
-  (unless (image-type-available-p 'svg)
-    (user-error "This Emacs was not built with SVG image support"))
-  (condition-case nil
-      (scad-sketch-at-point)
-    (user-error
-     (call-interactively #'scad-sketch-insert-array-at-point))))
+(defun scad-sketch-session-insert-array-at-point (name)
+  "Insert a new empty array named NAME at point and return its session."
+  (let (beg end)
+    (setq beg (point-marker))
+    (insert (format "%s = [
+];
+" name))
+    (setq end (copy-marker (point) t))
+    (scad-sketch--make-session name nil beg end)))
 
 (provide 'scad-sketch-session)
 ;;; scad-sketch-session.el ends here
