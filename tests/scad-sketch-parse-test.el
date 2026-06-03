@@ -116,6 +116,14 @@
          (vals   (mapcar (lambda (t) (nth 1 t)) (append tokens nil))))
     (should (equal vals '("(" ")" "{" "}" "[" "]" "," ";" "=")))))
 
+(ert-deftest ssp-tokenizer-angle-path ()
+  "Angle-bracket include/use paths tokenize as one `path' token."
+  (let* ((tokens (scad-sketch-parse--tokenize "include <MCAD/shapes.scad>"))
+         (types  (mapcar (lambda (tok) (nth 0 tok)) (append tokens nil)))
+         (vals   (mapcar (lambda (tok) (nth 1 tok)) (append tokens nil))))
+    (should (equal types '(id path)))
+    (should (equal vals '("include" "<MCAD/shapes.scad>")))))
+
 (ert-deftest ssp-tokenizer-whitespace-skipped ()
   "Whitespace and newlines produce no tokens."
   (let* ((tokens (scad-sketch-parse--tokenize "  \t\n  42  \r\n  ")))
@@ -255,6 +263,13 @@
          (n     (ssp-test--first-of-type nodes 'circle)))
     (should (ssp-test--approx= (plist-get n :r) 3.5))))
 
+(ert-deftest ssp-circle-extra-keyword-params-ignored ()
+  "circle(r=N, $fn=K) keeps the radius and ignores unsupported params."
+  (let* ((nodes (ssp-test--parse "circle(r=5, $fn=64);"))
+         (n     (ssp-test--first-of-type nodes 'circle)))
+    (should n)
+    (should (ssp-test--approx= (plist-get n :r) 5.0))))
+
 ;;; 3b. square
 
 (ert-deftest ssp-square-plain ()
@@ -347,6 +362,21 @@
     (should (string= (plist-get poly :source) "pts"))
     (should (null (plist-get poly :points)))
     (should (null (plist-get poly :polyround)))))
+
+(ert-deftest ssp-polygon-points-keyword-varref ()
+  "polygon(points=name) stores the variable name in :source."
+  (let* ((nodes (ssp-test--parse "pts=[[0,0]]; polygon(points=pts);"))
+         (poly  (ssp-test--first-of-type nodes 'polygon)))
+    (should (string= (plist-get poly :source) "pts"))
+    (should (null (plist-get poly :points)))))
+
+(ert-deftest ssp-polygon-points-keyword-inline-with-extra-params ()
+  "polygon(points=[...], paths=..., convexity=...) keeps points and ignores the rest."
+  (let* ((nodes (ssp-test--parse
+                 "polygon(points=[[0,0],[10,0],[0,10]], paths=[[0,1,2]], convexity=2);"))
+         (poly  (ssp-test--first-of-type nodes 'polygon)))
+    (should poly)
+    (should (= (length (plist-get poly :points)) 3))))
 
 (ert-deftest ssp-polygon-polyround-inline ()
   "polygon(polyRound([...], fn)) stores the points and fn."
@@ -539,19 +569,30 @@
 ;;;; =========================================================================
 
 (ert-deftest ssp-skip-include ()
-  "include <...>; (with semicolon) produces no node and does not crash.
-Note: angle brackets are not punctuation tokens, so the tokenizer treats
-the path as a sequence of identifier tokens.  Without a semicolon the
-skip logic consumes tokens until the next `;', which may include the
-following shape.  When include is followed by `;' it is isolated safely."
-  ;; With an explicit semicolon on the include line the circle survives.
-  (let* ((nodes (ssp-test--parse "include <foo.scad>;\ncircle(r=5);")))
+  "include <...> produces no node and does not eat the following shape."
+  (let* ((nodes (ssp-test--parse "include <foo.scad>
+circle(r=5);")))
+    (should (= (length nodes) 1))
+    (should (eq (plist-get (car nodes) :type) 'circle))))
+
+(ert-deftest ssp-skip-include-with-semicolon ()
+  "include <...>; also remains safe with an explicit semicolon."
+  (let* ((nodes (ssp-test--parse "include <foo.scad>;
+circle(r=5);")))
     (should (= (length nodes) 1))
     (should (eq (plist-get (car nodes) :type) 'circle))))
 
 (ert-deftest ssp-skip-use ()
-  "use <...>; (with semicolon) produces no node."
-  (let* ((nodes (ssp-test--parse "use <utils/helpers.scad>;\ncircle(r=5);")))
+  "use <...> produces no node and does not eat the following shape."
+  (let* ((nodes (ssp-test--parse "use <utils/helpers.scad>
+circle(r=5);")))
+    (should (= (length nodes) 1))
+    (should (eq (plist-get (car nodes) :type) 'circle))))
+
+(ert-deftest ssp-skip-use-with-semicolon ()
+  "use <...>; also remains safe with an explicit semicolon."
+  (let* ((nodes (ssp-test--parse "use <utils/helpers.scad>;
+circle(r=5);")))
     (should (= (length nodes) 1))
     (should (eq (plist-get (car nodes) :type) 'circle))))
 
@@ -573,6 +614,24 @@ following shape.  When include is followed by `;' it is isolated safely."
     ;; Only the standalone circle at the end survives.
     (should (= (length nodes) 1))
     (should (eq (plist-get (car nodes) :type) 'circle))))
+
+(ert-deftest ssp-skip-linear-extrude-braced ()
+  "A braced linear_extrude block is skipped whole, not harvested as 2D."
+  (let* ((nodes (ssp-test--parse
+                 "linear_extrude(height=10) { circle(r=30); }
+circle(r=5);")))
+    (should (= (length nodes) 1))
+    (should (eq (plist-get (car nodes) :type) 'circle))
+    (should (ssp-test--approx= (plist-get (car nodes) :r) 5.0))))
+
+(ert-deftest ssp-skip-3d-translate-wrapper ()
+  "A 3D translate wrapper is skipped as unsupported 3D syntax."
+  (let* ((nodes (ssp-test--parse
+                 "translate([1,2,0]) circle(r=30);
+circle(r=5);")))
+    (should (= (length nodes) 1))
+    (should (eq (plist-get (car nodes) :type) 'circle))
+    (should (ssp-test--approx= (plist-get (car nodes) :r) 5.0))))
 
 (ert-deftest ssp-skip-does-not-corrupt-subsequent-nodes ()
   "Nodes following a skipped form are still parsed correctly."
@@ -614,6 +673,15 @@ following shape.  When include is followed by `;' it is isolated safely."
          (circles (ssp-test--nodes-of-type nodes 'circle)))
     (should (= (length circles) 2))))
 
+
+(ert-deftest ssp-module-nodes-carry-scope ()
+  "Harvested module-body nodes carry a non-nil :scope."
+  (let* ((nodes (ssp-test--parse
+                 "module m() { pts = [[1,1]]; polygon(pts); }"))
+         (arr   (ssp-test--first-of-type nodes 'array))
+         (poly  (ssp-test--first-of-type nodes 'polygon)))
+    (should (plist-get arr :scope))
+    (should (equal (plist-get arr :scope) (plist-get poly :scope)))))
 
 ;;;; =========================================================================
 ;;;; 8. Positions (:beg / :end)
@@ -851,6 +919,45 @@ The range check is inclusive, so prefix whitespace to push :beg above 0."
     (should (ssp-test--approx= (nth 2 (nth 1 pts)) 5.0))))
 
 
+(ert-deftest ssp-lookup-prefers-same-module-scope ()
+  "lookup-variable prefers an array in the polygon's module scope over top-level."
+  (let* ((src (concat "pts = [[0,0]];
+"
+                      "module a() {
+"
+                      "  pts = [[1,1],[2,2]];
+"
+                      "  polygon(pts);
+"
+                      "}
+"))
+         (pos (string-match "polygon" src))
+         (pts (scad-sketch-parse--lookup-variable "pts" src pos)))
+    (should (= (length pts) 2))
+    (should (ssp-test--approx= (nth 0 (nth 0 pts)) 1.0))))
+
+(ert-deftest ssp-lookup-falls-back-to-parent-scope ()
+  "lookup-variable falls back to top-level when no module-local binding exists."
+  (let* ((src (concat "pts = [[0,0],[10,0]];
+"
+                      "module a() { polygon(pts); }
+"))
+         (pos (string-match "polygon" src))
+         (pts (scad-sketch-parse--lookup-variable "pts" src pos)))
+    (should (= (length pts) 2))
+    (should (ssp-test--approx= (nth 0 (nth 1 pts)) 10.0))))
+
+(ert-deftest ssp-lookup-separates-sibling-module-scopes ()
+  "lookup-variable does not confuse same-named arrays in sibling modules."
+  (let* ((src (concat "module a() { pts = [[1,1]]; polygon(pts); }
+"
+                      "module b() { pts = [[2,2]]; polygon(pts); }
+"))
+         (pos (string-match "polygon" src (string-match "module b" src)))
+         (pts (scad-sketch-parse--lookup-variable "pts" src pos)))
+    (should (= (length pts) 1))
+    (should (ssp-test--approx= (nth 0 (car pts)) 2.0))))
+
 ;;;; =========================================================================
 ;;;; 13. scad-sketch-parse--fmt-num
 ;;;; =========================================================================
@@ -1060,6 +1167,19 @@ The range check is inclusive, so prefix whitespace to push :beg above 0."
          (s  (scad-sketch-unparse-top-level (list p1 p2))))
     (should (string-match "_sketch_1" s))
     (should (string-match "_sketch_2" s))))
+
+(ert-deftest ssp-unparse-top-avoids-existing-extracted-name ()
+  "Generated _sketch_N names do not collide with existing array assignments."
+  (let* ((arr  (list :type 'array :name "_sketch_1" :beg 0 :end 0
+                     :points '((0.0 0.0 0.0))))
+         (poly (list :type 'polygon
+                     :points '((0.0 0.0 0.0)(40.0 0.0 0.0)(50.0 20.0 0.0)
+                               (40.0 40.0 0.0)(0.0 40.0 0.0))
+                     :source nil :polyround nil :beg 0 :end 0))
+         (s    (scad-sketch-unparse-top-level (list arr poly))))
+    (should (string-match "_sketch_1 = " s))
+    (should (string-match "_sketch_2 = " s))
+    (should (string-match "polygon(_sketch_2)" s))))
 
 (ert-deftest ssp-unparse-top-variable-ref-polygon-kept ()
   "A variable-ref polygon is never extracted; it just emits polygon(name)."

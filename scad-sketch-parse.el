@@ -66,13 +66,16 @@
                        (? (any "eE") (? (any "+-")) (+ digit))))
        ;; Strings
        (group-n 2 (seq ?\" (* (or (seq ?\\ anything) (not (any "\"\\")))) ?\"))
+       ;; Angle-bracket include/use paths.  Keep these as a single token so
+       ;; include/use without a trailing semicolon doesn't eat the next form.
+       (group-n 3 (seq ?< (* (not (any ">"))) ?>))
        ;; Identifiers
-       (group-n 3 (seq (any "A-Za-z_$") (* (any "A-Za-z0-9_$"))))
+       (group-n 4 (seq (any "A-Za-z_$") (* (any "A-Za-z0-9_$"))))
        ;; Punctuation
-       (group-n 4 (any "(){}[],;="))
+       (group-n 5 (any "(){}[],;="))
        ;; Whitespace (to skip)
-       (group-n 5 (+ (any " \t\r\n")))))
-  "Regexp matching one SCAD token.  Groups: 1=num 2=str 3=id 4=punct 5=ws.")
+       (group-n 6 (+ (any " \t\r\n")))))
+  "Regexp matching one SCAD token.  Groups: 1=num 2=str 3=path 4=id 5=punct 6=ws.")
 
 (defun scad-sketch-parse--strip-comments (s)
   "Return S with // line comments and /* */ block comments removed."
@@ -86,7 +89,7 @@
 (defun scad-sketch-parse--tokenize (source)
   "Tokenize SOURCE string.
 Returns a vector of (TYPE VALUE START END) where TYPE is a symbol
-`num', `str', `id', or `punct', and positions are 0-based."
+`num', `str', `path', `id', or `punct', and positions are 0-based."
   (let ((clean (scad-sketch-parse--strip-comments source))
         tokens)
     (let ((pos 0)
@@ -101,10 +104,12 @@ Returns a vector of (TYPE VALUE START END) where TYPE is a symbol
                ((match-beginning 2)
                 (push (list 'str (match-string 2 clean) start end) tokens))
                ((match-beginning 3)
-                (push (list 'id  (match-string 3 clean) start end) tokens))
+                (push (list 'path (match-string 3 clean) start end) tokens))
                ((match-beginning 4)
-                (push (list 'punct (match-string 4 clean) start end) tokens))
-               ;; group 5 = whitespace: skip
+                (push (list 'id  (match-string 4 clean) start end) tokens))
+               ((match-beginning 5)
+                (push (list 'punct (match-string 5 clean) start end) tokens))
+               ;; group 6 = whitespace: skip
                )
               (setq pos end))
           (setq pos (1+ pos)))))
@@ -177,6 +182,55 @@ Signal an error if EXPECTED-VAL or EXPECTED-TYPE don't match."
     (scad-sketch-parse--consume ps val)
     t))
 
+(defun scad-sketch-parse--nth-token (ps n)
+  "Return the token N positions after the current one, or nil."
+  (let* ((tokens (scad-sketch-parse--tokens ps))
+         (idx (+ (scad-sketch-parse--pos ps) n)))
+    (when (< idx (length tokens))
+      (aref tokens idx))))
+
+(defun scad-sketch-parse--nth-val (ps n)
+  "Return the value of the token N positions after the current one, or nil."
+  (let ((tok (scad-sketch-parse--nth-token ps n)))
+    (when tok (nth 1 tok))))
+
+(defun scad-sketch-parse--skip-balanced (ps open close)
+  "Skip a balanced expression that starts with OPEN and ends with CLOSE."
+  (scad-sketch-parse--consume ps open)
+  (let ((depth 1))
+    (while (and (> depth 0) (scad-sketch-parse--peek ps))
+      (let ((v (scad-sketch-parse--peek-val ps)))
+        (cond ((equal v open)  (setq depth (1+ depth)))
+              ((equal v close) (setq depth (1- depth))))
+        (scad-sketch-parse--consume ps)))))
+
+(defun scad-sketch-parse--skip-value (ps)
+  "Skip one generic SCAD value/expression in an argument list."
+  (let ((v (scad-sketch-parse--peek-val ps)))
+    (cond
+     ((equal v "(") (scad-sketch-parse--skip-balanced ps "(" ")"))
+     ((equal v "[") (scad-sketch-parse--skip-balanced ps "[" "]"))
+     ((equal v "{") (scad-sketch-parse--skip-balanced ps "{" "}"))
+     ((scad-sketch-parse--peek ps) (scad-sketch-parse--consume ps)))))
+
+(defun scad-sketch-parse--skip-keyword-or-value (ps)
+  "Skip KEY=VALUE or a single positional value."
+  (if (and (eq (scad-sketch-parse--peek-type ps) 'id)
+           (equal (scad-sketch-parse--nth-val ps 1) "="))
+      (progn
+        (scad-sketch-parse--consume ps nil 'id)
+        (scad-sketch-parse--consume ps "=")
+        (scad-sketch-parse--skip-value ps))
+    (scad-sketch-parse--skip-value ps)))
+
+(defun scad-sketch-parse--skip-rest-args (ps)
+  "Skip comma-separated arguments until the current closing parenthesis."
+  (while (and (scad-sketch-parse--peek ps)
+              (not (equal (scad-sketch-parse--peek-val ps) ")")))
+    (scad-sketch-parse--try-consume ps ",")
+    (unless (equal (scad-sketch-parse--peek-val ps) ")")
+      (scad-sketch-parse--skip-keyword-or-value ps))))
+
 ;;;; Grammar rules
 
 (defun scad-sketch-parse--num (ps)
@@ -216,9 +270,17 @@ Signal an error if EXPECTED-VAL or EXPECTED-TYPE don't match."
     (nreverse points)))
 
 (defun scad-sketch-parse--poly-arg (ps)
-  "Parse the argument to polygon().
-Returns (points source-name polyround-fn)."
+  "Parse the point argument to polygon().
+Returns (points source-name polyround-fn).  Supports bare positional points,
+variable references, polyRound(...), and the common points=... keyword form."
   (cond
+   ;; polygon(points=...)
+   ((and (eq (scad-sketch-parse--peek-type ps) 'id)
+         (string= (scad-sketch-parse--peek-val ps) "points")
+         (equal (scad-sketch-parse--nth-val ps 1) "="))
+    (scad-sketch-parse--consume ps "points")
+    (scad-sketch-parse--consume ps "=")
+    (scad-sketch-parse--poly-arg ps))
    ((equal (scad-sketch-parse--peek-val ps) "[")
     (list (scad-sketch-parse--array ps) nil nil))
    ((and (eq (scad-sketch-parse--peek-type ps) 'id)
@@ -240,16 +302,31 @@ Returns (points source-name polyround-fn)."
     (user-error "scad-sketch parser: unexpected polygon argument: %S"
                 (scad-sketch-parse--peek-val ps)))))
 
-(defun scad-sketch-parse--circle-arg (ps)
-  "Parse circle argument.  Returns (radius).
-Handles r=N, d=N, or bare N."
-  (if (and (eq (scad-sketch-parse--peek-type ps) 'id)
-           (member (scad-sketch-parse--peek-val ps) '("r" "d")))
-      (let ((kw (scad-sketch-parse--consume ps nil 'id)))
-        (scad-sketch-parse--consume ps "=")
-        (let ((v (scad-sketch-parse--num ps)))
-          (if (string= kw "d") (/ v 2.0) (float v))))
-    (float (scad-sketch-parse--num ps))))
+(defun scad-sketch-parse--circle-args (ps)
+  "Parse circle(...) args and return a radius.
+Handles circle(N), circle(r=N), circle(d=N), and ignores extra keyword
+arguments such as `$fn'.  Leaves point just before the closing paren."
+  (let ((r nil))
+    (while (and (scad-sketch-parse--peek ps)
+                (not (equal (scad-sketch-parse--peek-val ps) ")")))
+      (cond
+       ;; Bare radius: circle(15)
+       ((and (null r) (eq (scad-sketch-parse--peek-type ps) 'num))
+        (setq r (float (scad-sketch-parse--num ps))))
+       ;; r= or d=
+       ((and (eq (scad-sketch-parse--peek-type ps) 'id)
+             (member (scad-sketch-parse--peek-val ps) '("r" "d"))
+             (equal (scad-sketch-parse--nth-val ps 1) "="))
+        (let ((kw (scad-sketch-parse--consume ps nil 'id)))
+          (scad-sketch-parse--consume ps "=")
+          (let ((v (scad-sketch-parse--num ps)))
+            (setq r (if (string= kw "d") (/ v 2.0) (float v))))))
+       (t
+        (scad-sketch-parse--skip-keyword-or-value ps)))
+      (scad-sketch-parse--try-consume ps ","))
+    (unless r
+      (user-error "scad-sketch parser: circle() requires r, d, or bare radius"))
+    r))
 
 (defun scad-sketch-parse--text-params (ps)
   "Parse optional keyword parameters for text().  Returns alist."
@@ -300,6 +377,9 @@ Handles r=N, d=N, or bare N."
       (scad-sketch-parse--consume ps "polygon")
       (scad-sketch-parse--consume ps "(")
       (let* ((arg (scad-sketch-parse--poly-arg ps)))
+        ;; Ignore optional polygon parameters we don't model, such as paths=...
+        ;; and convexity=..., while keeping the editable point source.
+        (scad-sketch-parse--skip-rest-args ps)
         (scad-sketch-parse--consume ps ")")
         (scad-sketch-parse--try-consume ps ";")
         (list :type 'polygon :beg beg :end (scad-sketch-parse--prev-end ps)
@@ -308,7 +388,7 @@ Handles r=N, d=N, or bare N."
      ((string= v "circle")
       (scad-sketch-parse--consume ps "circle")
       (scad-sketch-parse--consume ps "(")
-      (let ((r (scad-sketch-parse--circle-arg ps)))
+      (let ((r (scad-sketch-parse--circle-args ps)))
         (scad-sketch-parse--consume ps ")")
         (scad-sketch-parse--try-consume ps ";")
         (list :type 'circle :beg beg :end (scad-sketch-parse--prev-end ps)
@@ -407,17 +487,73 @@ Returns :semi or :brace to indicate which was found."
           (setq result :semi done t))
          ((equal v "{")
           (setq result :brace done t))  ; leave { unconsumed
-         ((member v '("(" "["))
-          ;; Skip balanced sub-expression
-          (scad-sketch-parse--consume ps)
-          (let ((depth 1))
-            (while (and (> depth 0) (scad-sketch-parse--peek ps))
-              (let ((v2 (scad-sketch-parse--peek-val ps)))
-                (cond ((member v2 '("(" "[")) (setq depth (1+ depth)))
-                      ((member v2 '(")" "]")) (setq depth (1- depth))))
-                (scad-sketch-parse--consume ps)))))
+         ((equal v "(")
+          (scad-sketch-parse--skip-balanced ps "(" ")"))
+         ((equal v "[")
+          (scad-sketch-parse--skip-balanced ps "[" "]"))
          (t (scad-sketch-parse--consume ps)))))
     result))
+
+;;;; Scope bookkeeping
+
+(defvar scad-sketch-parse--collector nil
+  "Dynamic variable: a function called with each harvested node, or nil.
+Used by parser helpers to collect nodes from module/function bodies into the
+flat parse result.")
+
+(defvar scad-sketch-parse--scope nil
+  "Dynamic variable holding the current lexical-ish SCAD scope.
+The list is stored innermost first while parsing; nodes receive :scope in
+outermost-first order.")
+
+(defun scad-sketch-parse--current-scope ()
+  "Return the current node scope in outermost-first order."
+  (reverse scad-sketch-parse--scope))
+
+(defun scad-sketch-parse--stamp-scope (node)
+  "Attach the current :scope to NODE and all descendants."
+  (when node
+    (setq node (plist-put node :scope (scad-sketch-parse--current-scope)))
+    (cond
+     ((plist-get node :children)
+      (setq node (plist-put node :children
+                            (mapcar #'scad-sketch-parse--stamp-scope
+                                    (plist-get node :children)))))
+     ((plist-get node :child)
+      (setq node (plist-put node :child
+                            (scad-sketch-parse--stamp-scope
+                             (plist-get node :child))))))
+    node))
+
+(defun scad-sketch-parse--scope-name-for-form (ps beg)
+  "Return a stable-ish scope name for the current module/function form."
+  (let* ((kind (or (scad-sketch-parse--peek-val ps) "scope"))
+         (next (scad-sketch-parse--nth-token ps 1))
+         (name (when (and next (eq (nth 0 next) 'id))
+                 (nth 1 next))))
+    (format "%s:%s@%d" kind (or name "anonymous") beg)))
+
+(defun scad-sketch-parse--skip-brace-block (ps)
+  "Skip the balanced brace block at point."
+  (when (equal (scad-sketch-parse--peek-val ps) "{")
+    (scad-sketch-parse--skip-balanced ps "{" "}")))
+
+(defun scad-sketch-parse--skip-scoped-form (ps scope-name &optional collector)
+  "Skip a module/function form, harvesting its body under SCOPE-NAME."
+  (let ((boundary (scad-sketch-parse--skip-to-brace-or-semi ps)))
+    (when (eq boundary :brace)
+      (if collector
+          (let ((scad-sketch-parse--scope
+                 (cons scope-name scad-sketch-parse--scope)))
+            (scad-sketch-parse--descend-block ps collector))
+        (scad-sketch-parse--skip-brace-block ps)))))
+
+(defun scad-sketch-parse--skip-include-or-use (ps)
+  "Skip an include/use directive, with or without a trailing semicolon."
+  (scad-sketch-parse--consume ps nil 'id)
+  (when (eq (scad-sketch-parse--peek-type ps) 'path)
+    (scad-sketch-parse--consume ps nil 'path))
+  (scad-sketch-parse--try-consume ps ";"))
 
 (defun scad-sketch-parse--descend-block (ps collector)
   "Parse the `{ ... }\' block at current position, calling COLLECTOR on each
@@ -432,22 +568,15 @@ Used to extract array assignments and 2D shapes from module/function bodies."
     (scad-sketch-parse--consume ps "}")))
 
 (defun scad-sketch-parse--skip-unknown-form (ps &optional collector)
-  "Skip an unknown top-level form (include, use, module, function, etc.).
-If COLLECTOR is non-nil, descend into any brace block and call COLLECTOR
-on each recognized array/shape found inside, so module bodies are harvested."
+  "Skip an unknown form.
+If COLLECTOR is non-nil, descend into a brace block and collect recognized
+forms.  Callers should pass COLLECTOR only for module/function bodies; 3D
+wrappers and other unknown constructs should normally be skipped whole."
   (let ((boundary (scad-sketch-parse--skip-to-brace-or-semi ps)))
     (when (eq boundary :brace)
-      ;; Found a brace block — descend and harvest if collector provided,
-      ;; otherwise skip the whole block.
       (if collector
           (scad-sketch-parse--descend-block ps collector)
-        (let ((depth 1))
-          (scad-sketch-parse--consume ps "{")
-          (while (and (> depth 0) (scad-sketch-parse--peek ps))
-            (let ((v (scad-sketch-parse--peek-val ps)))
-              (cond ((equal v "{") (setq depth (1+ depth)))
-                    ((equal v "}") (setq depth (1- depth))))
-              (scad-sketch-parse--consume ps))))))))
+        (scad-sketch-parse--skip-brace-block ps)))))
 
 (defun scad-sketch-parse--top-level-form (ps)
   "Parse one top-level form: array assignment, known 2D shape, or skip unknown.
@@ -468,32 +597,37 @@ Returns a node plist or nil (for skipped forms like include/use/module)."
         (scad-sketch-parse--consume ps "=")
         (let ((points (scad-sketch-parse--array ps)))
           (scad-sketch-parse--try-consume ps ";")
-          (list :type 'array :beg beg :end (scad-sketch-parse--prev-end ps)
-                :name name :points points))))
-     ;; Known 2D shape or composition keyword
+          (scad-sketch-parse--stamp-scope
+           (list :type 'array :beg beg :end (scad-sketch-parse--prev-end ps)
+                 :name name :points points)))))
+     ;; include/use <...> may omit the semicolon in typical OpenSCAD style.
+     ((and (eq typ 'id) (member v '("include" "use")))
+      (scad-sketch-parse--skip-include-or-use ps)
+      nil)
+     ;; Module/function bodies are the only unknown brace forms we descend into.
+     ((and (eq typ 'id) (member v '("module" "function")))
+      (let ((scope-name (scad-sketch-parse--scope-name-for-form ps beg)))
+        (scad-sketch-parse--skip-scoped-form ps scope-name scad-sketch-parse--collector))
+      nil)
+     ;; Known 2D shape or composition keyword.
      ((and (eq typ 'id)
            (member v '("polygon" "circle" "square" "text"
                         "difference" "union" "intersection"
                         "translate" "rotate" "scale" "mirror")))
       (condition-case nil
-          (scad-sketch-parse--shape ps)
+          (scad-sketch-parse--stamp-scope (scad-sketch-parse--shape ps))
         (user-error
+         ;; If a nominally 2D transform has unsupported arguments, skip that
+         ;; wrapper rather than interpreting it as a 2D edit operation.
          (scad-sketch-parse--skip-unknown-form ps)
          nil)))
-     ;; Everything else: include, use, module, function, linear_extrude,
-     ;; name=non-array-value, etc.
-     ;; We pass the collector so module/function bodies are harvested for
-     ;; array assignments and 2D shapes.
+     ;; Everything else: 3D primitives, scalar assignments, unsupported control
+     ;; flow, etc.  Skip whole; do not harvest children from 3D wrappers.
      (t
-      (scad-sketch-parse--skip-unknown-form ps scad-sketch-parse--collector)
+      (scad-sketch-parse--skip-unknown-form ps)
       nil))))
 
 ;;;; Public API
-
-(defvar scad-sketch-parse--collector nil
-  "Dynamic variable: a function called with each harvested node, or nil.
-Used by `scad-sketch-parse--skip-unknown-form' to collect nodes from
-module/function bodies into the top-level result list.")
 
 (defun scad-sketch-parse (source)
   "Parse SOURCE string into a flat list of AST nodes.
@@ -507,7 +641,8 @@ they were top-level.  This allows editing arrays defined inside modules."
   (let* ((tokens (scad-sketch-parse--tokenize source))
          (ps     (scad-sketch-parse--make tokens))
          nodes)
-    (let ((scad-sketch-parse--collector (lambda (n) (push n nodes))))
+    (let ((scad-sketch-parse--collector (lambda (n) (push n nodes)))
+          (scad-sketch-parse--scope nil))
       (while (> (length (scad-sketch-parse--tokens ps))
                 (scad-sketch-parse--pos ps))
         (let ((node (scad-sketch-parse--top-level-form ps)))
@@ -570,46 +705,67 @@ node containing POS, or nil if POS is outside all nodes."
 
 ;;;; Scope-aware variable lookup
 
-(defun scad-sketch-parse--lookup-variable (name source before-pos)
-  "Find the definition of NAME as an array assignment in SOURCE.
-Only considers assignments at top-level scope or in the same module scope
-as BEFORE-POS.  Returns a list of [x y r] points, or nil if not found.
+(defun scad-sketch-parse--scope-prefix-p (prefix scope)
+  "Return non-nil if PREFIX is a scope prefix of SCOPE."
+  (let ((ok t))
+    (while (and ok prefix scope)
+      (unless (equal (car prefix) (car scope))
+        (setq ok nil))
+      (setq prefix (cdr prefix)
+            scope  (cdr scope)))
+    (and ok (null prefix))))
 
-Scope rule: track `module NAME(...) {' brace depth.  Only consider
-assignments at depth 0 (top level) in the region before BEFORE-POS."
-  (with-temp-buffer
-    (insert source)
-    (goto-char (point-min))
-    ;; Walk forward, tracking module brace depth, collecting top-level assignments.
-    (let ((result nil)
-          (target-re (concat "^\\s-*" (regexp-quote name) "\\s-*=\\s-*\\["))
-          (depth 0))
-      (while (and (not result) (< (point) (min (point-max) (1+ before-pos))))
-        (cond
-         ;; Module definition opens a new scope — skip inside
-         ((looking-at "\\s-*module\\s-+[^{]*{")
-          (goto-char (match-end 0))
-          (setq depth (1+ depth)))
-         ;; Track closing braces
-         ((looking-at "\\s-*}")
-          (when (> depth 0) (setq depth (1- depth)))
-          (forward-char 1))
-         ;; At top-level scope, look for name = [
-         ((and (= depth 0) (looking-at target-re))
-          (goto-char (match-end 0))
-          (backward-char 1)           ; back to the opening [
-          (let* ((arr-start (point))
-                 (arr-end   (condition-case nil
-                                (progn
-                                  (forward-sexp 1)
-                                  (point))
-                              (error nil))))
-            (when arr-end
-              (let* ((text (buffer-substring-no-properties arr-start arr-end))
-                     (pts  (scad-sketch-parse--parse-array-text text)))
-                (setq result pts)))))
-         (t (forward-line 1))))
-      result)))
+(defun scad-sketch-parse--scope-ancestry (scope)
+  "Return SCOPE, its parents, and nil, in nearest-to-farthest order."
+  (let ((acc nil)
+        (cur scope))
+    (while cur
+      (push cur acc)
+      (setq cur (butlast cur)))
+    (nreverse (cons nil acc))))
+
+(defun scad-sketch-parse--context-scope-at (nodes pos)
+  "Return the scope of the deepest node at POS, or the nearest prior node."
+  (let ((node (scad-sketch-parse-node-at nodes pos))
+        prior)
+    (unless node
+      (dolist (n nodes)
+        (when (and (plist-get n :end)
+                   (<= (plist-get n :end) pos)
+                   (or (null prior)
+                       (> (plist-get n :end) (plist-get prior :end))))
+          (setq prior n)))
+      (setq node prior))
+    (plist-get node :scope)))
+
+(defun scad-sketch-parse--lookup-variable (name source before-pos)
+  "Find NAME as an in-scope array assignment in SOURCE before BEFORE-POS.
+Returns a list of [x y r] points, or nil if not found.
+
+Scope rule: first search the current module/function scope, then parents,
+then top level.  Within a scope, the closest preceding assignment wins."
+  (let* ((nodes (scad-sketch-parse source))
+         (scope (scad-sketch-parse--context-scope-at nodes before-pos))
+         (ancestry (scad-sketch-parse--scope-ancestry scope))
+         result)
+    (while (and ancestry (null result))
+      (let* ((target-scope (car ancestry))
+             (candidates
+              (cl-remove-if-not
+               (lambda (n)
+                 (and (eq (plist-get n :type) 'array)
+                      (string= (plist-get n :name) name)
+                      (equal (plist-get n :scope) target-scope)
+                      (< (plist-get n :beg) before-pos)))
+               nodes)))
+        (when candidates
+          (setq result
+                (car (last (sort candidates
+                                 (lambda (a b)
+                                   (< (plist-get a :beg) (plist-get b :beg)))))))))
+      (setq ancestry (cdr ancestry)))
+    (when result
+      (plist-get result :points))))
 
 (defun scad-sketch-parse--parse-array-text (text)
   "Parse TEXT as a bare array literal `[[x,y,...],...]'.
@@ -622,11 +778,11 @@ Returns list of [x y r] triples."
 
 ;;;; Unparsing (AST → SCAD source)
 
-(defcustom scad-sketch-inline-threshold 4
+(defconst scad-sketch-inline-threshold 4
   "Polygons with this many points or fewer are inlined in emitted source.
-Polygons with more points are extracted to named array assignments."
-  :type 'integer
-  :group 'scad-sketch)
+Polygons with more points are extracted to named array assignments.
+
+This is deliberately fixed so sketch output canonicalizes predictably.")
 
 (defun scad-sketch-parse--fmt-num (n)
   "Format number N compactly for OpenSCAD output."
@@ -769,12 +925,36 @@ Returns the source string."
                                    (1+ (or indent 0)) extracted-names)))
      (t (format "%s/* unknown node type %S */\n" ind type)))))
 
+(defun scad-sketch-parse--collect-array-names (nodes)
+  "Return a hash table of array names already used in NODES."
+  (let ((names (make-hash-table :test 'equal)))
+    (dolist (node nodes)
+      (scad-sketch-parse--walk
+       node
+       (lambda (n)
+         (when (and (eq (plist-get n :type) 'array)
+                    (plist-get n :name))
+           (puthash (plist-get n :name) t names)))))
+    names))
+
+(defun scad-sketch-parse--fresh-extracted-name (used-names counters)
+  "Return a fresh canonical _sketch_N name."
+  (let ((base "_sketch")
+        name)
+    (while (or (null name) (gethash name used-names))
+      (let ((idx (1+ (or (gethash base counters) 0))))
+        (puthash base idx counters)
+        (setq name (format "%s_%d" base idx))))
+    (puthash name t used-names)
+    name))
+
 (defun scad-sketch-unparse-top-level (nodes)
   "Unparse a list of top-level NODES to an OpenSCAD source string.
 Handles extraction of large polygons to named assignments."
   ;; First pass: collect polygons that need extraction and assign names.
   (let ((extracted (make-hash-table :test 'eq))
         (counters  (make-hash-table :test 'equal))
+        (used-names (scad-sketch-parse--collect-array-names nodes))
         result)
     (dolist (node nodes)
       (scad-sketch-parse--walk
@@ -786,10 +966,9 @@ Handles extraction of large polygons to named assignments."
                   (n-pts (length (or pts '()))))
              (when (and (null src) (> n-pts scad-sketch-inline-threshold))
                (unless (gethash n extracted)
-                 (let* ((base "_sketch")
-                        (idx  (1+ (or (gethash base counters) 0))))
-                   (puthash base idx counters)
-                   (puthash n (format "%s_%d" base idx) extracted)))))))))
+                 (puthash n (scad-sketch-parse--fresh-extracted-name
+                             used-names counters)
+                          extracted))))))))
     ;; Second pass: emit extracted assignments first, then the shapes.
     ;; Build a list of (name . points) for all extracted polygons.
     (let (extractions)
@@ -798,7 +977,8 @@ Handles extraction of large polygons to named assignments."
                extracted)
       ;; Emit array assignments for extracted polygons.
       (dolist (ext (sort extractions (lambda (a b) (string< (car a) (car b)))))
-        (push (format "%s = %s;\n" (car ext)
+        (push (format "%s = %s;
+" (car ext)
                       (scad-sketch-parse--fmt-array (cdr ext)))
               result))
       ;; Emit the shapes, with extracted polygons using their names.
