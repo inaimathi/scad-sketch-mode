@@ -196,7 +196,6 @@ same-name array assignment if scope tags are absent."
     (car (sort (copy-sequence (or same-scope candidates))
                (lambda (a b) (> (plist-get a :beg)
                                 (plist-get b :beg)))))))
-
 (defun scad-sketch-session--used-identifiers-in-source (source)
   "Return all identifier-looking names in SOURCE.
 This intentionally over-approximates: identifiers in comments/strings may count
@@ -399,95 +398,6 @@ polygon(EXTRACTED-NAME) and is used when a preceding assignment was generated."
               (scad-sketch-session--fmt-inline-array points nil))))))
 
 
-(defun scad-sketch-session--emit-inline-polygon-replacement (session target indent)
-  "Emit replacement source for inline polygon TARGET from SESSION."
-  (scad-sketch-session-sync-active-shape-from-points session)
-  (let* ((points    (scad-sketch-session-points session))
-         (polyround (scad-sketch-target-polyround target))
-         (n         (length points)))
-    (if (<= n scad-sketch-session-inline-polygon-threshold)
-        (scad-sketch-session--emit-polygon-call points indent polyround)
-      (let ((name (or (plist-get (scad-sketch-target-metadata target)
-                                 :extracted-name)
-                      (scad-sketch-session--unique-sketch-name session))))
-        ;; Remember the generated name so repeated writes from the same editor
-        ;; session are stable.
-        (setf (scad-sketch-target-metadata target)
-              (plist-put (scad-sketch-target-metadata target)
-                         :extracted-name name))
-        (concat
-         (scad-sketch-session--emit-array-assignment
-          name points indent polyround)
-         (scad-sketch-session--emit-polygon-call
-          points indent polyround nil name))))))
-
-(defun scad-sketch-session--shape-polyround (shape)
-  "Return SHAPE's polyRound fn value, if any."
-  (scad-sketch-shape-polyround shape))
-
-(defun scad-sketch-session--shape-source-name (shape)
-  "Return SHAPE's source variable name, if it has one."
-  (plist-get (scad-sketch-shape-metadata shape) :source-name))
-
-(defun scad-sketch-session--shape-extracted-name (shape)
-  "Return SHAPE's generated extraction name, if one exists."
-  (plist-get (scad-sketch-shape-metadata shape) :extracted-name))
-
-(defun scad-sketch-session--set-shape-extracted-name (shape name)
-  "Record NAME as SHAPE's generated extraction name."
-  (setf (scad-sketch-shape-metadata shape)
-        (plist-put (scad-sketch-shape-metadata shape)
-                   :extracted-name name)))
-
-(defun scad-sketch-session--emit-union-shape (session shape indent)
-  "Return (:assignments STR :call STR) for SHAPE in SESSION."
-  (let* ((points    (scad-sketch-shape-points shape))
-         (polyround (scad-sketch-session--shape-polyround shape))
-         (source    (scad-sketch-session--shape-source-name shape)))
-    (cond
-     ;; Preserve source references.  The source array is written separately
-     ;; through the shape's source target.
-     (source
-      (list :assignments ""
-            :call (scad-sketch-session--emit-polygon-call
-                   points indent polyround source)))
-
-     ;; Small inline shapes stay inline.
-     ((<= (length points) scad-sketch-session-inline-polygon-threshold)
-      (list :assignments ""
-            :call (scad-sketch-session--emit-polygon-call
-                   points indent polyround)))
-
-     ;; Large inline/new shapes get extracted to a generated assignment.
-     (t
-      (let ((name (or (scad-sketch-session--shape-extracted-name shape)
-                      (scad-sketch-session--unique-sketch-name session))))
-        (scad-sketch-session--set-shape-extracted-name shape name)
-        (list :assignments
-              (scad-sketch-session--emit-array-assignment
-               name points "" polyround)
-              :call
-              (scad-sketch-session--emit-polygon-call
-               points indent polyround nil name)))))))
-
-(defun scad-sketch-session--emit-union-replacement (session indent)
-  "Emit SESSION as a canonical union at INDENT."
-  (scad-sketch-session-sync-active-shape-from-points session)
-  (let ((assignments "")
-        (calls ""))
-    (dolist (shape (scad-sketch-session-shapes session))
-      (let* ((emitted (scad-sketch-session--emit-union-shape
-                       session shape (concat indent "  ")))
-             (shape-assignments (plist-get emitted :assignments))
-             (shape-call (plist-get emitted :call)))
-        (unless (string= shape-assignments "")
-          (setq assignments (concat assignments shape-assignments)))
-        (setq calls (concat calls shape-call))))
-    (concat assignments
-            indent "union() {\n"
-            calls
-            indent "}\n")))
-
 (defun scad-sketch-session--target-indent (target)
   "Return indentation string for TARGET's beginning marker."
   (let ((marker (scad-sketch-target-beg-marker target)))
@@ -499,75 +409,7 @@ polygon(EXTRACTED-NAME) and is used when a preceding assignment was generated."
             (match-string-no-properties 0)
           "")))))
 
-(defun scad-sketch-session--target-replacement (session target)
-  "Return replacement source for TARGET using SESSION's current points."
-  (let ((indent (scad-sketch-session--target-indent target)))
-    (pcase (scad-sketch-target-kind target)
-      ('array
-       (scad-sketch-session--emit-array-assignment
-        (scad-sketch-target-name target)
-        (scad-sketch-session-points session)
-        indent
-        (scad-sketch-target-polyround target)))
-      ('polygon-var-source
-       ;; For source arrays attached to a shape, use that shape's points.
-       ;; Fall back to SESSION points for legacy single-shape sessions.
-       (let* ((shape
-               (cl-find-if
-                (lambda (shape)
-                  (eq (scad-sketch-shape-source-target shape) target))
-                (scad-sketch-session-shapes session)))
-              (points (if shape
-                          (scad-sketch-shape-points shape)
-                        (scad-sketch-session-points session))))
-         (scad-sketch-session--emit-array-assignment
-          (scad-sketch-target-name target)
-          points
-          indent
-          (scad-sketch-target-polyround target))))
-      ('polygon-inline
-       (scad-sketch-session--emit-inline-polygon-replacement
-        session target indent))
-      ('union-root
-       (scad-sketch-session--emit-union-replacement session indent))
-      (_
-       nil))))
 
-(defun scad-sketch-session-preview (session)
-  "Return the source preview for SESSION."
-  (scad-sketch-session-sync-active-shape-from-points session)
-  (if (eq (scad-sketch-session-root-kind session) 'union)
-      (scad-sketch-session--emit-union-replacement session "")
-    (let ((primary (car (scad-sketch-session-targets session))))
-      (pcase (and primary (scad-sketch-target-kind primary))
-        ('polygon-inline
-         (scad-sketch-session--emit-inline-polygon-replacement session primary ""))
-        ('polygon-call
-         (let* ((source-target
-                 (cl-find-if (lambda (tgt)
-                               (eq (scad-sketch-target-kind tgt)
-                                   'polygon-var-source))
-                             (scad-sketch-session-targets session)))
-                (source-name (and source-target
-                                  (scad-sketch-target-name source-target)))
-                (polyround (scad-sketch-target-polyround primary)))
-           (concat
-            (when source-target
-              (scad-sketch-session--emit-array-assignment
-               source-name
-               (scad-sketch-session-points session)
-               ""
-               polyround))
-            (scad-sketch-session--emit-polygon-call
-             (scad-sketch-session-points session)
-             ""
-             polyround
-             source-name))))
-        (_
-         (scad-sketch-session--emit-array-assignment
-          (scad-sketch-session-name session)
-          (scad-sketch-session-points session)
-          ""))))))
 
 ;;;; Session construction
 (defun scad-sketch-session--initial-point (points)
@@ -727,152 +569,187 @@ ROOT-TARGET-ID define the session's write plan."
      :write-p t
      :metadata nil)))
 
-
-(defun scad-sketch-session--polygon-node->shape-and-targets (ast node index)
-  "Return (SHAPE . TARGETS) for polygon NODE in AST.
-
-INDEX determines the generated shape id.  This supports inline polygon nodes
-and variable-reference polygon nodes.  Variable-reference nodes produce a
-read-only polygon-call target plus a writable source-array target."
-  (let ((shape-id (scad-sketch-session--shape-id index)))
-    (if (plist-get node :source)
-        (let* ((source-name (plist-get node :source))
-               (source-node
-                (scad-sketch-session--resolve-array-node ast source-name node)))
-          (unless source-node
-            (user-error "Could not resolve polygon source `%s'" source-name))
-          (let* ((call-target
-                  (scad-sketch-session--make-polygon-call-target node))
-                 (source-target
-                  (scad-sketch-session--make-array-target
-                   source-node
-                   (intern (format "polygon-var-source-%d" index))
-                   'polygon-var-source
-                   (plist-get node :polyround)))
-                 (shape
-                  (make-scad-sketch-shape
-                   :id shape-id
-                   :kind 'polygon
-                   :points (copy-tree (plist-get source-node :points))
-                   :closed t
-                   :polyround (plist-get node :polyround)
-                   :source-target source-target
-                   :metadata (list :source-name source-name
-                                   :call-node node
-                                   :source-node source-node))))
-            (cons shape (list call-target source-target))))
-      (let* ((target
-              (scad-sketch-session--make-polygon-inline-target node))
-             (shape
-              (make-scad-sketch-shape
-               :id shape-id
-               :kind 'polygon
-               :points (copy-tree (plist-get node :points))
-               :closed t
-               :polyround (plist-get node :polyround)
-               :source-target nil
-               :metadata (list :inline-node node))))
-        (cons shape (list target))))))
-
-(defun scad-sketch-session--union-supported-child-p (node)
-  "Return non-nil if NODE is currently supported as a union child."
-  (eq (plist-get node :type) 'polygon))
-
-(defun scad-sketch-session--session-from-union (ast path node)
-  "Build a multi-shape session for union NODE.
-
-This first union pass supports only direct polygon-ish children.  Transformed
-children and nested booleans should be added later once geometry normalization
-can preserve/edit them correctly."
-  (let ((children (plist-get node :children))
-        shapes
-        child-targets
-        index)
-    (setq index 0)
-    (dolist (child children)
-      (unless (scad-sketch-session--union-supported-child-p child)
-        (user-error "Unsupported union child for scad-sketch: %S"
-                    (plist-get child :type)))
-      (let ((pair (scad-sketch-session--polygon-node->shape-and-targets
-                   ast child index)))
-        (push (car pair) shapes)
-        (setq child-targets (append (cdr pair) child-targets))
-        (setq index (1+ index))))
-    (setq shapes (nreverse shapes))
-    (setq child-targets (nreverse child-targets))
-    (unless shapes
-      (user-error "Union has no editable polygon children"))
-    (let* ((root-target
-            (scad-sketch-session--make-root-target node 'union-root))
-           (active-shape (car shapes))
-           (points (copy-tree (scad-sketch-shape-points active-shape))))
-      (scad-sketch-session--make-session
-       "union"
-       points
-       (scad-sketch-target-beg-marker root-target)
-       (scad-sketch-target-end-marker root-target)
-       ast path node
-       (cons root-target child-targets)
-       shapes
-       (scad-sketch-shape-id active-shape)
-       'union
-       root-target))))
+(defun scad-sketch-session--shape-from-array-target (target shape-id &optional polyround)
+  "Build a shape from array TARGET."
+  (let ((node (scad-sketch-target-node target)))
+    (scad-sketch-session--make-shape
+     shape-id
+     (copy-tree (plist-get node :points))
+     polyround
+     (scad-sketch-target-id target)
+     nil
+     (list :source-name (scad-sketch-target-name target)
+           :source-node node))))
 
 (defun scad-sketch-session--session-from-array (ast path node)
-  "Build a session for direct array NODE."
-  (let* ((target (scad-sketch-session--make-array-target node))
-         (points (copy-tree (plist-get node :points))))
+  "Build an array-only session for direct array NODE.
+
+Array-only sessions can edit that array, but cannot serialize multiple shapes."
+  (let* ((target
+          (scad-sketch-session--make-array-target node 'array-0 'source nil))
+         (shape
+          (scad-sketch-session--shape-from-array-target target 'shape-0))
+         (markers (cons (scad-sketch-target-beg-marker target)
+                        (scad-sketch-target-end-marker target))))
     (scad-sketch-session--make-session
      (plist-get node :name)
-     points
-     (scad-sketch-target-beg-marker target)
-     (scad-sketch-target-end-marker target)
-     ast path node
-     (list target))))
+     (list shape)
+     'shape-0
+     (list target)
+     nil
+     (car markers)
+     (cdr markers)
+     ast path node)))
 
 (defun scad-sketch-session--session-from-inline-polygon (ast path node)
   "Build a session for inline polygon NODE."
-  (let* ((target (scad-sketch-session--make-polygon-inline-target node))
-         (points (copy-tree (plist-get node :points))))
-    (unless points
-      (user-error "Polygon has no inline points"))
+  (let* ((root-target
+          (scad-sketch-session--make-polygon-inline-root-target node))
+         (shape
+          (scad-sketch-session--make-shape
+           'shape-0
+           (copy-tree (plist-get node :points))
+           (plist-get node :polyround)
+           nil
+           (scad-sketch-target-id root-target)
+           (list :inline-node node))))
+    (unless (plist-get node :points)
+      (signal 'scad-sketch-unsupported-edit-target
+              (list "Polygon has no inline points")))
     (scad-sketch-session--make-session
      "polygon"
-     points
-     (scad-sketch-target-beg-marker target)
-     (scad-sketch-target-end-marker target)
-     ast path node
-     (list target))))
+     (list shape)
+     'shape-0
+     (list root-target)
+     (scad-sketch-target-id root-target)
+     (scad-sketch-target-beg-marker root-target)
+     (scad-sketch-target-end-marker root-target)
+     ast path node)))
 
 (defun scad-sketch-session--session-from-polygon-ref (ast path node)
   "Build a session for variable-ref polygon NODE."
   (let* ((source-name (plist-get node :source))
-         (source-node (and source-name
-                           (scad-sketch-session--resolve-array-node
-                            ast source-name node))))
+         (source-node
+          (and source-name
+               (scad-sketch-session--resolve-array-node
+                ast source-name node))))
     (unless source-name
-      (user-error "Polygon is not a variable reference"))
+      (signal 'scad-sketch-unsupported-edit-target
+              (list "Polygon is not a variable reference")))
     (unless source-node
-      (user-error "Could not resolve polygon source `%s'" source-name))
-    (let* ((call-target (scad-sketch-session--make-polygon-call-target node))
+      (signal 'scad-sketch-unsupported-edit-target
+              (list (format "Could not resolve polygon source `%s'" source-name))))
+    (let* ((root-target
+            (scad-sketch-session--make-polygon-ref-root-target node))
            (source-target
             (scad-sketch-session--make-array-target
-             source-node 'polygon-var-source-0 'polygon-var-source
-             (plist-get node :polyround)))
-           (points (copy-tree (plist-get source-node :points))))
+             source-node 'source-0 'source (plist-get node :polyround)))
+           (shape
+            (scad-sketch-session--make-shape
+             'shape-0
+             (copy-tree (plist-get source-node :points))
+             (plist-get node :polyround)
+             (scad-sketch-target-id source-target)
+             (scad-sketch-target-id root-target)
+             (list :source-name source-name
+                   :call-node node
+                   :source-node source-node))))
       (scad-sketch-session--make-session
        source-name
-       points
+       (list shape)
+       'shape-0
+       (list root-target source-target)
+       (scad-sketch-target-id root-target)
        (scad-sketch-target-beg-marker source-target)
        (scad-sketch-target-end-marker source-target)
-       ast path node
-       (list call-target source-target)))))
+       ast path node))))
 
 (defun scad-sketch-session--session-from-polygon (ast path node)
   "Build a session for polygon NODE."
   (if (plist-get node :source)
       (scad-sketch-session--session-from-polygon-ref ast path node)
     (scad-sketch-session--session-from-inline-polygon ast path node)))
+
+(defun scad-sketch-session--union-supported-child-p (node)
+  "Return non-nil if NODE is currently supported as a union child."
+  (eq (plist-get node :type) 'polygon))
+
+(defun scad-sketch-session--union-child->shape-and-targets (ast child index)
+  "Return (SHAPE . TARGETS) for union CHILD in AST."
+  (unless (scad-sketch-session--union-supported-child-p child)
+    (signal 'scad-sketch-unsupported-edit-target
+            (list (format "Unsupported union child for scad-sketch: %S"
+                          (plist-get child :type)))))
+  (let ((shape-id (scad-sketch-session--shape-id index)))
+    (if (plist-get child :source)
+        (let* ((source-name (plist-get child :source))
+               (source-node
+                (scad-sketch-session--resolve-array-node
+                 ast source-name child)))
+          (unless source-node
+            (signal 'scad-sketch-unsupported-edit-target
+                    (list (format "Could not resolve polygon source `%s'"
+                                  source-name))))
+          (let* ((source-target-id (intern (format "source-%d" index)))
+                 (source-target
+                  (scad-sketch-session--make-array-target
+                   source-node source-target-id 'source
+                   (plist-get child :polyround)))
+                 (shape
+                  (scad-sketch-session--make-shape
+                   shape-id
+                   (copy-tree (plist-get source-node :points))
+                   (plist-get child :polyround)
+                   source-target-id
+                   nil
+                   (list :source-name source-name
+                         :call-node child
+                         :source-node source-node))))
+            (cons shape (list source-target))))
+      (let ((shape
+             (scad-sketch-session--make-shape
+              shape-id
+              (copy-tree (plist-get child :points))
+              (plist-get child :polyround)
+              nil
+              nil
+              (list :inline-node child))))
+        (unless (plist-get child :points)
+          (signal 'scad-sketch-unsupported-edit-target
+                  (list "Inline union polygon has no points")))
+        (cons shape nil)))))
+
+(defun scad-sketch-session--session-from-union (ast path node)
+  "Build a multi-shape session for union NODE.
+
+This supports direct polygon-ish children only.  Transforms and nested booleans
+should be added after geometry normalization can preserve/edit them correctly."
+  (let ((root-target (scad-sketch-session--make-union-root-target node))
+        (children (plist-get node :children))
+        shapes
+        targets
+        index)
+    (setq index 0)
+    (dolist (child children)
+      (let ((pair (scad-sketch-session--union-child->shape-and-targets
+                   ast child index)))
+        (push (car pair) shapes)
+        (setq targets (append (cdr pair) targets))
+        (setq index (1+ index))))
+    (setq shapes (nreverse shapes))
+    (setq targets (nreverse targets))
+    (unless shapes
+      (signal 'scad-sketch-unsupported-edit-target
+              (list "Union has no editable polygon children")))
+    (scad-sketch-session--make-session
+     "union"
+     shapes
+     (scad-sketch-shape-id (car shapes))
+     (cons root-target targets)
+     (scad-sketch-target-id root-target)
+     (scad-sketch-target-beg-marker root-target)
+     (scad-sketch-target-end-marker root-target)
+     ast path node)))
 
 (defun scad-sketch-session-at-point ()
   "Build a parser-backed sketch session for the supported form at point.
@@ -895,16 +772,19 @@ Currently supports:
                         (eq (plist-get n :type) 'union))
                       path)))
     ;; If point is inside a supported union subtree, edit the whole union.
-    ;; This deliberately chooses the first/outermost union in PATH.
-    (if union-node
-        (scad-sketch-session--session-from-union ast path union-node)
-      (pcase (plist-get node :type)
-        ('array
-         (scad-sketch-session--session-from-array ast path node))
-        ('polygon
-         (scad-sketch-session--session-from-polygon ast path node))
-        (_
-         (user-error "Point is not inside a supported scad-sketch form"))))))
+    ;; Unsupported union children signal an error; they should not fall through
+    ;; to "insert a new array".
+    (cond
+     (union-node
+      (scad-sketch-session--session-from-union ast path union-node))
+     ((eq (plist-get node :type) 'array)
+      (scad-sketch-session--session-from-array ast path node))
+     ((eq (plist-get node :type) 'polygon)
+      (scad-sketch-session--session-from-polygon ast path node))
+     (t
+      (signal 'scad-sketch-unsupported-edit-target
+              (list (format "Unsupported scad-sketch form: %S"
+                            (plist-get node :type))))))))
 
 (defun scad-sketch-session-insert-array-at-point (name)
   "Insert a new empty array named NAME at point and return its session."
@@ -923,72 +803,257 @@ Currently supports:
           (make-scad-sketch-target
            :id 'array-0
            :kind 'array
+           :role 'source
            :node node
            :source-node node
            :beg-marker beg
            :end-marker end
            :name name
-           :points nil
            :polyround nil
            :write-p t
            :metadata nil))
     (setq shape
-          (make-scad-sketch-shape
-           :id 'shape-0
-           :kind 'polygon
-           :points nil
-           :closed t
-           :polyround nil
-           :source-target target
-           :metadata (list :source-name name :inserted-array t)))
+          (scad-sketch-session--make-shape
+           'shape-0 nil nil
+           (scad-sketch-target-id target)
+           nil
+           (list :source-name name :inserted-array t)))
     (scad-sketch-session--make-session
-     name nil beg end nil (list node) node (list target)
-     (list shape) 'shape-0 nil nil)))
+     name
+     (list shape)
+     'shape-0
+     (list target)
+     nil
+     beg end
+     nil (list node) node)))
 
-;;;; Write-back
+;; Writeback
+(defun scad-sketch-session--shape-source-target (session shape)
+  "Return SHAPE's source target in SESSION, or nil."
+  (when (scad-sketch-shape-source-target-id shape)
+    (scad-sketch-session-target-by-id
+     session (scad-sketch-shape-source-target-id shape))))
 
-(defun scad-sketch-session--write-target (session target)
-  "Write one writable TARGET using SESSION's current points."
-  (let ((replacement (scad-sketch-session--target-replacement session target))
-        (beg (scad-sketch-target-beg-marker target))
-        (end (scad-sketch-target-end-marker target)))
-    (when replacement
-      (goto-char beg)
-      (delete-region beg end)
-      (insert replacement)
-      (set-marker end (point)))))
+(defun scad-sketch-session--shape-source-name (session shape)
+  "Return SHAPE's source variable name, if any."
+  (let ((target (scad-sketch-session--shape-source-target session shape)))
+    (and target (scad-sketch-target-name target))))
+
+(defun scad-sketch-session--shape-extracted-name (shape)
+  "Return SHAPE's generated extraction name, if one exists."
+  (plist-get (scad-sketch-shape-metadata shape) :extracted-name))
+
+(defun scad-sketch-session--set-shape-extracted-name (shape name)
+  "Record NAME as SHAPE's generated extraction name."
+  (setf (scad-sketch-shape-metadata shape)
+        (plist-put (scad-sketch-shape-metadata shape)
+                   :extracted-name name)))
+
+(defun scad-sketch-session--emit-shape-call (session shape indent)
+  "Emit SHAPE as a polygon call at INDENT.
+
+This emits only the call.  Any generated assignments are handled by
+`scad-sketch-session--emit-shape-with-assignments'."
+  (let* ((points    (scad-sketch-shape-points shape))
+         (polyround (scad-sketch-shape-polyround shape))
+         (source    (scad-sketch-session--shape-source-name session shape)))
+    (scad-sketch-session--emit-polygon-call
+     points indent polyround source)))
+
+(defun scad-sketch-session--emit-shape-with-assignments (session shape indent)
+  "Return (:assignments STR :call STR) for SHAPE in SESSION.
+
+Referenced shapes preserve their source variable call.  Inline/new large shapes
+are extracted to generated `_sketch_N' assignments."
+  (let* ((points    (scad-sketch-shape-points shape))
+         (polyround (scad-sketch-shape-polyround shape))
+         (source    (scad-sketch-session--shape-source-name session shape)))
+    (cond
+     ;; Preserve source references.  The source array is written separately.
+     (source
+      (list :assignments ""
+            :call (scad-sketch-session--emit-polygon-call
+                   points indent polyround source)))
+
+     ;; Small inline/new shapes stay inline.
+     ((<= (length points) scad-sketch-session-inline-polygon-threshold)
+      (list :assignments ""
+            :call (scad-sketch-session--emit-polygon-call
+                   points indent polyround)))
+
+     ;; Large inline/new shapes get extracted.
+     (t
+      (let ((name (or (scad-sketch-session--shape-extracted-name shape)
+                      (scad-sketch-session--unique-sketch-name session))))
+        (scad-sketch-session--set-shape-extracted-name shape name)
+        (list :assignments
+              (scad-sketch-session--emit-array-assignment
+               name points "" polyround)
+              :call
+              (scad-sketch-session--emit-polygon-call
+               points indent polyround nil name)))))))
+
+(defun scad-sketch-session--emit-single-root-replacement (session shape indent)
+  "Emit replacement text for SESSION root when it contains one SHAPE."
+  (let ((emitted
+         (scad-sketch-session--emit-shape-with-assignments
+          session shape indent)))
+    (concat (plist-get emitted :assignments)
+            (plist-get emitted :call))))
+
+(defun scad-sketch-session--emit-union-root-replacement (session indent)
+  "Emit SESSION's shapes as a canonical union at INDENT."
+  (let ((assignments "")
+        (calls ""))
+    (dolist (shape (scad-sketch-session-shapes session))
+      (let* ((emitted (scad-sketch-session--emit-shape-with-assignments
+                       session shape (concat indent "  ")))
+             (shape-assignments (plist-get emitted :assignments))
+             (shape-call (plist-get emitted :call)))
+        (unless (string= shape-assignments "")
+          (setq assignments (concat assignments shape-assignments)))
+        (setq calls (concat calls shape-call))))
+    (concat assignments
+            indent "union() {\n"
+            calls
+            indent "}\n")))
+
+(defun scad-sketch-session--target-indent (target)
+  "Return indentation string for TARGET's beginning marker."
+  (let ((marker (scad-sketch-target-beg-marker target)))
+    (with-current-buffer (marker-buffer marker)
+      (save-excursion
+        (goto-char marker)
+        (beginning-of-line)
+        (if (looking-at "[ \t]*")
+            (match-string-no-properties 0)
+          "")))))
+
+(defun scad-sketch-session--source-target-replacement (session target)
+  "Return replacement text for source TARGET in SESSION."
+  (let* ((indent (scad-sketch-session--target-indent target))
+         (shape
+          (cl-find-if
+           (lambda (shape)
+             (eq (scad-sketch-shape-source-target-id shape)
+                 (scad-sketch-target-id target)))
+           (scad-sketch-session-shapes session)))
+         (points
+          (cond (shape
+                 (scad-sketch-shape-points shape))
+                ((eq (scad-sketch-target-kind target) 'array)
+                 (plist-get (scad-sketch-target-node target) :points))
+                (t
+                 nil))))
+    (scad-sketch-session--emit-array-assignment
+     (scad-sketch-target-name target)
+     points
+     indent
+     (scad-sketch-target-polyround target))))
+
+(defun scad-sketch-session--root-target-replacement (session root-target)
+  "Return replacement text for ROOT-TARGET in SESSION, or nil.
+
+A single referenced polygon does not need its root call replaced; its source
+array update is enough.  A single inline polygon does replace the root.  Multiple
+shapes always serialize through the root as a union."
+  (let* ((indent (scad-sketch-session--target-indent root-target))
+         (shapes (scad-sketch-session-shapes session))
+         (n      (length shapes)))
+    (cond
+     ((<= n 0)
+      "")
+
+     ((> n 1)
+      (scad-sketch-session--emit-union-root-replacement session indent))
+
+     ;; One shape.  Existing `polygon(pts)' root can remain as-is; source target
+     ;; handles the actual points.
+     ((and (= n 1)
+           (eq (scad-sketch-target-kind root-target) 'polygon-ref))
+      nil)
+
+     ;; One shape with an inline polygon root or existing union root: emit the
+     ;; natural single-shape representation.
+     (t
+      (scad-sketch-session--emit-single-root-replacement
+       session (car shapes) indent)))))
+
+(defun scad-sketch-session-preview (session)
+  "Return the source preview for SESSION."
+  (scad-sketch-session-sync-active-shape-from-points session)
+  (let ((root (scad-sketch-session-root-target session)))
+    (cond
+     (root
+      (or (scad-sketch-session--root-target-replacement session root)
+          ;; Referenced single-shape root: show source + call preview.
+          (let* ((shape (car (scad-sketch-session-shapes session)))
+                 (source-target
+                  (and shape
+                       (scad-sketch-session--shape-source-target session shape))))
+            (concat
+             (when source-target
+               (scad-sketch-session--source-target-replacement
+                session source-target))
+             (scad-sketch-session--emit-shape-call session shape "")))))
+     (t
+      (let ((source-target (car (scad-sketch-session-source-targets session))))
+        (if source-target
+            (scad-sketch-session--source-target-replacement
+             session source-target)
+          ""))))))
+
+(defun scad-sketch-session--write-target-replacement (target replacement)
+  "Replace TARGET with REPLACEMENT in its source buffer."
+  (when replacement
+    (goto-char (scad-sketch-target-beg-marker target))
+    (delete-region (scad-sketch-target-beg-marker target)
+                   (scad-sketch-target-end-marker target))
+    (insert replacement)
+    (set-marker (scad-sketch-target-end-marker target) (point))))
 
 (defun scad-sketch-session-write-back (session)
   "Write SESSION edits back to its source buffer."
   (scad-sketch-session-sync-active-shape-from-points session)
   (let* ((source (scad-sketch-session-source-buffer session))
-         (targets
-          (if (eq (scad-sketch-session-root-kind session) 'union)
-              ;; For union sessions, rewrite the root union and any referenced
-              ;; source arrays.  Do not separately rewrite inline child polygon
-              ;; targets because they live inside the root region.
-              (let ((root (scad-sketch-session-root-target session))
-                    (source-targets
-                     (delq nil
-                           (mapcar #'scad-sketch-shape-source-target
-                                   (scad-sketch-session-shapes session)))))
-                (delq nil (cons root source-targets)))
-            (cl-remove-if-not #'scad-sketch-target-write-p
-                              (scad-sketch-session-targets session)))))
+         (root   (scad-sketch-session-root-target session))
+         (source-targets (scad-sketch-session-source-targets session)))
     (unless (buffer-live-p source)
       (user-error "Source buffer is gone"))
-    ;; Multiple targets must be replaced from later buffer positions to earlier
-    ;; positions so earlier edits do not shift later regions.
-    (setq targets
-          (sort (copy-sequence targets)
-                (lambda (a b)
-                  (> (marker-position (scad-sketch-target-beg-marker a))
-                     (marker-position (scad-sketch-target-beg-marker b))))))
 
-    (with-current-buffer source
-      (save-excursion
-        (dolist (target targets)
-          (scad-sketch-session--write-target session target))))
+    (when (and (null root)
+               (> (length (scad-sketch-session-shapes session)) 1))
+      (signal 'scad-sketch-unsupported-edit-target
+              (list "This session only owns arrays; open a polygon or union to write multiple shapes")))
+
+    (let (write-items)
+      ;; Source targets first conceptually, but all replacements are sorted by
+      ;; buffer position before application.
+      (dolist (target source-targets)
+        (push (cons target
+                    (scad-sketch-session--source-target-replacement
+                     session target))
+              write-items))
+
+      (when root
+        (let ((replacement
+               (scad-sketch-session--root-target-replacement session root)))
+          (when replacement
+            (push (cons root replacement) write-items))))
+
+      (setq write-items
+            (sort write-items
+                  (lambda (a b)
+                    (> (marker-position
+                        (scad-sketch-target-beg-marker (car a)))
+                       (marker-position
+                        (scad-sketch-target-beg-marker (car b)))))))
+
+      (with-current-buffer source
+        (save-excursion
+          (dolist (item write-items)
+            (scad-sketch-session--write-target-replacement
+             (car item) (cdr item))))))
 
     (setf (scad-sketch-session-dirty session) nil)
     session))

@@ -58,13 +58,20 @@ C-c C-s and C-c C-o are intentionally left free for `scad-mode'.")
 
 ;;;###autoload
 (defun scad-sketch-or-insert-at-point ()
-  "Edit the array at point, or insert and open a new one if none is found."
+  "Edit the supported form at point, or insert a new array if none is found.
+
+Only `scad-sketch-no-edit-target' falls through to insertion.  Unsupported
+forms are real errors and should be reported rather than silently switching to
+new-array insertion."
   (interactive)
-  (scad-sketch--ensure-svg)
-  (condition-case nil
+  (unless (image-type-available-p 'svg)
+    (user-error "This Emacs was not built with SVG image support"))
+  (condition-case err
       (scad-sketch-at-point)
-    (user-error
-     (call-interactively #'scad-sketch-insert-array-at-point))))
+    (scad-sketch-no-edit-target
+     (call-interactively #'scad-sketch-insert-array-at-point))
+    (scad-sketch-unsupported-edit-target
+     (signal (car err) (cdr err)))))
 
 (provide 'scad-sketch)
 ;;; scad-sketch.el ends here
