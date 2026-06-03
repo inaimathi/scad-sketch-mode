@@ -69,6 +69,19 @@
   points point
   marks            ; list of [x y], newest first; (car marks) is current mark
   named-marks selected-index
+
+  ;; Selection/attention model.
+  ;;
+  ;; A selection ref is a plist like:
+  ;;   (:kind point :shape-id shape-0 :index 2)
+  ;;   (:kind shape :shape-id shape-0)
+  ;;
+  ;; In the current editor, there is only one shape, `shape-0`, backed by
+  ;; `points`.  This is deliberately shaped like the future tree/object model.
+  selection
+  focus-ref
+  hover-index
+
   source-buffer content-beg content-end
   ast path root-node targets
   dirty undo-stack)
@@ -433,6 +446,11 @@ multi-region editing."
    :marks nil
    :named-marks nil
    :selected-index (if points 0 nil)
+   :selection nil
+   :focus-ref (if points
+                  (list :kind 'point :shape-id 'shape-0 :index 0)
+                (list :kind 'shape :shape-id 'shape-0))
+   :hover-index 0
    :source-buffer (current-buffer)
    :content-beg beg-marker
    :content-end end-marker

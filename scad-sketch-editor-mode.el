@@ -73,8 +73,12 @@
     (define-key map (kbd "r")         #'scad-sketch-rectangle-from-mark)
     (define-key map (kbd "c")         #'scad-sketch-toggle-closed)
     (define-key map (kbd "R")         #'scad-sketch-set-radius)
-    (define-key map (kbd "TAB")       #'scad-sketch-next-point)
-    (define-key map (kbd "<backtab>") #'scad-sketch-previous-point)
+    (define-key map (kbd "TAB")       #'scad-sketch-next-selectable)
+    (define-key map (kbd "<backtab>") #'scad-sketch-previous-selectable)
+    (define-key map (kbd ".")         #'scad-sketch-next-hovered)
+    (define-key map (kbd ",")         #'scad-sketch-previous-hovered)
+    (define-key map (kbd "SPC")       #'scad-sketch-toggle-attention-selection)
+    (define-key map (kbd "s")         #'scad-sketch-clear-selection)
     (define-key map (kbd "x")         #'scad-sketch-set-x)
     (define-key map (kbd "y")         #'scad-sketch-set-y)
     (define-key map (kbd "X")         #'scad-sketch-set-delta-x)
@@ -181,13 +185,34 @@ Session:
   "Mark SESSION as having unsaved edits."
   (setf (scad-sketch-session-dirty session) t))
 
-(defun scad-sketch--mutate (fn)
-  "Push undo, call FN with session, mark dirty, re-render."
+(defun scad-sketch--change (fn &optional source-mutation-p)
+  "Call FN with session, then re-render.
+
+When SOURCE-MUTATION-P is non-nil, push undo and mark the session dirty.
+Cursor movement, mark movement, hover, focus, and selection are clean changes;
+editing source geometry is dirty."
   (let ((session (scad-sketch--assert-session)))
-    (scad-sketch--push-undo session)
+    (when source-mutation-p
+      (scad-sketch--push-undo session))
     (funcall fn session)
-    (scad-sketch--mark-dirty session)
+    (scad-sketch--normalize-attention session)
+    (when source-mutation-p
+      (scad-sketch--mark-dirty session))
     (scad-sketch--render)))
+
+(defun scad-sketch--edit (fn)
+  "Apply FN as a source-geometry mutation."
+  (scad-sketch--change fn t))
+
+(defun scad-sketch--clean-change (fn)
+  "Apply FN as a clean UI/session change."
+  (scad-sketch--change fn nil))
+
+;; Backwards-compatible name.  From here on, use `scad-sketch--edit' for
+;; mutations that should dirty the source.
+(defun scad-sketch--mutate (fn)
+  "Apply FN as a source-geometry mutation."
+  (scad-sketch--edit fn))
 
 ;;; Point selection
 
@@ -210,26 +235,44 @@ Session:
 
 ;;; Movement
 
-
 (defun scad-sketch--move-point (dx dy &optional snap)
-  "Move cursor by DX, DY; snap to grid when SNAP is non-nil."
-  (scad-sketch--mutate
+  "Move cursor by DX, DY; snap to grid when SNAP is non-nil.
+
+This is a clean operation: moving the editor cursor does not dirty source."
+  (scad-sketch--clean-change
    (lambda (s)
      (let ((new (scad-sketch--move-xy (scad-sketch-session-point s) dx dy)))
        (setf (scad-sketch-session-point s)
-             (if snap (scad-sketch--snap-xy new (scad-sketch--grid s)) new))))))
+             (if snap (scad-sketch--snap-xy new (scad-sketch--grid s)) new))
+       (setf (scad-sketch-session-hover-index s) 0)))))
 
 (defun scad-sketch--move-selected (dx dy &optional snap)
-  "Move selected vertex by DX, DY; snap to grid when SNAP is non-nil."
-  (scad-sketch--mutate
+  "Move selected vertices/shapes by DX, DY; snap to grid when SNAP is non-nil.
+
+If no explicit selection exists, falls back to the active point."
+  (scad-sketch--edit
    (lambda (s)
-     (let* ((old    (or (scad-sketch--selected-point s)
-                        (user-error "No selected point")))
-            (new-xy (scad-sketch--move-xy (scad-sketch--point-xy old) dx dy))
-            (snapped (if snap (scad-sketch--snap-xy new-xy (scad-sketch--grid s)) new-xy))
-            (new    (scad-sketch--make-model-point snapped old)))
-       (scad-sketch--set-selected-point s new)
-       (setf (scad-sketch-session-point s) snapped)))))
+     (let ((indices (scad-sketch--selected-point-indices s t)))
+       (unless indices
+         (user-error "No selected point or shape"))
+       (dolist (idx indices)
+         (let* ((old    (nth idx (scad-sketch-session-points s)))
+                (new-xy (scad-sketch--move-xy
+                         (scad-sketch--point-xy old) dx dy))
+                (snapped (if snap
+                             (scad-sketch--snap-xy new-xy
+                                                   (scad-sketch--grid s))
+                           new-xy))
+                (new    (scad-sketch--make-model-point snapped old)))
+           (setf (scad-sketch-session-points s)
+                 (scad-sketch--replace-nth
+                  idx new (scad-sketch-session-points s)))))
+       ;; Keep cursor attached to single active point when possible.
+       (when (= 1 (length indices))
+         (setf (scad-sketch-session-point s)
+               (scad-sketch--point-xy
+                (nth (car indices)
+                     (scad-sketch-session-points s)))))))))
 
 (defun scad-sketch--grid   (s) (float (scad-sketch-session-grid s)))
 (defun scad-sketch--fine   (s) (float (scad-sketch-session-fine-step s)))
@@ -265,7 +308,7 @@ Session:
 (defun scad-sketch-set-mark ()
   "Replace all marks with the current cursor position."
   (interactive)
-  (scad-sketch--mutate
+  (scad-sketch--clean-change
    (lambda (s)
      (setf (scad-sketch-session-marks s)
            (list (copy-sequence (scad-sketch-session-point s)))))))
@@ -273,7 +316,7 @@ Session:
 (defun scad-sketch-push-mark ()
   "Push the current cursor position onto the mark stack."
   (interactive)
-  (scad-sketch--mutate
+  (scad-sketch--clean-change
    (lambda (s)
      (push (copy-sequence (scad-sketch-session-point s))
            (scad-sketch-session-marks s)))))
@@ -283,35 +326,41 @@ Session:
   (interactive)
   (let ((session (scad-sketch--assert-session)))
     (unless (scad-sketch-session-marks session) (user-error "No marks set")))
-  (scad-sketch--mutate
+  (scad-sketch--clean-change
    (lambda (s)
      (setf (scad-sketch-session-point s)
-           (copy-sequence (pop (scad-sketch-session-marks s)))))))
+           (copy-sequence (pop (scad-sketch-session-marks s))))
+     (setf (scad-sketch-session-hover-index s) 0))))
 
 (defun scad-sketch-jump-to-mark ()
   "Move cursor to the most recent mark without consuming it."
   (interactive)
   (let ((session (scad-sketch--assert-session)))
     (unless (scad-sketch-session-marks session) (user-error "No marks set")))
-  (scad-sketch--mutate
+  (scad-sketch--clean-change
    (lambda (s)
      (setf (scad-sketch-session-point s)
-           (copy-sequence (car (scad-sketch-session-marks s)))))))
+           (copy-sequence (car (scad-sketch-session-marks s))))
+     (setf (scad-sketch-session-hover-index s) 0))))
 
 (defun scad-sketch-clear-marks ()
   "Clear all marks."
   (interactive)
-  (scad-sketch--mutate
+  (scad-sketch--clean-change
    (lambda (s) (setf (scad-sketch-session-marks s) nil))))
 
 ;;; Vertex editing
 
 (defun scad-sketch--append-model-point (session point)
-  "Append POINT to SESSION and select it."
+  "Append POINT to SESSION and focus/select it."
   (setf (scad-sketch-session-points session)
         (append (scad-sketch-session-points session) (list point)))
-  (setf (scad-sketch-session-selected-index session)
-        (1- (length (scad-sketch-session-points session)))))
+  (let ((idx (1- (length (scad-sketch-session-points session)))))
+    (setf (scad-sketch-session-selected-index session) idx)
+    (setf (scad-sketch-session-focus-ref session)
+          (scad-sketch--point-ref idx))
+    (setf (scad-sketch-session-selection session)
+          (list (scad-sketch--point-ref idx)))))
 
 (defun scad-sketch-append-point ()
   "Append the cursor position as a new vertex."
@@ -343,21 +392,36 @@ Without marks, inserts only the cursor."
        (setf (scad-sketch-session-selected-index s) new-idx)))))
 
 (defun scad-sketch-delete-selected ()
-  "Delete the selected vertex."
+  "Delete selected vertices.
+
+A selected shape deletes all vertices in the current shape.  If no explicit
+selection exists, deletes the active point."
   (interactive)
-  (scad-sketch--mutate
+  (scad-sketch--edit
    (lambda (s)
-     (let ((idx    (or (scad-sketch-session-selected-index s)
-                       (user-error "No selected point")))
-           (points (scad-sketch-session-points s)))
-       (unless (< idx (length points)) (user-error "Selected point out of range"))
-       (setf (scad-sketch-session-points s)
-             (append (cl-subseq points 0 idx) (nthcdr (1+ idx) points)))
+     (let* ((indices (sort (copy-sequence
+                            (scad-sketch--selected-point-indices s t))
+                           #'>))
+            (points (scad-sketch-session-points s)))
+       (unless indices
+         (user-error "No selected point or shape"))
+       (dolist (idx indices)
+         (when (and (>= idx 0) (< idx (length points)))
+           (setq points
+                 (append (cl-subseq points 0 idx)
+                         (nthcdr (1+ idx) points)))))
+       (setf (scad-sketch-session-points s) points)
+       (setf (scad-sketch-session-selection s) nil)
        (setf (scad-sketch-session-selected-index s)
-             (cond ((null (scad-sketch-session-points s)) nil)
-                   ((>= idx (length (scad-sketch-session-points s)))
-                    (1- (length (scad-sketch-session-points s))))
-                   (t idx)))))))
+             (cond ((null points) nil)
+                   ((>= (car indices) (length points))
+                    (1- (length points)))
+                   (t (car indices))))
+       (when (scad-sketch-session-selected-index s)
+         (setf (scad-sketch-session-point s)
+               (scad-sketch--point-xy
+                (nth (scad-sketch-session-selected-index s)
+                     points))))))))
 
 (defun scad-sketch-line-from-mark ()
   "Append marks (oldest first) then cursor as new vertices."
@@ -382,54 +446,120 @@ Without marks, inserts only the cursor."
 (defun scad-sketch-toggle-closed ()
   "Toggle the closed flag."
   (interactive)
-  (scad-sketch--mutate
+  (scad-sketch--clean-change
    (lambda (s)
-     (setf (scad-sketch-session-closed s) (not (scad-sketch-session-closed s))))))
+     (setf (scad-sketch-session-closed s)
+           (not (scad-sketch-session-closed s))))))
 
 (defun scad-sketch-set-radius (radius)
-  "Set the polyRound radius of the selected vertex."
+  "Set the polyRound radius of selected vertices.
+
+If a shape is selected, applies to all of its vertices.  If no explicit
+selection exists, applies to the active point."
   (interactive (list (read-number "Radius: " 0)))
-  (scad-sketch--mutate
+  (scad-sketch--edit
    (lambda (s)
-     (let ((pt (or (scad-sketch--selected-point s) (user-error "No selected point"))))
-       (scad-sketch--set-selected-point
-        s (list (nth 0 pt) (nth 1 pt) (float radius)))))))
+     (let ((indices (scad-sketch--selected-point-indices s t)))
+       (unless indices
+         (user-error "No selected point or shape"))
+       (dolist (idx indices)
+         (let ((pt (nth idx (scad-sketch-session-points s))))
+           (setf (scad-sketch-session-points s)
+                 (scad-sketch--replace-nth
+                  idx
+                  (list (nth 0 pt) (nth 1 pt) (float radius))
+                  (scad-sketch-session-points s)))))))))
 
-(defun scad-sketch-next-point ()
-  "Select the next vertex, moving cursor to it."
-  (interactive)
-  (let ((session (scad-sketch--assert-session)))
-    (unless (scad-sketch-session-points session) (user-error "No points")))
-  (scad-sketch--mutate
-   (lambda (s)
-     (let* ((n   (length (scad-sketch-session-points s)))
-            (idx (mod (1+ (or (scad-sketch-session-selected-index s) -1)) n)))
-       (setf (scad-sketch-session-selected-index s) idx)
-       (setf (scad-sketch-session-point s)
-             (scad-sketch--point-xy (nth idx (scad-sketch-session-points s))))))))
+(defun scad-sketch--set-focus-ref (session ref)
+  "Set SESSION focus to REF and move cursor to REF's anchor."
+  (setf (scad-sketch-session-focus-ref session) ref)
+  (setf (scad-sketch-session-point session)
+        (copy-sequence (scad-sketch--ref-anchor session ref)))
+  (setf (scad-sketch-session-hover-index session) 0)
+  (when (eq (scad-sketch--ref-kind ref) 'point)
+    (setf (scad-sketch-session-selected-index session)
+          (scad-sketch--ref-index ref))))
 
-(defun scad-sketch-previous-point ()
-  "Select the previous vertex, moving cursor to it."
-  (interactive)
-  (let ((session (scad-sketch--assert-session)))
-    (unless (scad-sketch-session-points session) (user-error "No points")))
-  (scad-sketch--mutate
+(defun scad-sketch--cycle-selectable (delta)
+  "Cycle focus by DELTA through all selectable refs."
+  (scad-sketch--clean-change
    (lambda (s)
-     (let* ((n   (length (scad-sketch-session-points s)))
-            (idx (mod (1- (or (scad-sketch-session-selected-index s) 0)) n)))
-       (setf (scad-sketch-session-selected-index s) idx)
-       (setf (scad-sketch-session-point s)
-             (scad-sketch--point-xy (nth idx (scad-sketch-session-points s))))))))
+     (let* ((refs (scad-sketch--selectable-refs s))
+            (n (length refs))
+            (focus (or (scad-sketch-session-focus-ref s)
+                       (car refs)))
+            (idx (or (cl-position-if
+                      (lambda (ref)
+                        (scad-sketch--same-ref-p ref focus))
+                      refs)
+                     0)))
+       (unless (> n 0)
+         (user-error "No selectable objects"))
+       (scad-sketch--set-focus-ref s
+                                    (nth (mod (+ idx delta) n)
+                                         refs))))))
+
+(defun scad-sketch-next-selectable ()
+  "Cycle focus to the next selectable shape/point."
+  (interactive)
+  (scad-sketch--cycle-selectable 1))
+
+(defun scad-sketch-previous-selectable ()
+  "Cycle focus to the previous selectable shape/point."
+  (interactive)
+  (scad-sketch--cycle-selectable -1))
+
+(defun scad-sketch--cycle-hovered (delta)
+  "Cycle attention by DELTA among hovered refs under point."
+  (scad-sketch--clean-change
+   (lambda (s)
+     (let* ((candidates (scad-sketch--hover-candidates s))
+            (n (length candidates)))
+       (unless (> n 0)
+         (user-error "No hovered objects under point"))
+       (setf (scad-sketch-session-hover-index s)
+             (mod (+ (or (scad-sketch-session-hover-index s) 0)
+                     delta)
+                  n))))))
+
+(defun scad-sketch-next-hovered ()
+  "Cycle attention to the next hovered object under point."
+  (interactive)
+  (scad-sketch--cycle-hovered 1))
+
+(defun scad-sketch-previous-hovered ()
+  "Cycle attention to the previous hovered object under point."
+  (interactive)
+  (scad-sketch--cycle-hovered -1))
+
+(defun scad-sketch-toggle-attention-selection ()
+  "Toggle the currently attended hovered/focused object in the selection."
+  (interactive)
+  (scad-sketch--clean-change
+   (lambda (s)
+     (let ((ref (scad-sketch--attention-ref s)))
+       (unless ref
+         (user-error "No focused or hovered object"))
+       (scad-sketch--toggle-ref-selection s ref)))))
+
+(defun scad-sketch-clear-selection ()
+  "Clear the current selection."
+  (interactive)
+  (scad-sketch--clean-change
+   (lambda (s)
+     (setf (scad-sketch-session-selection s) nil))))
+
 
 ;;; Coordinate commands
 
 (defun scad-sketch--set-point-axis (axis value)
   "Set cursor coordinate AXIS (0=x, 1=y) to VALUE."
-  (scad-sketch--mutate
+  (scad-sketch--clean-change
    (lambda (s)
      (let ((pt (copy-sequence (scad-sketch-session-point s))))
        (setf (nth axis pt) (float value))
-       (setf (scad-sketch-session-point s) pt)))))
+       (setf (scad-sketch-session-point s) pt)
+       (setf (scad-sketch-session-hover-index s) 0)))))
 
 (defun scad-sketch-set-x (x)
   "Set cursor X."
@@ -463,32 +593,45 @@ Without marks, inserts only the cursor."
   (interactive (list (read-number "Distance from mark: " 0)))
   (let ((session (scad-sketch--assert-session)))
     (unless (scad-sketch-session-marks session) (user-error "No marks set")))
-  (scad-sketch--mutate
+  (scad-sketch--clean-change
    (lambda (s)
-     (setf (scad-sketch-session-point s)
-           (scad-sketch--geometry-point-at-distance
-            (car (scad-sketch-session-marks s))
-            (scad-sketch-session-point s)
-            distance)))))
+     (let* ((m  (car (scad-sketch-session-marks s)))
+            (p  (scad-sketch-session-point s))
+            (angle (atan (- (nth 1 p) (nth 1 m))
+                         (- (nth 0 p) (nth 0 m)))))
+       (setf (scad-sketch-session-point s)
+             (list (+ (nth 0 m) (* (float distance) (cos angle)))
+                   (+ (nth 1 m) (* (float distance) (sin angle)))))
+       (setf (scad-sketch-session-hover-index s) 0)))))
 
 (defun scad-sketch-set-angle-from-mark (degrees)
   "Set angle from most recent mark to cursor in DEGREES, preserving distance."
   (interactive (list (read-number "Angle degrees from mark: " 0)))
   (let ((session (scad-sketch--assert-session)))
     (unless (scad-sketch-session-marks session) (user-error "No marks set")))
-  (scad-sketch--mutate
+  (scad-sketch--clean-change
    (lambda (s)
-     (setf (scad-sketch-session-point s)
-           (scad-sketch--geometry-point-at-angle
-            (car (scad-sketch-session-marks s))
-            (scad-sketch-session-point s)
-            degrees)))))
+     (let* ((m     (car (scad-sketch-session-marks s)))
+            (p     (scad-sketch-session-point s))
+            (dx    (- (nth 0 p) (nth 0 m)))
+            (dy    (- (nth 1 p) (nth 1 m)))
+            (dist  (sqrt (+ (* dx dx) (* dy dy))))
+            (angle (* pi (/ (float degrees) 180.0))))
+       (setf (scad-sketch-session-point s)
+             (list (+ (nth 0 m) (* dist (cos angle)))
+                   (+ (nth 1 m) (* dist (sin angle)))))
+       (setf (scad-sketch-session-hover-index s) 0)))))
 
 (defun scad-sketch-set-grid (grid)
   "Set the grid step."
-  (interactive (list (read-number "Grid step: " (scad-sketch-session-grid (scad-sketch--assert-session)))))
-  (scad-sketch--mutate
-   (lambda (s) (setf (scad-sketch-session-grid s) (float grid)))))
+  (interactive
+   (list (read-number "Grid step: "
+                      (scad-sketch-session-grid
+                       (scad-sketch--assert-session)))))
+  (scad-sketch--clean-change
+   (lambda (s)
+     (setf (scad-sketch-session-grid s) (float grid))
+     (setf (scad-sketch-session-hover-index s) 0))))
 
 ;;; Undo command
 
@@ -565,63 +708,107 @@ Without marks, inserts only the cursor."
                              :stroke "#d0d0d0" :stroke-width 2))))
 
 ;;; polyRound arc geometry
-
 (defun scad-sketch--draw-path (svg transform session)
   "Draw the polygon path and vertex circles."
-  (let* ((points  (scad-sketch-session-points session))
-         (closed  (scad-sketch-session-closed session))
-         (n       (length points))
-         (idx     0))
+  (let* ((points          (scad-sketch-session-points session))
+         (closed          (scad-sketch-session-closed session))
+         (n               (length points))
+         (idx             0)
+         (shape-selected  (scad-sketch--shape-selected-p session))
+         (attention       (scad-sketch--attention-ref session))
+         (shape-attention (and attention
+                               (eq (scad-sketch--ref-kind attention) 'shape)))
+         (shape-stroke    (cond (shape-selected "#d13f00")
+                                (shape-attention "#0057c2")
+                                (t "#111111")))
+         (shape-width     (if (or shape-selected shape-attention) 5 3)))
     (when (>= n 2)
       (if (scad-sketch--any-radius-p points)
           (let ((d (scad-sketch--polyround-path-d points closed transform)))
             (when d
-              (svg-node svg 'path :d d :stroke "#111111" :stroke-width 3 :fill "none")))
+              (svg-node svg 'path
+                        :d d
+                        :stroke shape-stroke
+                        :stroke-width shape-width
+                        :fill "none")))
         (let ((xy-points (mapcar #'scad-sketch--point-xy points)))
-          (cl-loop for a on xy-points for b = (cadr a) when b do
+          (cl-loop for a on xy-points
+                   for b = (cadr a)
+                   when b do
                    (scad-sketch--svg-line svg transform (car a) b
-                                          :stroke "#111111" :stroke-width 3))
+                                          :stroke shape-stroke
+                                          :stroke-width shape-width))
           (when (and closed (> n 2))
-            (scad-sketch--svg-line svg transform (car (last xy-points)) (car xy-points)
-                                   :stroke "#111111" :stroke-width 3)))))
-    (let* ((n      (length points))
-           (closed (scad-sketch-session-closed session)))
-      (dolist (pt points)
-        (let* ((xy     (scad-sketch--point-xy pt))
-               (screen (funcall transform xy))
-               (sel    (= idx (or (scad-sketch-session-selected-index session) -1)))
-               (radius (scad-sketch--point-radius pt)))
-          (svg-circle svg (nth 0 screen) (nth 1 screen) (if sel 7 5)
-                      :stroke (if sel "#d13f00" "#111111") :stroke-width (if sel 3 2)
-                      :fill   (if sel "#fff0e8" "#ffffff"))
-          (svg-text svg (number-to-string idx)
-                    :x (+ (nth 0 screen) 8) :y (- (nth 1 screen) 8)
-                    :font-size 12 :fill "#333333")
-          (when (> radius 0)
-            (let* ((prev    (cond ((> idx 0)      (nth (1- idx) points))
-                                  (closed         (nth (1- n)   points))))
-                   (next    (cond ((< idx (1- n)) (nth (1+ idx) points))
-                                  (closed         (nth 0        points))))
-                   (corner  (when (and prev next)
-                              (scad-sketch--corner-geometry
-                               (scad-sketch--point-xy prev)
-                               xy
-                               (scad-sketch--point-xy next)
-                               radius)))
-                   (actual-r (if corner (plist-get corner :radius) radius))
-                   (capped   (and corner (< (+ actual-r 0.001) radius))))
-              (svg-circle svg (nth 0 screen) (nth 1 screen)
-                          (scad-sketch--pixel-radius actual-r transform)
-                          :stroke (if capped "#c04000" "#804000")
-                          :stroke-width 1 :stroke-dasharray "3,3" :fill "none")
-              (svg-text svg (if capped
-                                (format "r=%s\u2192%s"
-                                        (scad-sketch--fmt-num radius)
-                                        (scad-sketch--fmt-num actual-r))
-                              (format "r=%s" (scad-sketch--fmt-num actual-r)))
-                        :x (+ (nth 0 screen) 8) :y (+ (nth 1 screen) 18)
-                        :font-size 11 :fill (if capped "#c04000" "#804000")))))
-        (setq idx (1+ idx))))))
+            (scad-sketch--svg-line svg transform
+                                   (car (last xy-points))
+                                   (car xy-points)
+                                   :stroke shape-stroke
+                                   :stroke-width shape-width)))))
+
+    (when shape-attention
+      (let ((center (funcall transform (scad-sketch--shape-center session))))
+        (svg-text svg "shape"
+                  :x (+ (nth 0 center) 10)
+                  :y (+ (nth 1 center) 4)
+                  :font-size 12
+                  :fill "#0057c2")))
+
+    (dolist (pt points)
+      (let* ((xy        (scad-sketch--point-xy pt))
+             (screen    (funcall transform xy))
+             (point-ref (scad-sketch--point-ref idx))
+             (sel       (scad-sketch--point-selected-p session idx))
+             (attn      (and attention
+                              (scad-sketch--same-ref-p attention point-ref)))
+             (radius    (scad-sketch--point-radius pt)))
+        (svg-circle svg (nth 0 screen) (nth 1 screen)
+                    (cond (sel 8)
+                          (attn 7)
+                          (t 5))
+                    :stroke (cond (sel "#d13f00")
+                                  (attn "#0057c2")
+                                  (t "#111111"))
+                    :stroke-width (cond (sel 3)
+                                        (attn 3)
+                                        (t 2))
+                    :fill (cond (sel "#fff0e8")
+                                (attn "#dfefff")
+                                (t "#ffffff")))
+        (svg-text svg (number-to-string idx)
+                  :x (+ (nth 0 screen) 8)
+                  :y (- (nth 1 screen) 8)
+                  :font-size 12
+                  :fill "#333333")
+        (when (> radius 0)
+          (let* ((prev     (cond ((> idx 0)      (nth (1- idx) points))
+                                 (closed         (nth (1- n)   points))))
+                 (next     (cond ((< idx (1- n)) (nth (1+ idx) points))
+                                 (closed         (nth 0        points))))
+                 (corner   (when (and prev next)
+                             (scad-sketch--corner-geometry
+                              (scad-sketch--point-xy prev)
+                              xy
+                              (scad-sketch--point-xy next)
+                              radius)))
+                 (actual-r (if corner (plist-get corner :radius) radius))
+                 (capped   (and corner (< (+ actual-r 0.001) radius))))
+            (svg-circle svg (nth 0 screen) (nth 1 screen)
+                        (scad-sketch--pixel-radius actual-r transform)
+                        :stroke (if capped "#c04000" "#804000")
+                        :stroke-width 1
+                        :stroke-dasharray "3,3"
+                        :fill "none")
+            (svg-text svg (if capped
+                              (format "r=%s\u2192%s"
+                                      (scad-sketch--fmt-num radius)
+                                      (scad-sketch--fmt-num actual-r))
+                            (format "r=%s"
+                                    (scad-sketch--fmt-num actual-r)))
+                      :x (+ (nth 0 screen) 8)
+                      :y (+ (nth 1 screen) 18)
+                      :font-size 11
+                      :fill (if capped "#c04000" "#804000")))))
+      (setq idx (1+ idx)))))
 
 (defun scad-sketch--draw-point-and-marks (svg transform session)
   "Draw all marks and the cursor point."
@@ -659,22 +846,35 @@ Without marks, inserts only the cursor."
 
 (defun scad-sketch--draw-hud (svg session)
   "Draw the status bar."
-  (let* ((marks    (scad-sketch-session-marks session))
-         (sel      (scad-sketch-session-selected-index session))
-         (mark-str (cond ((null marks) "none")
-                         ((= 1 (length marks)) (scad-sketch--fmt-xy (car marks)))
-                         (t (format "%s (+%d)" (scad-sketch--fmt-xy (car marks))
-                                    (1- (length marks))))))
-         (text (format "%s  grid=%s%s  point=%s  mark=%s  sel=%s  %s"
-                       (scad-sketch-session-name session)
-                       (scad-sketch--fmt-num (scad-sketch-session-grid session))
-                       (scad-sketch-session-units session)
-                       (scad-sketch--fmt-xy (scad-sketch-session-point session))
-                       mark-str
-                       (if sel (number-to-string sel) "none")
-                       (if (scad-sketch-session-dirty session) "*dirty*" "saved"))))
-    (svg-rectangle svg 0 0 scad-sketch-canvas-width 28 :fill "#f8f8f8")
-    (svg-text svg text :x 10 :y 19 :font-size 13 :fill "#111111")))
+  (let* ((marks     (scad-sketch-session-marks session))
+         (mark-str  (cond ((null marks) "none")
+                          ((= 1 (length marks))
+                           (scad-sketch--fmt-xy (car marks)))
+                          (t
+                           (format "%s (+%d)"
+                                   (scad-sketch--fmt-xy (car marks))
+                                   (1- (length marks))))))
+         (attention (scad-sketch--attention-ref session))
+         (text      (format "%s  grid=%s%s  point=%s  mark=%s  attn=%s  sel=%s  %s"
+                            (scad-sketch-session-name session)
+                            (scad-sketch--fmt-num
+                             (scad-sketch-session-grid session))
+                            (scad-sketch-session-units session)
+                            (scad-sketch--fmt-xy
+                             (scad-sketch-session-point session))
+                            mark-str
+                            (scad-sketch--ref-summary attention)
+                            (scad-sketch--selection-summary session)
+                            (if (scad-sketch-session-dirty session)
+                                "*dirty*"
+                              "saved"))))
+    (svg-rectangle svg 0 0 scad-sketch-canvas-width 28
+                   :fill "#f8f8f8")
+    (svg-text svg text
+              :x 10
+              :y 19
+              :font-size 13
+              :fill "#111111")))
 
 (defun scad-sketch--render ()
   "Re-render the editor buffer."
@@ -730,12 +930,15 @@ Without marks, inserts only the cursor."
 For full documentation use \\[describe-mode]."
   (interactive)
   (scad-sketch--assert-session)
-  (message (concat "arrows=move  C-arrows=coarse  M-arrows=fine(off-grid)  S-arrows=move-vertex | "
-                   "TAB/S-TAB=select  p=append  i=insert  k=delete | "
-                   "m=set-mark  M=push  `=pop  '=jump  C=clear | "
-                   "R=radius  c=closed  l=line  r=rect | "
-                   "x/y=coord  X/Y=delta  d=dist  a=angle  g=grid | "
-                   "w=write  u=undo  q=quit  C-h m=full help")))
+  (message
+   (concat "arrows=move cursor(clean)  C-arrows=coarse  M-arrows=fine | "
+           "TAB/S-TAB=focus shape/point  ./,=cycle hovered  SPC=toggle selection  s=clear selection | "
+           "S-arrows=move selected geometry(dirty) | "
+           "p=append  i=insert  k=delete | "
+           "m=set-mark  M=push  `=pop  '=jump  C=clear marks | "
+           "R=radius  c=closed  l=line  r=rect | "
+           "x/y=coord  X/Y=delta  d=dist  a=angle  g=grid | "
+           "w=write  u=undo  q=quit  C-h m=full help")))
 
 
 (provide 'scad-sketch-editor-mode)

@@ -36,6 +36,313 @@ Preserves radius from OLD-POINT if provided."
     (setf (nth n copy) value)
     copy))
 
+;;;; Selection / hover / attention
+
+(defcustom scad-sketch-hover-radius-factor 0.75
+  "Hover radius as a multiple of the current grid step."
+  :type 'number :group 'scad-sketch)
+
+(defun scad-sketch--shape-id ()
+  "Return the current single-shape id.
+
+This is intentionally a function so the later object-tree implementation has
+one obvious place to start replacing the current single-shape assumption."
+  'shape-0)
+
+(defun scad-sketch--shape-ref ()
+  "Return the current shape selection ref."
+  (list :kind 'shape :shape-id (scad-sketch--shape-id)))
+
+(defun scad-sketch--point-ref (idx)
+  "Return a point selection ref for IDX."
+  (list :kind 'point :shape-id (scad-sketch--shape-id) :index idx))
+
+(defun scad-sketch--ref-kind (ref)
+  "Return REF kind."
+  (plist-get ref :kind))
+
+(defun scad-sketch--ref-index (ref)
+  "Return point index from REF."
+  (plist-get ref :index))
+
+(defun scad-sketch--ref-shape-id (ref)
+  "Return shape id from REF."
+  (plist-get ref :shape-id))
+
+(defun scad-sketch--same-ref-p (a b)
+  "Return non-nil if selection refs A and B describe the same object."
+  (and a b
+       (eq (scad-sketch--ref-kind a) (scad-sketch--ref-kind b))
+       (eq (scad-sketch--ref-shape-id a) (scad-sketch--ref-shape-id b))
+       (equal (scad-sketch--ref-index a) (scad-sketch--ref-index b))))
+
+(defun scad-sketch--selection-contains-ref-p (session ref)
+  "Return non-nil if SESSION selection explicitly contains REF."
+  (cl-some (lambda (selected)
+             (scad-sketch--same-ref-p selected ref))
+           (scad-sketch-session-selection session)))
+
+(defun scad-sketch--shape-selected-p (session &optional shape-id)
+  "Return non-nil if SHAPE-ID is selected in SESSION."
+  (let ((shape-ref (list :kind 'shape
+                         :shape-id (or shape-id (scad-sketch--shape-id)))))
+    (scad-sketch--selection-contains-ref-p session shape-ref)))
+
+(defun scad-sketch--point-selected-p (session idx)
+  "Return non-nil if point IDX is selected in SESSION.
+
+A selected shape makes all of its points effectively selected."
+  (or (scad-sketch--shape-selected-p session)
+      (scad-sketch--selection-contains-ref-p
+       session (scad-sketch--point-ref idx))))
+
+(defun scad-sketch--remove-shape-and-subpoints (selection shape-id)
+  "Return SELECTION with SHAPE-ID and all of its point refs removed."
+  (cl-remove-if
+   (lambda (ref)
+     (eq (scad-sketch--ref-shape-id ref) shape-id))
+   selection))
+
+(defun scad-sketch--all-point-refs-except (session idx)
+  "Return point refs for every SESSION point except IDX."
+  (let (refs)
+    (dotimes (i (length (scad-sketch-session-points session)))
+      (unless (= i idx)
+        (push (scad-sketch--point-ref i) refs)))
+    (nreverse refs)))
+
+(defun scad-sketch--toggle-ref-selection (session ref)
+  "Toggle REF in SESSION selection.
+
+Shape/point invariants:
+  - A shape ref and its subpoint refs cannot coexist.
+  - Toggling a shape selects the whole shape and removes subpoints.
+  - Toggling a point while its shape is selected converts the shape selection
+    into all point refs except that point, giving a convenient subtract flow."
+  (let* ((kind (scad-sketch--ref-kind ref))
+         (shape-id (scad-sketch--ref-shape-id ref))
+         (selection (scad-sketch-session-selection session)))
+    (pcase kind
+      ('shape
+       (if (scad-sketch--shape-selected-p session shape-id)
+           (setf (scad-sketch-session-selection session)
+                 (cl-remove-if (lambda (selected)
+                                 (scad-sketch--same-ref-p selected ref))
+                               selection))
+         (setf (scad-sketch-session-selection session)
+               (cons ref (scad-sketch--remove-shape-and-subpoints
+                          selection shape-id)))))
+      ('point
+       (let ((idx (scad-sketch--ref-index ref)))
+         (cond
+          ;; Shape selected: subtract this point by expanding shape into all
+          ;; other point refs.
+          ((scad-sketch--shape-selected-p session shape-id)
+           (setf (scad-sketch-session-selection session)
+                 (append
+                  (scad-sketch--all-point-refs-except session idx)
+                  (scad-sketch--remove-shape-and-subpoints
+                   selection shape-id))))
+          ;; Point explicitly selected: remove it.
+          ((scad-sketch--selection-contains-ref-p session ref)
+           (setf (scad-sketch-session-selection session)
+                 (cl-remove-if (lambda (selected)
+                                 (scad-sketch--same-ref-p selected ref))
+                               selection)))
+          ;; Otherwise add it.
+          (t
+           (push ref (scad-sketch-session-selection session)))))))))
+
+(defun scad-sketch--hover-radius (session)
+  "Return hover radius in model units for SESSION."
+  (max (scad-sketch--fine session)
+       (* scad-sketch-hover-radius-factor
+          (max 0.0001 (scad-sketch--grid session)))))
+
+(defun scad-sketch--distance (a b)
+  "Return Euclidean distance between points A and B."
+  (let ((dx (- (nth 0 a) (nth 0 b)))
+        (dy (- (nth 1 a) (nth 1 b))))
+    (sqrt (+ (* dx dx) (* dy dy)))))
+
+(defun scad-sketch--distance-to-segment (p a b)
+  "Return distance from point P to segment A-B."
+  (let* ((px (nth 0 p))  (py (nth 1 p))
+         (ax (nth 0 a))  (ay (nth 1 a))
+         (bx (nth 0 b))  (by (nth 1 b))
+         (vx (- bx ax))  (vy (- by ay))
+         (wx (- px ax))  (wy (- py ay))
+         (len2 (+ (* vx vx) (* vy vy))))
+    (if (< len2 1e-12)
+        (scad-sketch--distance p a)
+      (let* ((raw (/ (+ (* wx vx) (* wy vy)) len2))
+             (u (max 0.0 (min 1.0 raw)))
+             (closest (list (+ ax (* u vx))
+                            (+ ay (* u vy)))))
+        (scad-sketch--distance p closest)))))
+
+(defun scad-sketch--point-in-polygon-p (p xy-points)
+  "Return non-nil if P is inside XY-POINTS using even/odd ray casting."
+  (let ((inside nil)
+        (j (1- (length xy-points)))
+        (x (nth 0 p))
+        (y (nth 1 p)))
+    (dotimes (i (length xy-points))
+      (let* ((pi (nth i xy-points))
+             (pj (nth j xy-points))
+             (xi (nth 0 pi)) (yi (nth 1 pi))
+             (xj (nth 0 pj)) (yj (nth 1 pj)))
+        (when (and (/= yi yj)
+                   (<= (min yi yj) y)
+                   (< y (max yi yj))
+                   (< x (+ xi (/ (* (- y yi) (- xj xi))
+                                  (- yj yi)))))
+          (setq inside (not inside))))
+      (setq j i))
+    inside))
+
+(defun scad-sketch--shape-center (session)
+  "Return the model-space center of SESSION's current shape."
+  (let ((points (mapcar #'scad-sketch--point-xy
+                        (scad-sketch-session-points session))))
+    (if points
+        (let ((sx 0.0) (sy 0.0) (n 0))
+          (dolist (p points)
+            (setq sx (+ sx (nth 0 p)))
+            (setq sy (+ sy (nth 1 p)))
+            (setq n (1+ n)))
+          (list (/ sx n) (/ sy n)))
+      (copy-sequence (scad-sketch-session-point session)))))
+
+(defun scad-sketch--shape-hovered-p (session)
+  "Return non-nil if SESSION point is on/near the current shape."
+  (let* ((p (scad-sketch-session-point session))
+         (points (mapcar #'scad-sketch--point-xy
+                         (scad-sketch-session-points session)))
+         (n (length points))
+         (r (scad-sketch--hover-radius session))
+         (near nil))
+    (when (>= n 2)
+      (cl-loop for rest on points
+               for a = (car rest)
+               for b = (cadr rest)
+               when (and b (<= (scad-sketch--distance-to-segment p a b) r))
+               do (setq near t))
+      (when (and (not near)
+                 (scad-sketch-session-closed session)
+                 (> n 2)
+                 (<= (scad-sketch--distance-to-segment
+                      p (car (last points)) (car points))
+                     r))
+        (setq near t))
+      (or near
+          (and (scad-sketch-session-closed session)
+               (> n 2)
+               (scad-sketch--point-in-polygon-p p points))))))
+
+(defun scad-sketch--hover-candidates (session)
+  "Return hovered refs under SESSION's current point.
+
+Point refs are listed before the shape ref so exact vertex hovers get
+attention before the containing polygon."
+  (let ((p (scad-sketch-session-point session))
+        (r (scad-sketch--hover-radius session))
+        candidates)
+    (cl-loop for model-point in (scad-sketch-session-points session)
+             for idx from 0
+             for xy = (scad-sketch--point-xy model-point)
+             when (<= (scad-sketch--distance p xy) r)
+             do (push (scad-sketch--point-ref idx) candidates))
+    (setq candidates (nreverse candidates))
+    (when (scad-sketch--shape-hovered-p session)
+      (setq candidates (append candidates (list (scad-sketch--shape-ref)))))
+    candidates))
+
+(defun scad-sketch--selectable-refs (session)
+  "Return all selectable refs for SESSION in tab-cycle order."
+  (append
+   (list (scad-sketch--shape-ref))
+   (cl-loop for _pt in (scad-sketch-session-points session)
+            for idx from 0
+            collect (scad-sketch--point-ref idx))))
+
+(defun scad-sketch--ref-anchor (session ref)
+  "Return a model-space anchor point for REF."
+  (pcase (scad-sketch--ref-kind ref)
+    ('shape
+     (scad-sketch--shape-center session))
+    ('point
+     (let ((point (nth (scad-sketch--ref-index ref)
+                       (scad-sketch-session-points session))))
+       (if point
+           (scad-sketch--point-xy point)
+         (copy-sequence (scad-sketch-session-point session)))))
+    (_
+     (copy-sequence (scad-sketch-session-point session)))))
+
+(defun scad-sketch--attention-ref (session)
+  "Return the ref currently receiving attention in SESSION."
+  (let* ((candidates (scad-sketch--hover-candidates session))
+         (n (length candidates)))
+    (if (> n 0)
+        (nth (mod (or (scad-sketch-session-hover-index session) 0) n)
+             candidates)
+      (scad-sketch-session-focus-ref session))))
+
+(defun scad-sketch--normalize-attention (session)
+  "Clamp hover index and keep legacy selected-index aligned with attention."
+  (let* ((candidates (scad-sketch--hover-candidates session))
+         (n (length candidates)))
+    (when (> n 0)
+      (setf (scad-sketch-session-hover-index session)
+            (mod (or (scad-sketch-session-hover-index session) 0) n)))
+    (let ((attention (scad-sketch--attention-ref session)))
+      (when attention
+        (setf (scad-sketch-session-focus-ref session) attention)
+        (if (eq (scad-sketch--ref-kind attention) 'point)
+            (setf (scad-sketch-session-selected-index session)
+                  (scad-sketch--ref-index attention))
+          (setf (scad-sketch-session-selected-index session) nil))))))
+
+(defun scad-sketch--selected-point-indices (session &optional fallback-to-active)
+  "Return selected point indices in SESSION.
+
+Shape selections expand to all points.  When no explicit selection exists and
+FALLBACK-TO-ACTIVE is non-nil, return the legacy active point."
+  (let (indices)
+    (dolist (ref (scad-sketch-session-selection session))
+      (pcase (scad-sketch--ref-kind ref)
+        ('shape
+         (dotimes (i (length (scad-sketch-session-points session)))
+           (push i indices)))
+        ('point
+         (let ((idx (scad-sketch--ref-index ref)))
+           (when (and idx
+                      (>= idx 0)
+                      (< idx (length (scad-sketch-session-points session))))
+             (push idx indices))))))
+    (setq indices (delete-dups (nreverse indices)))
+    (if (and (null indices) fallback-to-active
+             (scad-sketch-session-selected-index session))
+        (list (scad-sketch-session-selected-index session))
+      indices)))
+
+(defun scad-sketch--selection-summary (session)
+  "Return compact text describing SESSION selection."
+  (let ((selection (scad-sketch-session-selection session)))
+    (if (null selection)
+        "none"
+      (format "%d item%s"
+              (length selection)
+              (if (= 1 (length selection)) "" "s")))))
+
+(defun scad-sketch--ref-summary (ref)
+  "Return compact text for REF."
+  (pcase (and ref (scad-sketch--ref-kind ref))
+    ('shape "shape")
+    ('point (format "point[%s]" (scad-sketch--ref-index ref)))
+    (_ "none")))
+
 ;;;; Movement and construction helpers
 
 (defun scad-sketch--move-xy (xy dx dy)
