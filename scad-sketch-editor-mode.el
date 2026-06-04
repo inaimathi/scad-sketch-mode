@@ -594,7 +594,6 @@ return the legacy active point."
     (_ "none")))
 
 ;;; Movement
-
 (defun scad-sketch--move-point (dx dy &optional snap)
   "Move cursor by DX, DY; snap to grid when SNAP is non-nil.
 
@@ -1117,6 +1116,145 @@ selection exists, applies to the active point."
 
 
 ;;; Rendering
+(defun scad-sketch--root-is-boolean-p (session)
+  "Return non-nil if SESSION has a boolean root target."
+  (let ((root (scad-sketch-session-root-target session)))
+    (and root
+         (eq (scad-sketch-target-kind root) 'boolean))))
+
+(defun scad-sketch--shape-path-d (shape transform)
+  "Return an SVG path string for SHAPE under TRANSFORM."
+  (pcase (scad-sketch-shape-kind shape)
+    ('polygon
+     (let* ((points (scad-sketch-shape-points shape))
+            (closed (scad-sketch-shape-closed shape)))
+       (if (scad-sketch--any-radius-p points)
+           (scad-sketch--polyround-path-d points closed transform)
+         (let* ((xy-points (mapcar #'scad-sketch--point-xy points))
+                (screen-points (mapcar transform xy-points)))
+           (when screen-points
+             (concat
+              (format "M %s %s"
+                      (scad-sketch--fmt-num (nth 0 (car screen-points)))
+                      (scad-sketch--fmt-num (nth 1 (car screen-points))))
+              (mapconcat
+               (lambda (p)
+                 (format " L %s %s"
+                         (scad-sketch--fmt-num (nth 0 p))
+                         (scad-sketch--fmt-num (nth 1 p))))
+               (cdr screen-points)
+               "")
+              (if (and closed (> (length screen-points) 2))
+                  " Z"
+                "")))))))
+    ('circle
+     (let* ((md (scad-sketch-shape-metadata shape))
+            (center (funcall transform
+                             (list (plist-get md :cx)
+                                   (plist-get md :cy))))
+            (r (scad-sketch--pixel-radius
+                (plist-get md :r) transform))
+            (cx (nth 0 center))
+            (cy (nth 1 center)))
+       (format "M %s %s A %s %s 0 1 0 %s %s A %s %s 0 1 0 %s %s"
+               (scad-sketch--fmt-num (- cx r))
+               (scad-sketch--fmt-num cy)
+               (scad-sketch--fmt-num r)
+               (scad-sketch--fmt-num r)
+               (scad-sketch--fmt-num (+ cx r))
+               (scad-sketch--fmt-num cy)
+               (scad-sketch--fmt-num r)
+               (scad-sketch--fmt-num r)
+               (scad-sketch--fmt-num (- cx r))
+               (scad-sketch--fmt-num cy))))
+    (_ nil)))
+
+(defun scad-sketch--draw-shape-path (svg d &rest attrs)
+  "Draw SVG path D on SVG with ATTRS."
+  (when d
+    (apply #'svg-node svg 'path (append (list :d d) attrs))))
+
+(defun scad-sketch--draw-tree-preview (svg transform session tree &optional mode)
+  "Draw a boolean preview for TREE.
+
+MODE is one of:
+  - nil / 'solid : normal positive preview
+  - 'erase       : background fill + dashed stroke (difference child)
+  - 'ghost       : dashed outline only"
+  (pcase (plist-get tree :kind)
+    ('shape
+     (let* ((shape (scad-sketch-session-shape-by-id
+                    session (plist-get tree :shape-id)))
+            (d (and shape (scad-sketch--shape-path-d shape transform))))
+       (when d
+         (pcase mode
+           ('erase
+            (scad-sketch--draw-shape-path
+             svg d
+             :fill "#ffffff"
+             :stroke "#999999"
+             :stroke-width 2
+             :stroke-dasharray "6,4"))
+           ('ghost
+            (scad-sketch--draw-shape-path
+             svg d
+             :fill "none"
+             :stroke "#aaaaaa"
+             :stroke-width 2
+             :stroke-dasharray "6,4"))
+           (_
+            (scad-sketch--draw-shape-path
+             svg d
+             :fill "#ffffff"
+             :stroke "#777777"
+             :stroke-width 3)))))
+     nil)
+
+    ('boolean
+     (let ((op (plist-get tree :op))
+           (children (plist-get tree :children)))
+       (pcase mode
+         ;; In erase/ghost mode, just recurse through descendants in the same
+         ;; visual style; we are not trying to preserve exact nested semantics
+         ;; in the subtractive overlay.
+         ((or 'erase 'ghost)
+          (dolist (child children)
+            (scad-sketch--draw-tree-preview
+             svg transform session child mode)))
+
+         (_
+          (pcase op
+            ('union
+             ;; Drawing solid children sequentially gives a convincing union:
+             ;; later fills cover interior edges from earlier children.
+             (dolist (child children)
+               (scad-sketch--draw-tree-preview
+                svg transform session child 'solid)))
+
+            ('difference
+             (when children
+               (scad-sketch--draw-tree-preview
+                svg transform session (car children) 'solid)
+               (dolist (child (cdr children))
+                 (scad-sketch--draw-tree-preview
+                  svg transform session child 'erase))))
+
+            ('intersection
+             ;; Still approximate: draw the first child solid and the rest as
+             ;; ghosts so the user can see what's participating.
+             (when children
+               (scad-sketch--draw-tree-preview
+                svg transform session (car children) 'solid)
+               (dolist (child (cdr children))
+                 (scad-sketch--draw-tree-preview
+                  svg transform session child 'ghost))))
+
+            (_
+             (dolist (child children)
+               (scad-sketch--draw-tree-preview
+                svg transform session child 'solid))))))))
+    (_ nil)))
+
 (defun scad-sketch--circle-bounds (shape)
   "Return bounds for circle SHAPE."
   (let* ((md (scad-sketch-shape-metadata shape))
@@ -1324,36 +1462,50 @@ selection exists, applies to the active point."
                                (eq (scad-sketch--ref-shape-id attention)
                                    shape-id)))
          (active-shape    (eq shape-id
-                               (scad-sketch-session-active-shape-id session)))
+                              (scad-sketch-session-active-shape-id session)))
+         (ghosted         (and (scad-sketch--root-is-boolean-p session)
+                               (not shape-selected)
+                               (not shape-attention)
+                               (not active-shape)))
          (shape-stroke    (cond (shape-selected "#d13f00")
                                 (shape-attention "#0057c2")
                                 (active-shape "#333333")
+                                (ghosted "#9a9a9a")
                                 (t "#777777")))
          (shape-width     (cond ((or shape-selected shape-attention) 5)
                                 (active-shape 4)
-                                (t 3))))
+                                (ghosted 1.5)
+                                (t 3)))
+         (shape-dash      (and ghosted "6,4")))
     (when (>= n 2)
       (if (scad-sketch--any-radius-p points)
           (let ((d (scad-sketch--polyround-path-d points closed transform)))
             (when d
-              (svg-node svg 'path
-                        :d d
-                        :stroke shape-stroke
-                        :stroke-width shape-width
-                        :fill "none")))
-        (let ((xy-points (mapcar #'scad-sketch--point-xy points)))
+              (apply #'svg-node svg 'path
+                     (append
+                      (list :d d
+                            :stroke shape-stroke
+                            :stroke-width shape-width
+                            :fill "none")
+                      (when shape-dash
+                        (list :stroke-dasharray shape-dash))))))
+        (let ((xy-points (mapcar #'scad-sketch--point-xy points))
+              (line-attrs (append
+                           (list :stroke shape-stroke
+                                 :stroke-width shape-width)
+                           (when shape-dash
+                             (list :stroke-dasharray shape-dash)))))
           (cl-loop for a on xy-points
                    for b = (cadr a)
                    when b do
-                   (scad-sketch--svg-line svg transform (car a) b
-                                          :stroke shape-stroke
-                                          :stroke-width shape-width))
+                   (apply #'scad-sketch--svg-line
+                          svg transform (car a) b line-attrs))
           (when (and closed (> n 2))
-            (scad-sketch--svg-line svg transform
-                                   (car (last xy-points))
-                                   (car xy-points)
-                                   :stroke shape-stroke
-                                   :stroke-width shape-width)))))
+            (apply #'scad-sketch--svg-line
+                   svg transform
+                   (car (last xy-points))
+                   (car xy-points)
+                   line-attrs)))))
 
     (dolist (pt points)
       (let* ((xy        (scad-sketch--point-xy pt))
@@ -1361,7 +1513,7 @@ selection exists, applies to the active point."
              (point-ref (scad-sketch--point-ref idx shape-id))
              (sel       (scad-sketch--point-selected-p session shape-id idx))
              (attn      (and attention
-                              (scad-sketch--same-ref-p attention point-ref)))
+                             (scad-sketch--same-ref-p attention point-ref)))
              (radius    (scad-sketch--point-radius pt)))
         (svg-circle svg (nth 0 screen) (nth 1 screen)
                     (cond (sel 8)
@@ -1430,16 +1582,26 @@ selection exists, applies to the active point."
                                (eq (scad-sketch--ref-shape-id attention)
                                    shape-id)))
          (active-shape    (eq shape-id
-                               (scad-sketch-session-active-shape-id session))))
-    (svg-circle svg (nth 0 screen) (nth 1 screen) pr
-                :stroke (cond (shape-selected "#d13f00")
-                              (shape-attention "#0057c2")
-                              (active-shape "#333333")
-                              (t "#777777"))
-                :stroke-width (cond ((or shape-selected shape-attention) 5)
-                                    (active-shape 4)
-                                    (t 3))
-                :fill "none")
+                              (scad-sketch-session-active-shape-id session)))
+         (ghosted         (and (scad-sketch--root-is-boolean-p session)
+                               (not shape-selected)
+                               (not shape-attention)
+                               (not active-shape)))
+         (attrs           (append
+                           (list :stroke (cond (shape-selected "#d13f00")
+                                               (shape-attention "#0057c2")
+                                               (active-shape "#333333")
+                                               (ghosted "#9a9a9a")
+                                               (t "#777777"))
+                                 :stroke-width (cond ((or shape-selected
+                                                          shape-attention) 5)
+                                                     (active-shape 4)
+                                                     (ghosted 1.5)
+                                                     (t 3))
+                                 :fill "none")
+                           (when ghosted
+                             (list :stroke-dasharray "6,4")))))
+    (apply #'svg-circle svg (nth 0 screen) (nth 1 screen) pr attrs)
     (svg-circle svg (nth 0 screen) (nth 1 screen)
                 (cond (shape-selected 8)
                       (shape-attention 7)
@@ -1527,12 +1689,25 @@ selection exists, applies to the active point."
 (defun scad-sketch--draw-path (svg transform session)
   "Draw all shapes and boolean boxes in SESSION."
   (scad-sketch-session-sync-active-shape-from-points session)
+
+  ;; First, draw a semantic boolean preview when the session is rooted at a
+  ;; boolean.  This makes unions read as unions and differences read as bites.
+  (when (and (scad-sketch--root-is-boolean-p session)
+             (scad-sketch-session-tree session))
+    (scad-sketch--draw-tree-preview
+     svg transform session (scad-sketch-session-tree session) 'solid))
+
+  ;; Then draw per-shape editor overlays.  In boolean sessions, non-active /
+  ;; non-selected / non-attended shapes are ghosted so they do not visually
+  ;; reintroduce strong internal union edges.
   (dolist (shape (scad-sketch-session-shapes session))
     (pcase (scad-sketch-shape-kind shape)
       ('polygon
        (scad-sketch--draw-one-polygon-shape svg transform session shape))
       ('circle
        (scad-sketch--draw-one-circle-shape svg transform session shape))))
+
+  ;; Finally, draw dotted labeled boxes for boolean groups.
   (when (scad-sketch-session-tree session)
     (scad-sketch--draw-boolean-boxes
      svg transform session (scad-sketch-session-tree session))))
