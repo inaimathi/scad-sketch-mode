@@ -53,7 +53,6 @@
           (list (scad-sketch--point-ref idx shape-id)))))
 
 ;;; Selected geometry movement
-
 (defun scad-sketch--move-shape (shape dx dy &optional snap grid)
   "Move whole SHAPE by DX DY, snapping to GRID when SNAP is non-nil."
   (pcase (scad-sketch-shape-kind shape)
@@ -71,11 +70,18 @@
                  (list (plist-get md :cx) (plist-get md :cy))
                  dx dy))
             (xy (if snap (scad-sketch--snap-xy xy grid) xy)))
-       (setf (scad-sketch-shape-metadata shape)
-             (plist-put md :cx (nth 0 xy)))
-       (setf (scad-sketch-shape-metadata shape)
-             (plist-put (scad-sketch-shape-metadata shape)
-                        :cy (nth 1 xy)))))))
+       (setq md (plist-put md :cx (nth 0 xy)))
+       (setq md (plist-put md :cy (nth 1 xy)))
+       (setf (scad-sketch-shape-metadata shape) md)))
+    ('text
+     (let* ((md (scad-sketch-shape-metadata shape))
+            (xy (scad-sketch--move-xy
+                 (list (plist-get md :x) (plist-get md :y))
+                 dx dy))
+            (xy (if snap (scad-sketch--snap-xy xy grid) xy)))
+       (setq md (plist-put md :x (nth 0 xy)))
+       (setq md (plist-put md :y (nth 1 xy)))
+       (setf (scad-sketch-shape-metadata shape) md)))))
 
 (defun scad-sketch--move-selected (dx dy &optional snap)
   "Move selected vertices/shapes by DX, DY.  Snap to grid when SNAP is non-nil.

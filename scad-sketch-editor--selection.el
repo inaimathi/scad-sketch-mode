@@ -88,6 +88,14 @@
       ('circle
        (let ((md (scad-sketch-shape-metadata shape)))
          (list (plist-get md :cx) (plist-get md :cy))))
+      ('text
+       (let* ((md     (scad-sketch-shape-metadata shape))
+              (str    (or (plist-get md :str) ""))
+              (size   (float (or (plist-get md :size) 10.0)))
+              (width  (max size (* size 0.6 (max 1 (string-width str)))))
+              (height size))
+         (list (+ (float (or (plist-get md :x) 0.0)) (/ width 2.0))
+               (+ (float (or (plist-get md :y) 0.0)) (/ height 2.0)))))
       ('polygon
        (let ((points (mapcar #'scad-sketch--point-xy
                              (scad-sketch-shape-points shape))))
@@ -113,6 +121,18 @@
               (cr (plist-get md :r))
               (d  (scad-sketch--distance p (list cx cy))))
          (or (<= (abs (- d cr)) r) (< d cr))))
+      ('text
+       (let* ((md     (scad-sketch-shape-metadata shape))
+              (str    (or (plist-get md :str) ""))
+              (x      (float (or (plist-get md :x) 0.0)))
+              (y      (float (or (plist-get md :y) 0.0)))
+              (size   (float (or (plist-get md :size) 10.0)))
+              (width  (max size (* size 0.6 (max 1 (string-width str)))))
+              (height size)
+              (px     (nth 0 p))
+              (py     (nth 1 p)))
+         (and (<= (- x r) px (+ x width r))
+              (<= (- y r) py (+ y height r)))))
       ('polygon
        (let* ((points (mapcar #'scad-sketch--point-xy
                                (scad-sketch-shape-points shape)))

@@ -74,13 +74,13 @@
 
 (cl-defstruct scad-sketch-shape
   id
-  kind             ; 'polygon or 'circle
-  points           ; polygon points; nil for circle
+  kind             ; 'polygon, 'circle, or 'text
+  points           ; polygon points; nil for primitive shapes
   closed
   polyround
   source-target-id
   call-target-id
-  metadata)        ; circle: :cx :cy :r
+  metadata)        ; circle: :cx :cy :r; text: :str :x :y :size :angle
 
 (cl-defstruct scad-sketch-session
   name units grid fine-step coarse-step closed
@@ -388,6 +388,31 @@ inline rather than rewriting a source array through a transformed call."
       (list :from 'circle :node node)))
     (scad-sketch-session--tree-shape shape-id)))
 
+(defun scad-sketch-session--convert-text-node (_ast node matrix state)
+  "Convert text NODE under MATRIX into a text shape."
+  (let* ((shape-id (scad-sketch-session--conversion-shape-id state))
+         (x0       (float (or (plist-get node :x) 0.0)))
+         (y0       (float (or (plist-get node :y) 0.0)))
+         (origin   (scad-sketch-session--mat-apply matrix (list x0 y0)))
+         (basis-0  (scad-sketch-session--mat-apply matrix '(0.0 0.0)))
+         (basis-x  (scad-sketch-session--mat-apply matrix '(1.0 0.0)))
+         (dx       (- (nth 0 basis-x) (nth 0 basis-0)))
+         (dy       (- (nth 1 basis-x) (nth 1 basis-0)))
+         (angle    (* 180.0 (/ (atan dy dx) pi)))
+         (scale    (scad-sketch-session--mat-uniform-scale matrix))
+         (size     (* (float (or (plist-get node :size) 10.0)) scale)))
+    (scad-sketch-session--conversion-push-shape
+     state
+     (scad-sketch-session--make-text-shape
+      shape-id
+      (or (plist-get node :str) "")
+      (nth 0 origin)
+      (nth 1 origin)
+      size
+      angle
+      (list :from 'text :node node)))
+    (scad-sketch-session--tree-shape shape-id)))
+
 (defun scad-sketch-session--convert-boolean-node (ast node matrix state)
   "Convert boolean NODE under MATRIX into a boolean tree node."
   (let* ((op (plist-get node :type))
@@ -432,6 +457,8 @@ inline rather than rewriting a source array through a transformed call."
      (scad-sketch-session--convert-square-node ast node matrix state))
     ('circle
      (scad-sketch-session--convert-circle-node ast node matrix state))
+    ('text
+     (scad-sketch-session--convert-text-node ast node matrix state))
     ((or 'union 'difference 'intersection)
      (scad-sketch-session--convert-boolean-node ast node matrix state))
     ((or 'translate 'rotate 'scale 'mirror)
@@ -622,6 +649,24 @@ as used, which is fine for avoiding generated-name collisions."
    :metadata (append (list :cx (float cx)
                            :cy (float cy)
                            :r  (float r))
+                     metadata)))
+
+(defun scad-sketch-session--make-text-shape
+    (id str x y size &optional angle metadata)
+  "Build a text shape."
+  (make-scad-sketch-shape
+   :id id
+   :kind 'text
+   :points nil
+   :closed t
+   :polyround nil
+   :source-target-id nil
+   :call-target-id nil
+   :metadata (append (list :str str
+                           :x (float x)
+                           :y (float y)
+                           :size (float size)
+                           :angle (float (or angle 0.0)))
                      metadata)))
 
 (defun scad-sketch-session-add-shape (session points &optional polyround)
@@ -921,7 +966,7 @@ source region is replaced and its matrix can be flattened into editable shapes."
   (cl-find-if
    (lambda (node)
      (memq (plist-get node :type)
-           '(polygon circle square union difference intersection
+           '(polygon circle square text union difference intersection
                      translate rotate scale mirror)))
    path))
 
@@ -1026,6 +1071,46 @@ source region is replaced and its matrix can be flattened into editable shapes."
               indent
               (scad-sketch-session--fmt-num r)))))
 
+(defun scad-sketch-session--emit-text-shape (shape indent)
+  "Emit text SHAPE at INDENT."
+  (let* ((md    (scad-sketch-shape-metadata shape))
+         (str   (or (plist-get md :str) ""))
+         (x     (float (or (plist-get md :x) 0.0)))
+         (y     (float (or (plist-get md :y) 0.0)))
+         (size  (float (or (plist-get md :size) 10.0)))
+         (angle (float (or (plist-get md :angle) 0.0)))
+         (zero-pos (and (< (abs x) 0.000001)
+                        (< (abs y) 0.000001)))
+         (zero-ang (< (abs angle) 0.000001))
+         (call (format "text(%S, size=%s);"
+                       str
+                       (scad-sketch-session--fmt-num size))))
+    (cond
+     ((and zero-pos zero-ang)
+      (format "%s%s\n" indent call))
+     (zero-pos
+      (format "%srotate(%s)\n%s  %s\n"
+              indent
+              (scad-sketch-session--fmt-num angle)
+              indent
+              call))
+     (zero-ang
+      (format "%stranslate([%s, %s])\n%s  %s\n"
+              indent
+              (scad-sketch-session--fmt-num x)
+              (scad-sketch-session--fmt-num y)
+              indent
+              call))
+     (t
+      (format "%stranslate([%s, %s])\n%s  rotate(%s)\n%s    %s\n"
+              indent
+              (scad-sketch-session--fmt-num x)
+              (scad-sketch-session--fmt-num y)
+              indent
+              (scad-sketch-session--fmt-num angle)
+              indent
+              call)))))
+
 (defun scad-sketch-session--emit-polygon-shape-call (session shape indent)
   "Emit polygon SHAPE call at INDENT."
   (let* ((points    (scad-sketch-shape-points shape))
@@ -1040,6 +1125,9 @@ source region is replaced and its matrix can be flattened into editable shapes."
     ('circle
      (list :assignments ""
            :call (scad-sketch-session--emit-circle-shape shape indent)))
+    ('text
+     (list :assignments ""
+           :call (scad-sketch-session--emit-text-shape shape indent)))
     ('polygon
      (let* ((points    (scad-sketch-shape-points shape))
             (polyround (scad-sketch-shape-polyround shape))

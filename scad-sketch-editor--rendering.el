@@ -98,11 +98,41 @@
          (r  (plist-get md :r)))
     (list (- cx r) (+ cx r) (- cy r) (+ cy r))))
 
+(defun scad-sketch--text-bounds (shape)
+  "Return approximate (MIN-X MAX-X MIN-Y MAX-Y) bounds for text SHAPE."
+  (let* ((md     (scad-sketch-shape-metadata shape))
+         (str    (or (plist-get md :str) ""))
+         (x      (float (or (plist-get md :x) 0.0)))
+         (y      (float (or (plist-get md :y) 0.0)))
+         (size   (max 0.0001 (float (or (plist-get md :size) 10.0))))
+         (angle  (* pi (/ (float (or (plist-get md :angle) 0.0)) 180.0)))
+         (width  (max size (* size 0.6 (max 1 (string-width str)))))
+         (height size)
+         (co     (cos angle))
+         (si     (sin angle))
+         (corners (list (list 0.0 0.0)
+                        (list width 0.0)
+                        (list width height)
+                        (list 0.0 height)))
+         xs ys)
+    (dolist (c corners)
+      (let* ((cx (+ x (- (* (nth 0 c) co) (* (nth 1 c) si))))
+             (cy (+ y (+ (* (nth 0 c) si) (* (nth 1 c) co)))))
+        (push cx xs)
+        (push cy ys)))
+    (list (apply #'min xs)
+          (apply #'max xs)
+          (apply #'min ys)
+          (apply #'max ys))))
+
 (defun scad-sketch--shape-xy-points (shape)
   "Return representative XY points for SHAPE (for bounds computation only)."
   (pcase (scad-sketch-shape-kind shape)
     ('polygon (mapcar #'scad-sketch--point-xy (scad-sketch-shape-points shape)))
     ('circle  (let ((b (scad-sketch--circle-bounds shape)))
+                (list (list (nth 0 b) (nth 2 b))
+                      (list (nth 1 b) (nth 3 b)))))
+    ('text    (let ((b (scad-sketch--text-bounds shape)))
                 (list (list (nth 0 b) (nth 2 b))
                       (list (nth 1 b) (nth 3 b)))))
     (_ nil)))
@@ -160,7 +190,6 @@
            args)))
 
 ;;;; ── Shape path generation ──────────────────────────────────────────────────
-
 (defun scad-sketch--shape-path-d (shape transform)
   "Return an SVG path-data string for SHAPE under TRANSFORM, or nil."
   (pcase (scad-sketch-shape-kind shape)
@@ -197,6 +226,29 @@
                (scad-sketch--fmt-num (+ cx r)) (scad-sketch--fmt-num cy)
                (scad-sketch--fmt-num r)         (scad-sketch--fmt-num r)
                (scad-sketch--fmt-num (- cx r)) (scad-sketch--fmt-num cy))))
+    ('text
+     ;; Minimal boolean-preview support: approximate glyph outlines by the text
+     ;; bounding rectangle.  The interactive overlay still draws real SVG text.
+     (pcase-let ((`(,min-x ,max-x ,min-y ,max-y)
+                  (scad-sketch--text-bounds shape)))
+       (let* ((pts (mapcar transform
+                           (list (list min-x min-y)
+                                 (list max-x min-y)
+                                 (list max-x max-y)
+                                 (list min-x max-y))))
+              (p0 (nth 0 pts))
+              (p1 (nth 1 pts))
+              (p2 (nth 2 pts))
+              (p3 (nth 3 pts)))
+         (format "M %s %s L %s %s L %s %s L %s %s Z"
+                 (scad-sketch--fmt-num (nth 0 p0))
+                 (scad-sketch--fmt-num (nth 1 p0))
+                 (scad-sketch--fmt-num (nth 0 p1))
+                 (scad-sketch--fmt-num (nth 1 p1))
+                 (scad-sketch--fmt-num (nth 0 p2))
+                 (scad-sketch--fmt-num (nth 1 p2))
+                 (scad-sketch--fmt-num (nth 0 p3))
+                 (scad-sketch--fmt-num (nth 1 p3))))))
     (_ nil)))
 
 ;;;; ── Tree queries ────────────────────────────────────────────────────────────
@@ -600,12 +652,86 @@ When SUPPRESS-STROKE is non-nil, skip ring stroke; centre dot still drawn."
               :x (+ (nth 0 screen) 8) :y (- (nth 1 screen) 8)
               :font-size 11 :fill "#333333")))
 
-;;;; ── Boolean bounding boxes ─────────────────────────────────────────────────
+(defun scad-sketch--draw-one-text-shape (svg transform session shape
+                                             &optional suppress-stroke)
+  "Draw text SHAPE editor overlay.
+When SUPPRESS-STROKE is non-nil, skip the bounding box unless focused."
+  (let* ((shape-id    (scad-sketch-shape-id shape))
+         (md          (scad-sketch-shape-metadata shape))
+         (str         (or (plist-get md :str) ""))
+         (x           (float (or (plist-get md :x) 0.0)))
+         (y           (float (or (plist-get md :y) 0.0)))
+         (size        (float (or (plist-get md :size) 10.0)))
+         (angle       (float (or (plist-get md :angle) 0.0)))
+         (screen      (funcall transform (list x y)))
+         (font-px     (max 8 (scad-sketch--pixel-radius size transform)))
+         (shape-sel   (scad-sketch--shape-selected-p session shape-id))
+         (attention   (scad-sketch--attention-ref session))
+         (shape-attn  (and attention
+                           (eq (scad-sketch--ref-kind attention) 'shape)
+                           (eq (scad-sketch--ref-shape-id attention) shape-id)))
+         (active-shape (eq shape-id
+                           (scad-sketch-session-active-shape-id session)))
+         (boolean-session (scad-sketch--root-is-boolean-p session))
+         (ghosted     (and boolean-session
+                           (not shape-sel)
+                           (not shape-attn)
+                           (not active-shape)))
+         (stroke      (cond (shape-sel    "#d13f00")
+                            (shape-attn   "#0057c2")
+                            (active-shape "#333333")
+                            (ghosted      "#9a9a9a")
+                            (t            "#777777")))
+         (width       (cond ((or shape-sel shape-attn) 5)
+                            (active-shape 4)
+                            (ghosted 1.5)
+                            (t 3))))
+    (when (or (not suppress-stroke) shape-sel shape-attn active-shape)
+      (pcase-let ((`(,min-x ,max-x ,min-y ,max-y)
+                   (scad-sketch--text-bounds shape)))
+        (let* ((p0 (funcall transform (list min-x min-y)))
+               (p1 (funcall transform (list max-x max-y)))
+               (rx (min (nth 0 p0) (nth 0 p1)))
+               (ry (min (nth 1 p0) (nth 1 p1)))
+               (rw (abs (- (nth 0 p1) (nth 0 p0))))
+               (rh (abs (- (nth 1 p1) (nth 1 p0)))))
+          (apply #'svg-rectangle svg rx ry rw rh
+                 (append (list :stroke stroke
+                               :stroke-width width
+                               :fill "none")
+                         (when ghosted (list :stroke-dasharray "6,4")))))))
+    (apply #'svg-text svg str
+           (append
+            (list :x (nth 0 screen)
+                  :y (nth 1 screen)
+                  :font-size font-px
+                  :fill (if ghosted "#777777" "#111111"))
+            (unless (< (abs angle) 0.000001)
+              ;; Model Y is flipped into screen Y, so visual rotation reverses.
+              (list :transform
+                    (format "rotate(%s %s %s)"
+                            (scad-sketch--fmt-num (- angle))
+                            (scad-sketch--fmt-num (nth 0 screen))
+                            (scad-sketch--fmt-num (nth 1 screen)))))))
+    (when (or (not suppress-stroke) shape-sel shape-attn active-shape)
+      (svg-circle svg (nth 0 screen) (nth 1 screen)
+                  (cond (shape-sel 8) (shape-attn 7) (active-shape 6) (t 5))
+                  :stroke stroke
+                  :stroke-width 2
+                  :fill (cond (shape-sel    "#fff0e8")
+                              (shape-attn   "#dfefff")
+                              (active-shape "#ffffff")
+                              (t            "#f8f8f8")))
+      (svg-text svg (format "%s" shape-id)
+                :x (+ (nth 0 screen) 8) :y (- (nth 1 screen) 8)
+                :font-size 11 :fill "#333333"))))
 
+;;;; ── Boolean bounding boxes ─────────────────────────────────────────────────
 (defun scad-sketch--shape-bounds (shape)
   "Return (MIN-X MAX-X MIN-Y MAX-Y) for SHAPE."
   (pcase (scad-sketch-shape-kind shape)
     ('circle  (scad-sketch--circle-bounds shape))
+    ('text    (scad-sketch--text-bounds shape))
     ('polygon
      (let ((pts (mapcar #'scad-sketch--point-xy
                         (scad-sketch-shape-points shape))))
@@ -660,7 +786,6 @@ When SUPPRESS-STROKE is non-nil, skip ring stroke; centre dot still drawn."
       (scad-sketch--draw-boolean-boxes svg transform session child))))
 
 ;;;; ── Main scene draw pass ───────────────────────────────────────────────────
-
 (defun scad-sketch--draw-path (svg transform session)
   "Draw the full scene: boolean preview, group highlight, overlays, boxes."
   (scad-sketch-session-sync-active-shape-from-points session)
@@ -691,6 +816,8 @@ When SUPPRESS-STROKE is non-nil, skip ring stroke; centre dot still drawn."
             ('polygon (scad-sketch--draw-one-polygon-shape
                        svg transform session shape suppress))
             ('circle  (scad-sketch--draw-one-circle-shape
+                       svg transform session shape suppress))
+            ('text    (scad-sketch--draw-one-text-shape
                        svg transform session shape suppress))))))
 
     ;; Layer 4 – Boolean bounding-box labels.
