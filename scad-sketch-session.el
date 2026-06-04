@@ -291,15 +291,23 @@ inline rather than rewriting a source array through a transformed call."
 
 (defun scad-sketch-session--convert-polygon-node (ast node matrix state)
   "Convert polygon NODE under MATRIX into a tree shape node."
-  (let* ((shape-id (scad-sketch-session--conversion-shape-id state))
-         (polyround (plist-get node :polyround))
-         (source-name (plist-get node :source))
-         source-node source-target source-target-id points)
+  (let* ((shape-id         (scad-sketch-session--conversion-shape-id state))
+         (polyround        (plist-get node :polyround))
+         (source-name      (plist-get node :source))
+         (source-node      nil)
+         (source-target    nil)
+         (source-target-id nil)
+         (polygon-pts      nil))
+
     (if source-name
         (progn
+          ;; Preserve variable-reference polygons only when there is no
+          ;; transform to flatten.  This lets write-back update the original
+          ;; array assignment instead of replacing polygon(name).
           (setq source-node
                 (scad-sketch-session--resolve-array-node-for-conversion
                  ast source-name node matrix))
+
           (if source-node
               (progn
                 (setq source-target-id
@@ -308,8 +316,12 @@ inline rather than rewriting a source array through a transformed call."
                       (scad-sketch-session--make-array-target
                        source-node source-target-id 'source polyround))
                 (scad-sketch-session--conversion-push-target state source-target)
-                (setq points (copy-tree (plist-get source-node :points))))
-            ;; Flatten transformed source refs into inline polygon coordinates.
+                (setq polygon-pts
+                      (copy-tree (plist-get source-node :points))))
+
+            ;; A transformed polygon(name) cannot safely rewrite `name',
+            ;; because the transform has already been baked into editor space.
+            ;; Flatten the resolved array into inline editable points instead.
             (let ((resolved
                    (scad-sketch-session--resolve-array-node
                     ast source-name node)))
@@ -317,22 +329,28 @@ inline rather than rewriting a source array through a transformed call."
                 (signal 'scad-sketch-unsupported-edit-target
                         (list (format "Could not resolve polygon source `%s'"
                                       source-name))))
-              (setq points
-                    (mapcar (lambda (p)
-                              (append
-                               (scad-sketch-session--mat-apply
-                                matrix (list (nth 0 p) (nth 1 p)))
-                               (list (or (nth 2 p) 0))))
-                            (plist-get resolved :points)))))))
-      (setq points
-            (mapcar (lambda (p)
-                      (append
-                       (scad-sketch-session--mat-apply
-                        matrix (list (nth 0 p) (nth 1 p)))
-                       (list (or (nth 2 p) 0))))
-                    (plist-get node :points))))
+              (setq polygon-pts
+                    (mapcar
+                     (lambda (pt)
+                       (append
+                        (scad-sketch-session--mat-apply
+                         matrix
+                         (list (nth 0 pt) (nth 1 pt)))
+                        (list (or (nth 2 pt) 0))))
+                     (plist-get resolved :points))))))
 
-    (unless points
+      ;; Inline polygon([...]) case.
+      (setq polygon-pts
+            (mapcar
+             (lambda (pt)
+               (append
+                (scad-sketch-session--mat-apply
+                 matrix
+                 (list (nth 0 pt) (nth 1 pt)))
+                (list (or (nth 2 pt) 0))))
+             (plist-get node :points))))
+
+    (unless polygon-pts
       (signal 'scad-sketch-unsupported-edit-target
               (list "Polygon has no editable points")))
 
@@ -340,12 +358,14 @@ inline rather than rewriting a source array through a transformed call."
      state
      (scad-sketch-session--make-polygon-shape
       shape-id
-      points
+      polygon-pts
       polyround
       source-target-id
       nil
-      (list :source-name source-name :node node)))
-    (scad-sketch-session--tree-shape shape-id))
+      (list :source-name source-name
+            :node node)))
+
+    (scad-sketch-session--tree-shape shape-id)))
 
 (defun scad-sketch-session--convert-square-node (_ast node matrix state)
   "Convert square NODE under MATRIX into a polygon shape."
@@ -391,9 +411,7 @@ inline rather than rewriting a source array through a transformed call."
 (defun scad-sketch-session--convert-text-node (_ast node matrix state)
   "Convert text NODE under MATRIX into a text shape."
   (let* ((shape-id (scad-sketch-session--conversion-shape-id state))
-         (x0       (float (or (plist-get node :x) 0.0)))
-         (y0       (float (or (plist-get node :y) 0.0)))
-         (origin   (scad-sketch-session--mat-apply matrix (list x0 y0)))
+         (origin   (scad-sketch-session--mat-apply matrix '(0.0 0.0)))
          (basis-0  (scad-sketch-session--mat-apply matrix '(0.0 0.0)))
          (basis-x  (scad-sketch-session--mat-apply matrix '(1.0 0.0)))
          (dx       (- (nth 0 basis-x) (nth 0 basis-0)))
@@ -450,23 +468,29 @@ inline rather than rewriting a source array through a transformed call."
 
 (defun scad-sketch-session--convert-node (ast node matrix state)
   "Convert parser NODE under MATRIX into editable shapes and a tree."
-  (pcase (plist-get node :type)
-    ('polygon
-     (scad-sketch-session--convert-polygon-node ast node matrix state))
-    ('square
-     (scad-sketch-session--convert-square-node ast node matrix state))
-    ('circle
-     (scad-sketch-session--convert-circle-node ast node matrix state))
-    ('text
-     (scad-sketch-session--convert-text-node ast node matrix state))
-    ((or 'union 'difference 'intersection)
-     (scad-sketch-session--convert-boolean-node ast node matrix state))
-    ((or 'translate 'rotate 'scale 'mirror)
-     (scad-sketch-session--convert-transform-node ast node matrix state))
-    (_
-     (signal 'scad-sketch-unsupported-edit-target
-             (list (format "Unsupported scad-sketch form: %S"
-                           (plist-get node :type)))))))
+  (let ((type (plist-get node :type)))
+    (cond
+     ((eq type 'polygon)
+      (scad-sketch-session--convert-polygon-node ast node matrix state))
+
+     ((eq type 'square)
+      (scad-sketch-session--convert-square-node ast node matrix state))
+
+     ((eq type 'circle)
+      (scad-sketch-session--convert-circle-node ast node matrix state))
+
+     ((eq type 'text)
+      (scad-sketch-session--convert-text-node ast node matrix state))
+
+     ((memq type '(union difference intersection))
+      (scad-sketch-session--convert-boolean-node ast node matrix state))
+
+     ((memq type '(translate rotate scale mirror))
+      (scad-sketch-session--convert-transform-node ast node matrix state))
+
+     (t
+      (signal 'scad-sketch-unsupported-edit-target
+              (list (format "Unsupported scad-sketch form: %S" type)))))))
 
 ;;;; Parser-backed source resolution
 
@@ -662,12 +686,13 @@ as used, which is fine for avoiding generated-name collisions."
    :polyround nil
    :source-target-id nil
    :call-target-id nil
-   :metadata (append (list :str str
-                           :x (float x)
-                           :y (float y)
-                           :size (float size)
-                           :angle (float (or angle 0.0)))
-                     metadata)))
+   :metadata (append
+              (list :str str
+                    :x (float x)
+                    :y (float y)
+                    :size (float size)
+                    :angle (float (or angle 0.0)))
+              metadata)))
 
 (defun scad-sketch-session-add-shape (session points &optional polyround)
   "Add a new polygon shape with POINTS to SESSION and make it active.
@@ -966,8 +991,9 @@ source region is replaced and its matrix can be flattened into editable shapes."
   (cl-find-if
    (lambda (node)
      (memq (plist-get node :type)
-           '(polygon circle square text union difference intersection
-                     translate rotate scale mirror)))
+           '(polygon circle square text
+             union difference intersection
+             translate rotate scale mirror)))
    path))
 
 (defun scad-sketch-session-at-point ()
@@ -1088,12 +1114,14 @@ source region is replaced and its matrix can be flattened into editable shapes."
     (cond
      ((and zero-pos zero-ang)
       (format "%s%s\n" indent call))
+
      (zero-pos
       (format "%srotate(%s)\n%s  %s\n"
               indent
               (scad-sketch-session--fmt-num angle)
               indent
               call))
+
      (zero-ang
       (format "%stranslate([%s, %s])\n%s  %s\n"
               indent
@@ -1101,6 +1129,7 @@ source region is replaced and its matrix can be flattened into editable shapes."
               (scad-sketch-session--fmt-num y)
               indent
               call))
+
      (t
       (format "%stranslate([%s, %s])\n%s  rotate(%s)\n%s    %s\n"
               indent
@@ -1125,32 +1154,37 @@ source region is replaced and its matrix can be flattened into editable shapes."
     ('circle
      (list :assignments ""
            :call (scad-sketch-session--emit-circle-shape shape indent)))
+
     ('text
      (list :assignments ""
            :call (scad-sketch-session--emit-text-shape shape indent)))
+
     ('polygon
-     (let* ((points    (scad-sketch-shape-points shape))
-            (polyround (scad-sketch-shape-polyround shape))
-            (source    (scad-sketch-session--shape-source-name session shape)))
+     (let* ((shape-points (scad-sketch-shape-points shape))
+            (polyround    (scad-sketch-shape-polyround shape))
+            (source       (scad-sketch-session--shape-source-name session shape)))
        (cond
         (source
          (list :assignments ""
                :call (scad-sketch-session--emit-polygon-call
-                      points indent polyround source)))
-        ((<= (length points) scad-sketch-session-inline-polygon-threshold)
+                      shape-points indent polyround source)))
+
+        ((<= (length shape-points) scad-sketch-session-inline-polygon-threshold)
          (list :assignments ""
                :call (scad-sketch-session--emit-polygon-call
-                      points indent polyround)))
+                      shape-points indent polyround)))
+
         (t
          (let ((name (or (scad-sketch-session--shape-extracted-name shape)
                          (scad-sketch-session--unique-sketch-name session))))
            (scad-sketch-session--set-shape-extracted-name shape name)
            (list :assignments
                  (scad-sketch-session--emit-array-assignment
-                  name points "" polyround)
+                  name shape-points "" polyround)
                  :call
                  (scad-sketch-session--emit-polygon-call
-                  points indent polyround nil name)))))))
+                  shape-points indent polyround nil name)))))))
+
     (_
      (list :assignments "" :call ""))))
 
