@@ -98,7 +98,18 @@
     (setf (scad-sketch-shape-metadata shape) md)))
 
 (defun scad-sketch--move-primitive-handle-to (shape idx xy)
-  "Move primitive SHAPE handle IDX to XY."
+  "Move primitive SHAPE handle IDX to XY.
+
+Circle:
+  0 moves the center.
+  1 and 2 set radius from center to handle position.
+
+Square:
+  0..3 resize from corner handles.
+  4 moves the whole square by center.
+
+Text:
+  0 moves the text origin."
   (pcase (scad-sketch-shape-kind shape)
     ('circle
      (let* ((md (scad-sketch-shape-metadata shape))
@@ -600,6 +611,18 @@ This does not move the cursor and does not update global focus."
   (scad-sketch--clean-change
    (lambda (s)
      (setf (scad-sketch-session-selection s) nil))))
+
+(defun scad-sketch-clear-transient-state ()
+  "Clear transient editor state: marks, selection, and hover cycling.
+
+This does not mutate source geometry and does not clear global focus."
+  (interactive)
+  (scad-sketch--clean-change
+   (lambda (s)
+     (setf (scad-sketch-session-marks s) nil)
+     (setf (scad-sketch-session-named-marks s) nil)
+     (setf (scad-sketch-session-selection s) nil)
+     (setf (scad-sketch-session-hover-index s) 0))))
 
 ;;; Undo restore command
 

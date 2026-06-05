@@ -193,7 +193,7 @@ Corners are ordered:
   "Return the number of point-like handles for primitive SHAPE.
 
 Circle handles:
-  0 center, 1 east radius, 2 north radius, 3 west radius, 4 south radius.
+  0 center, 1 east radius, 2 north radius.
 
 Square handles:
   0..3 corners, 4 center.
@@ -201,7 +201,7 @@ Square handles:
 Text handles:
   0 text origin."
   (pcase (scad-sketch-shape-kind shape)
-    ('circle 5)
+    ('circle 3)
     ('square 5)
     ('text   1)
     (_ 0)))
@@ -215,11 +215,9 @@ Text handles:
             (cy (float (or (plist-get md :cy) 0.0)))
             (r  (float (or (plist-get md :r) 0.0))))
        (pcase idx
-         (0 (list cx cy))
-         (1 (list (+ cx r) cy))
-         (2 (list cx (+ cy r)))
-         (3 (list (- cx r) cy))
-         (4 (list cx (- cy r)))
+         (0 (list cx cy))          ; center / translation handle
+         (1 (list (+ cx r) cy))    ; east radius handle
+         (2 (list cx (+ cy r)))    ; north radius handle
          (_ nil))))
     ('square
      (if (= idx 4)
