@@ -88,14 +88,15 @@
       ('circle
        (let ((md (scad-sketch-shape-metadata shape)))
          (list (plist-get md :cx) (plist-get md :cy))))
+      ('square
+       (let ((pts (scad-sketch--square-corner-points shape)))
+         (list (/ (+ (nth 0 (nth 0 pts)) (nth 0 (nth 2 pts))) 2.0)
+               (/ (+ (nth 1 (nth 0 pts)) (nth 1 (nth 2 pts))) 2.0))))
       ('text
-       (let* ((md     (scad-sketch-shape-metadata shape))
-              (str    (or (plist-get md :str) ""))
-              (size   (float (or (plist-get md :size) 10.0)))
-              (width  (max size (* size 0.6 (max 1 (string-width str)))))
-              (height size))
-         (list (+ (float (or (plist-get md :x) 0.0)) (/ width 2.0))
-               (+ (float (or (plist-get md :y) 0.0)) (/ height 2.0)))))
+       (pcase-let ((`(,min-x ,max-x ,min-y ,max-y)
+                    (scad-sketch--text-rough-bounds shape)))
+         (list (/ (+ min-x max-x) 2.0)
+               (/ (+ min-y max-y) 2.0))))
       ('polygon
        (let ((points (mapcar #'scad-sketch--point-xy
                              (scad-sketch-shape-points shape))))
@@ -121,21 +122,23 @@
               (cr (plist-get md :r))
               (d  (scad-sketch--distance p (list cx cy))))
          (or (<= (abs (- d cr)) r) (< d cr))))
+      ('square
+       (let* ((pts  (scad-sketch--square-corner-points shape))
+              (near nil))
+         (dotimes (i 4)
+           (let ((a (nth i pts))
+                 (b (nth (mod (1+ i) 4) pts)))
+             (when (<= (scad-sketch--distance-to-segment p a b) r)
+               (setq near t))))
+         (or near (scad-sketch--point-in-polygon-p p pts))))
       ('text
-       (let* ((md     (scad-sketch-shape-metadata shape))
-              (str    (or (plist-get md :str) ""))
-              (x      (float (or (plist-get md :x) 0.0)))
-              (y      (float (or (plist-get md :y) 0.0)))
-              (size   (float (or (plist-get md :size) 10.0)))
-              (width  (max size (* size 0.6 (max 1 (string-width str)))))
-              (height size)
-              (px     (nth 0 p))
-              (py     (nth 1 p)))
-         (and (<= (- x r) px (+ x width r))
-              (<= (- y r) py (+ y height r)))))
+       (pcase-let ((`(,min-x ,max-x ,min-y ,max-y)
+                    (scad-sketch--text-rough-bounds shape)))
+         (and (<= (- min-x r) (nth 0 p) (+ max-x r))
+              (<= (- min-y r) (nth 1 p) (+ max-y r)))))
       ('polygon
        (let* ((points (mapcar #'scad-sketch--point-xy
-                               (scad-sketch-shape-points shape)))
+                              (scad-sketch-shape-points shape)))
               (n      (length points))
               (near   nil))
          (when (>= n 2)
@@ -157,38 +160,103 @@
                     (scad-sketch--point-in-polygon-p p points))))))
       (_ nil))))
 
+(defun scad-sketch--square-corner-points (shape)
+  "Return square SHAPE corner points in model coordinates.
+
+Corners are ordered like a polygon:
+  0 lower-left/origin, 1 lower-right, 2 upper-right, 3 upper-left."
+  (let* ((md    (scad-sketch-shape-metadata shape))
+         (x     (float (or (plist-get md :x) 0.0)))
+         (y     (float (or (plist-get md :y) 0.0)))
+         (w     (float (or (plist-get md :w) 0.0)))
+         (h     (float (or (plist-get md :h) 0.0)))
+         (a     (* pi (/ (float (or (plist-get md :angle) 0.0)) 180.0)))
+         (ux    (cos a))
+         (uy    (sin a))
+         (vx    (- (sin a)))
+         (vy    (cos a))
+         (p0    (list x y))
+         (p1    (list (+ x (* ux w))
+                      (+ y (* uy w))))
+         (p2    (list (+ x (* ux w) (* vx h))
+                      (+ y (* uy w) (* vy h))))
+         (p3    (list (+ x (* vx h))
+                      (+ y (* vy h)))))
+    (list p0 p1 p2 p3)))
+
+(defun scad-sketch--primitive-handle-count (shape)
+  "Return the number of point-like handles for primitive SHAPE."
+  (pcase (scad-sketch-shape-kind shape)
+    ('circle 1)
+    ('square 4)
+    (_ 0)))
+
+(defun scad-sketch--primitive-handle-xy (shape idx)
+  "Return model-space XY for primitive SHAPE handle IDX, or nil."
+  (pcase (scad-sketch-shape-kind shape)
+    ('circle
+     (when (= idx 0)
+       (let* ((md (scad-sketch-shape-metadata shape))
+              (cx (float (or (plist-get md :cx) 0.0)))
+              (cy (float (or (plist-get md :cy) 0.0)))
+              (r  (float (or (plist-get md :r) 0.0))))
+         (list (+ cx r) cy))))
+    ('square
+     (nth idx (scad-sketch--square-corner-points shape)))
+    (_ nil)))
+
+(defun scad-sketch--text-rough-bounds (shape)
+  "Return approximate bounds for text SHAPE as (MIN-X MAX-X MIN-Y MAX-Y)."
+  (let* ((md     (scad-sketch-shape-metadata shape))
+         (str    (or (plist-get md :str) ""))
+         (x      (float (or (plist-get md :x) 0.0)))
+         (y      (float (or (plist-get md :y) 0.0)))
+         (size   (float (or (plist-get md :size) 10.0)))
+         (width  (max size (* size 0.6 (max 1 (string-width str)))))
+         (height size))
+    (list x (+ x width) y (+ y height))))
+
 (defun scad-sketch--hover-candidates (session)
   "Return hovered refs under SESSION's current point.
 
-Point refs are listed before shape refs so exact vertex hovers take
-attention priority over the containing polygon."
+Point refs are listed before shape refs so exact vertex/handle hovers take
+attention priority over the containing shape."
   (let ((p          (scad-sketch-session-point session))
         (r          (scad-sketch--hover-radius session))
         candidates)
     (dolist (shape (scad-sketch-session-shapes session))
       (let ((shape-id (scad-sketch-shape-id shape)))
-        (when (eq (scad-sketch-shape-kind shape) 'polygon)
-          (cl-loop for model-point in (scad-sketch-shape-points shape)
-                   for idx from 0
-                   for xy = (scad-sketch--point-xy model-point)
-                   when (<= (scad-sketch--distance p xy) r)
-                   do (push (scad-sketch--point-ref idx shape-id) candidates)))
+        (pcase (scad-sketch-shape-kind shape)
+          ('polygon
+           (cl-loop for model-point in (scad-sketch-shape-points shape)
+                    for idx from 0
+                    for xy = (scad-sketch--point-xy model-point)
+                    when (<= (scad-sketch--distance p xy) r)
+                    do (push (scad-sketch--point-ref idx shape-id) candidates)))
+          ((or 'circle 'square)
+           (dotimes (idx (scad-sketch--primitive-handle-count shape))
+             (let ((xy (scad-sketch--primitive-handle-xy shape idx)))
+               (when (and xy (<= (scad-sketch--distance p xy) r))
+                 (push (scad-sketch--point-ref idx shape-id) candidates))))))
         (when (scad-sketch--shape-hovered-p session shape)
           (push (scad-sketch--shape-ref shape-id) candidates))))
     (nreverse candidates)))
 
 ;;; Selectable refs (TAB cycle)
-
 (defun scad-sketch--selectable-refs (session)
   "Return all selectable refs for SESSION in tab-cycle order."
   (let (refs)
     (dolist (shape (scad-sketch-session-shapes session))
       (let ((shape-id (scad-sketch-shape-id shape)))
         (push (scad-sketch--shape-ref shape-id) refs)
-        (when (eq (scad-sketch-shape-kind shape) 'polygon)
-          (cl-loop for _pt in (scad-sketch-shape-points shape)
-                   for idx from 0
-                   do (push (scad-sketch--point-ref idx shape-id) refs)))))
+        (pcase (scad-sketch-shape-kind shape)
+          ('polygon
+           (cl-loop for _pt in (scad-sketch-shape-points shape)
+                    for idx from 0
+                    do (push (scad-sketch--point-ref idx shape-id) refs)))
+          ((or 'circle 'square)
+           (dotimes (idx (scad-sketch--primitive-handle-count shape))
+             (push (scad-sketch--point-ref idx shape-id) refs))))))
     (nreverse refs)))
 
 (defun scad-sketch--ref-anchor (session ref)
@@ -199,12 +267,18 @@ attention priority over the containing polygon."
     ('point
      (let* ((shape (scad-sketch-session-shape-by-id
                     session (scad-sketch--ref-shape-id ref)))
-            (point (and shape
-                        (nth (scad-sketch--ref-index ref)
-                             (scad-sketch-shape-points shape)))))
-       (if point
-           (scad-sketch--point-xy point)
-         (copy-sequence (scad-sketch-session-point session)))))
+            (idx   (scad-sketch--ref-index ref)))
+       (pcase (and shape (scad-sketch-shape-kind shape))
+         ('polygon
+          (let ((point (nth idx (scad-sketch-shape-points shape))))
+            (if point
+                (scad-sketch--point-xy point)
+              (copy-sequence (scad-sketch-session-point session)))))
+         ((or 'circle 'square)
+          (or (scad-sketch--primitive-handle-xy shape idx)
+              (copy-sequence (scad-sketch-session-point session))))
+         (_
+          (copy-sequence (scad-sketch-session-point session))))))
     (_ (copy-sequence (scad-sketch-session-point session)))))
 
 ;;; Selection membership predicates
@@ -324,27 +398,31 @@ Invariants:
                 (scad-sketch-session-selection session))))
 
 (defun scad-sketch--selected-point-locs (session &optional fallback-to-active)
-  "Return selected point locations in SESSION as (SHAPE-ID . INDEX) conses.
+  "Return selected point/handle locations as (SHAPE-ID . INDEX) conses.
 
-Shape selections expand to all points.  When no explicit selection exists
-and FALLBACK-TO-ACTIVE is non-nil, return the legacy active point."
+Polygon shape selections expand to all vertices.  Primitive shape selections
+remain shape selections and are moved as whole shapes by `scad-sketch--move-selected'."
   (let (locs)
     (dolist (ref (scad-sketch-session-selection session))
       (pcase (scad-sketch--ref-kind ref)
         ('shape
          (let* ((shape-id (scad-sketch--ref-shape-id ref))
                 (shape    (scad-sketch-session-shape-by-id session shape-id)))
-           (when shape
+           (when (and shape (eq (scad-sketch-shape-kind shape) 'polygon))
              (dotimes (i (length (scad-sketch-shape-points shape)))
                (push (cons shape-id i) locs)))))
         ('point
          (let* ((shape-id (scad-sketch--ref-shape-id ref))
                 (idx      (scad-sketch--ref-index ref))
                 (shape    (scad-sketch-session-shape-by-id session shape-id)))
-           (when (and shape idx
-                      (>= idx 0)
-                      (< idx (length (scad-sketch-shape-points shape))))
-             (push (cons shape-id idx) locs))))))
+           (when (and shape idx (>= idx 0))
+             (pcase (scad-sketch-shape-kind shape)
+               ('polygon
+                (when (< idx (length (scad-sketch-shape-points shape)))
+                  (push (cons shape-id idx) locs)))
+               ((or 'circle 'square)
+                (when (< idx (scad-sketch--primitive-handle-count shape))
+                  (push (cons shape-id idx) locs)))))))))
     (setq locs (delete-dups (nreverse locs)))
     (if (and (null locs) fallback-to-active
              (scad-sketch-session-active-shape-id session)

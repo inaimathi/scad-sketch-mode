@@ -369,9 +369,11 @@ arguments such as `$fn'.  Leaves point just before the closing paren."
      ;; Compositions
      ((member v '("difference" "union" "intersection"))
       (scad-sketch-parse--composition ps beg))
+
      ;; Transforms
      ((member v '("translate" "rotate" "scale" "mirror"))
       (scad-sketch-parse--transform ps beg))
+
      ;; polygon
      ((string= v "polygon")
       (scad-sketch-parse--consume ps "polygon")
@@ -384,6 +386,7 @@ arguments such as `$fn'.  Leaves point just before the closing paren."
         (scad-sketch-parse--try-consume ps ";")
         (list :type 'polygon :beg beg :end (scad-sketch-parse--prev-end ps)
               :points (nth 0 arg) :source (nth 1 arg) :polyround (nth 2 arg))))
+
      ;; circle
      ((string= v "circle")
       (scad-sketch-parse--consume ps "circle")
@@ -393,40 +396,58 @@ arguments such as `$fn'.  Leaves point just before the closing paren."
         (scad-sketch-parse--try-consume ps ";")
         (list :type 'circle :beg beg :end (scad-sketch-parse--prev-end ps)
               :r r :cx 0.0 :cy 0.0)))
+
      ;; square
      ((string= v "square")
       (scad-sketch-parse--consume ps "square")
       (scad-sketch-parse--consume ps "(")
       (let ((dims (scad-sketch-parse--2d-vec ps)))
-        (let ((w (car dims)) (h (cdr dims))
+        (let ((w (car dims))
+              (h (cdr dims))
               (center nil))
           (when (equal (scad-sketch-parse--peek-val ps) ",")
             (scad-sketch-parse--consume ps ",")
-            (when (not (equal (scad-sketch-parse--peek-val ps) ")"))
-              (let ((kw (scad-sketch-parse--consume ps nil 'id)))
-                (when (string= kw "center")
-                  (scad-sketch-parse--consume ps "=")
-                  (setq center (scad-sketch-parse--bool ps))))))
+            (when (and (eq (scad-sketch-parse--peek-type ps) 'id)
+                       (string= (scad-sketch-parse--peek-val ps) "center")
+                       (equal (scad-sketch-parse--nth-val ps 1) "="))
+              (scad-sketch-parse--consume ps "center")
+              (scad-sketch-parse--consume ps "=")
+              (setq center (scad-sketch-parse--bool ps)))
+            (scad-sketch-parse--skip-rest-args ps))
           (scad-sketch-parse--consume ps ")")
           (scad-sketch-parse--try-consume ps ";")
-          (list :type 'square :beg beg :end (scad-sketch-parse--prev-end ps)
-                :x (if center (/ w -2.0) 0.0)
-                :y (if center (/ h -2.0) 0.0)
-                :w w :h h :angle 0.0))))
+          (list :type 'square
+                :beg beg
+                :end (scad-sketch-parse--prev-end ps)
+                :x (if center (/ (- w) 2.0) 0.0)
+                :y (if center (/ (- h) 2.0) 0.0)
+                :w (float w)
+                :h (float h)
+                :angle 0.0
+                :center center))))
+
      ;; text
      ((string= v "text")
       (scad-sketch-parse--consume ps "text")
       (scad-sketch-parse--consume ps "(")
-      (let* ((str (scad-sketch-parse--str ps))
-             (params (scad-sketch-parse--text-params ps)))
+      (let* ((str    (scad-sketch-parse--str ps))
+             (params (scad-sketch-parse--text-params ps))
+             (size   (or (cdr (assq 'size params)) 10.0))
+             (font   (cdr (assq 'font params))))
         (scad-sketch-parse--consume ps ")")
         (scad-sketch-parse--try-consume ps ";")
-        (list :type 'text :beg beg :end (scad-sketch-parse--prev-end ps)
-              :str str :x 0.0 :y 0.0
-              :size (float (or (cdr (assq 'size params)) 10.0)))))
+        (list :type 'text
+              :beg beg
+              :end (scad-sketch-parse--prev-end ps)
+              :str str
+              :x 0.0
+              :y 0.0
+              :size (float size)
+              :font font
+              :angle 0.0)))
+
      (t
-      (user-error "scad-sketch parser: unknown shape %S (not a supported 2D primitive)"
-                  v)))))
+      (user-error "scad-sketch parser: unsupported shape form: %S" v)))))
 
 (defun scad-sketch-parse--composition (ps beg)
   "Parse a composition (difference/union/intersection) node."

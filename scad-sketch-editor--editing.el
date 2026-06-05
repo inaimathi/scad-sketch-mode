@@ -53,6 +53,67 @@
           (list (scad-sketch--point-ref idx shape-id)))))
 
 ;;; Selected geometry movement
+(defun scad-sketch--current-edit-shape (session)
+  "Return the shape currently receiving edit attention in SESSION."
+  (let* ((ref (scad-sketch--attention-ref session))
+         (shape-id (or (and ref (scad-sketch--ref-shape-id ref))
+                       (scad-sketch-session-active-shape-id session))))
+    (or (and shape-id (scad-sketch-session-shape-by-id session shape-id))
+        (scad-sketch-session-active-shape session))))
+
+(defun scad-sketch--move-square-corner-to (shape idx xy)
+  "Move square SHAPE corner IDX to XY, preserving the opposite corner."
+  (let* ((md    (scad-sketch-shape-metadata shape))
+         (x     (float (or (plist-get md :x) 0.0)))
+         (y     (float (or (plist-get md :y) 0.0)))
+         (w     (float (or (plist-get md :w) 0.0)))
+         (h     (float (or (plist-get md :h) 0.0)))
+         (angle (float (or (plist-get md :angle) 0.0)))
+         (a     (* pi (/ angle 180.0)))
+         (ux    (cos a))
+         (uy    (sin a))
+         (vx    (- (sin a)))
+         (vy    (cos a))
+         (opp   (mod (+ idx 2) 4))
+         (opp-local
+          (pcase opp
+            (0 (list 0.0 0.0))
+            (1 (list w 0.0))
+            (2 (list w h))
+            (3 (list 0.0 h))))
+         (dx    (- (nth 0 xy) x))
+         (dy    (- (nth 1 xy) y))
+         (new-local (list (+ (* dx ux) (* dy uy))
+                          (+ (* dx vx) (* dy vy))))
+         (min-x (min (nth 0 opp-local) (nth 0 new-local)))
+         (max-x (max (nth 0 opp-local) (nth 0 new-local)))
+         (min-y (min (nth 1 opp-local) (nth 1 new-local)))
+         (max-y (max (nth 1 opp-local) (nth 1 new-local)))
+         (new-x (+ x (* min-x ux) (* min-y vx)))
+         (new-y (+ y (* min-x uy) (* min-y vy))))
+    (setq md (plist-put md :x new-x))
+    (setq md (plist-put md :y new-y))
+    (setq md (plist-put md :w (max 0.0001 (- max-x min-x))))
+    (setq md (plist-put md :h (max 0.0001 (- max-y min-y))))
+    (setf (scad-sketch-shape-metadata shape) md)))
+
+(defun scad-sketch--move-primitive-handle-to (shape idx xy)
+  "Move primitive SHAPE handle IDX to XY."
+  (pcase (scad-sketch-shape-kind shape)
+    ('circle
+     (let* ((md (scad-sketch-shape-metadata shape))
+            (cx (float (or (plist-get md :cx) 0.0)))
+            (cy (float (or (plist-get md :cy) 0.0)))
+            (dx (- (nth 0 xy) cx))
+            (dy (- (nth 1 xy) cy))
+            (r  (sqrt (+ (* dx dx) (* dy dy)))))
+       (setq md (plist-put md :r (max 0.0001 r)))
+       (setf (scad-sketch-shape-metadata shape) md)))
+    ('square
+     (scad-sketch--move-square-corner-to shape idx xy))
+    (_
+     (user-error "Selected point is not editable for this shape"))))
+
 (defun scad-sketch--move-shape (shape dx dy &optional snap grid)
   "Move whole SHAPE by DX DY, snapping to GRID when SNAP is non-nil."
   (pcase (scad-sketch-shape-kind shape)
@@ -73,7 +134,7 @@
        (setq md (plist-put md :cx (nth 0 xy)))
        (setq md (plist-put md :cy (nth 1 xy)))
        (setf (scad-sketch-shape-metadata shape) md)))
-    ('text
+    ((or 'square 'text)
      (let* ((md (scad-sketch-shape-metadata shape))
             (xy (scad-sketch--move-xy
                  (list (plist-get md :x) (plist-get md :y))
@@ -86,7 +147,8 @@
 (defun scad-sketch--move-selected (dx dy &optional snap)
   "Move selected vertices/shapes by DX, DY.  Snap to grid when SNAP is non-nil.
 
-Falls back to the active shape/point when no explicit selection exists."
+For circle and square point refs, this moves the primitive edit handle rather
+than translating the whole shape."
   (scad-sketch--edit
    (lambda (s)
      (let ((shape-ids (scad-sketch--selected-shape-ids s))
@@ -98,22 +160,34 @@ Falls back to the active shape/point when no explicit selection exists."
              (when shape
                (scad-sketch--move-shape shape dx dy snap
                                         (scad-sketch--grid s))))))
+
         (locs
          (dolist (loc locs)
            (let* ((shape-id (car loc))
                   (idx      (cdr loc))
-                  (shape    (scad-sketch-session-shape-by-id s shape-id))
-                  (points   (scad-sketch-shape-points shape))
-                  (old      (nth idx points))
-                  (new-xy   (scad-sketch--move-xy
-                             (scad-sketch--point-xy old) dx dy))
-                  (snapped  (if snap
-                                (scad-sketch--snap-xy new-xy
-                                                      (scad-sketch--grid s))
-                              new-xy))
-                  (new      (scad-sketch--make-model-point snapped old)))
-             (setf (scad-sketch-shape-points shape)
-                   (scad-sketch--replace-nth idx new points)))))
+                  (shape    (scad-sketch-session-shape-by-id s shape-id)))
+             (pcase (and shape (scad-sketch-shape-kind shape))
+               ('polygon
+                (let* ((points   (scad-sketch-shape-points shape))
+                       (old      (nth idx points))
+                       (new-xy   (scad-sketch--move-xy
+                                  (scad-sketch--point-xy old) dx dy))
+                       (snapped  (if snap
+                                     (scad-sketch--snap-xy new-xy
+                                                           (scad-sketch--grid s))
+                                   new-xy))
+                       (new      (scad-sketch--make-model-point snapped old)))
+                  (setf (scad-sketch-shape-points shape)
+                        (scad-sketch--replace-nth idx new points))))
+               ((or 'circle 'square)
+                (let* ((old-xy  (scad-sketch--primitive-handle-xy shape idx))
+                       (new-xy  (scad-sketch--move-xy old-xy dx dy))
+                       (snapped (if snap
+                                    (scad-sketch--snap-xy new-xy
+                                                          (scad-sketch--grid s))
+                                  new-xy)))
+                  (scad-sketch--move-primitive-handle-to shape idx snapped)))))))
+
         (t
          (let ((shape (scad-sketch-session-active-shape s)))
            (unless shape (user-error "No selected point or shape"))
@@ -311,25 +385,124 @@ active point when no explicit selection exists."
              (scad-sketch-shape-closed shape))))))
 
 (defun scad-sketch-set-radius (radius)
-  "Set the polyRound radius of selected vertices.
+  "Set radius.
 
-Applies to a selected shape's all vertices, or to the active point."
+For circles, sets the circle radius.
+For polygons, sets the polyRound radius of selected vertices."
   (interactive (list (read-number "Radius: " 0)))
   (scad-sketch--edit
    (lambda (s)
-     (let ((locs (scad-sketch--selected-point-locs s t)))
-       (unless locs (user-error "No selected point or shape"))
-       (dolist (loc locs)
-         (let* ((shape-id (car loc))
-                (idx      (cdr loc))
-                (shape    (scad-sketch-session-shape-by-id s shape-id))
-                (points   (scad-sketch-shape-points shape))
-                (pt       (nth idx points)))
-           (setf (scad-sketch-shape-points shape)
-                 (scad-sketch--replace-nth
-                  idx
-                  (list (nth 0 pt) (nth 1 pt) (float radius))
-                  points))))))))
+     (let ((shape (scad-sketch--current-edit-shape s)))
+       (pcase (and shape (scad-sketch-shape-kind shape))
+         ('circle
+          (let ((md (scad-sketch-shape-metadata shape)))
+            (setq md (plist-put md :r (max 0.0001 (float radius))))
+            (setf (scad-sketch-shape-metadata shape) md)))
+         ('polygon
+          (let ((locs (scad-sketch--selected-point-locs s t)))
+            (unless locs (user-error "No selected point or shape"))
+            (dolist (loc locs)
+              (let* ((shape-id (car loc))
+                     (idx      (cdr loc))
+                     (shape    (scad-sketch-session-shape-by-id s shape-id))
+                     (points   (scad-sketch-shape-points shape))
+                     (pt       (nth idx points)))
+                (setf (scad-sketch-shape-points shape)
+                      (scad-sketch--replace-nth
+                       idx
+                       (list (nth 0 pt) (nth 1 pt) (float radius))
+                       points))))))
+         (_
+          (user-error "Radius applies to circles or polygon vertices")))))))
+
+(defun scad-sketch-set-size ()
+  "Set the size of the current primitive shape.
+
+Square: prompts for width and height.
+Circle: prompts for radius.
+Text: prompts for font size."
+  (interactive)
+  (let* ((session (scad-sketch--assert-session))
+         (shape   (scad-sketch--current-edit-shape session)))
+    (unless shape (user-error "No active shape"))
+    (pcase (scad-sketch-shape-kind shape)
+      ('square
+       (let* ((md (scad-sketch-shape-metadata shape))
+              (w  (read-number "Width: "  (float (or (plist-get md :w) 0.0))))
+              (h  (read-number "Height: " (float (or (plist-get md :h) 0.0)))))
+         (scad-sketch--edit
+          (lambda (_s)
+            (setq md (plist-put md :w (max 0.0001 (float w))))
+            (setq md (plist-put md :h (max 0.0001 (float h))))
+            (setf (scad-sketch-shape-metadata shape) md)))))
+      ('circle
+       (call-interactively #'scad-sketch-set-radius))
+      ('text
+       (let* ((md   (scad-sketch-shape-metadata shape))
+              (size (read-number "Text size: "
+                                 (float (or (plist-get md :size) 10.0)))))
+         (scad-sketch--edit
+          (lambda (_s)
+            (setq md (plist-put md :size (max 0.0001 (float size))))
+            (setf (scad-sketch-shape-metadata shape) md)))))
+      (_
+       (user-error "Size applies to square, circle, or text shapes")))))
+
+(defun scad-sketch-set-text (text)
+  "Set the string of the current text shape to TEXT."
+  (interactive
+   (let* ((session (scad-sketch--assert-session))
+          (shape   (scad-sketch--current-edit-shape session))
+          (md      (and shape (scad-sketch-shape-metadata shape))))
+     (unless (and shape (eq (scad-sketch-shape-kind shape) 'text))
+       (user-error "No active text shape"))
+     (list (read-string "Text: " (or (plist-get md :str) "")))))
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((shape (scad-sketch--current-edit-shape s))
+            (md    (scad-sketch-shape-metadata shape)))
+       (unless (eq (scad-sketch-shape-kind shape) 'text)
+         (user-error "No active text shape"))
+       (setq md (plist-put md :str text))
+       (setf (scad-sketch-shape-metadata shape) md)))))
+
+(defun scad-sketch--available-font-families ()
+  "Return available font family names for completion."
+  (sort (delete-dups
+         (delq nil
+               (mapcar (lambda (font)
+                         (cond
+                          ((stringp font) font)
+                          ((consp font)   (car font))
+                          (t nil)))
+                       (font-family-list))))
+        #'string<))
+
+(defun scad-sketch-set-text-font (font)
+  "Set the font family of the current text shape to FONT.
+
+An empty FONT clears the explicit font."
+  (interactive
+   (let* ((session (scad-sketch--assert-session))
+          (shape   (scad-sketch--current-edit-shape session))
+          (md      (and shape (scad-sketch-shape-metadata shape))))
+     (unless (and shape (eq (scad-sketch-shape-kind shape) 'text))
+       (user-error "No active text shape"))
+     (list
+      (completing-read
+       "Font family (empty clears): "
+       (scad-sketch--available-font-families)
+       nil nil
+       (or (plist-get md :font) "")))))
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((shape (scad-sketch--current-edit-shape s))
+            (md    (scad-sketch-shape-metadata shape)))
+       (unless (eq (scad-sketch-shape-kind shape) 'text)
+         (user-error "No active text shape"))
+       (setq md (plist-put md :font
+                            (if (string-empty-p font) nil font)))
+       (setf (scad-sketch-shape-metadata shape) md)))))
 
 ;;; Focus/selection commands
 
