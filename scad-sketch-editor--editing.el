@@ -853,6 +853,194 @@ An empty FONT clears the explicit font."
                             (if (string-empty-p font) nil font)))
        (setf (scad-sketch-shape-metadata shape) md)))))
 
+;;; Selection boolean commands
+(defun scad-sketch--next-editor-group-id (session op)
+  "Return a fresh editor-created group id for OP in SESSION."
+  (let* ((prefix (format "%s-edit-" op))
+         (used nil))
+    (cl-labels
+        ((walk
+          (tree)
+          (when tree
+            (pcase (plist-get tree :kind)
+              ('boolean
+               (push (plist-get tree :group-id) used)
+               (dolist (child (plist-get tree :children))
+                 (walk child)))
+              ('mirror
+               (push (plist-get tree :mirror-id) used)
+               (walk (plist-get tree :child)))))))
+      (walk (scad-sketch-session-tree session)))
+    (let ((n 0)
+          id)
+      (while
+          (progn
+            (setq id (intern (format "%s%d" prefix n)))
+            (memq id used))
+        (setq n (1+ n)))
+      id)))
+
+(defun scad-sketch--shape-leaf-nodes (shape-ids)
+  "Return tree shape leaves for SHAPE-IDS."
+  (mapcar #'scad-sketch-session--tree-shape shape-ids))
+
+(defun scad-sketch--tree-insert-node-at-first-selected
+    (tree selected-ids replacement-node)
+  "Replace first selected shape leaf in TREE with REPLACEMENT-NODE.
+
+Other selected leaves are removed.  SELECTED-IDS should already be in tree
+traversal order."
+  (let ((inserted nil))
+    (cl-labels
+        ((walk
+          (node)
+          (pcase (and node (plist-get node :kind))
+            ('shape
+             (let ((shape-id (plist-get node :shape-id)))
+               (cond
+                ((not (memq shape-id selected-ids))
+                 node)
+                ((not inserted)
+                 (setq inserted t)
+                 replacement-node)
+                (t
+                 nil))))
+
+            ('boolean
+             (let* ((children
+                     (delq nil
+                           (mapcar #'walk
+                                   (plist-get node :children)))))
+               (cond
+                ((null children)
+                 nil)
+                ((null (cdr children))
+                 (car children))
+                (t
+                 (plist-put
+                  (copy-sequence node)
+                  :children children)))))
+
+            ('mirror
+             (let ((child (walk (plist-get node :child))))
+               (when child
+                 (plist-put (copy-sequence node) :child child))))
+
+            (_ node))))
+      (let ((new-tree (walk tree)))
+        (unless inserted
+          (user-error "Selected shapes were not found in tree"))
+        new-tree))))
+
+(defun scad-sketch--wrap-selected-shapes-with-node
+    (session ordered-ids replacement-node &optional focus-ref)
+  "Wrap ORDERED-IDS in SESSION tree with REPLACEMENT-NODE.
+
+ORDERED-IDS must be selected whole-shape ids in tree traversal order.
+FOCUS-REF, when non-nil, becomes the new selection and focus."
+  (setf (scad-sketch-session-tree session)
+        (scad-sketch--tree-insert-node-at-first-selected
+         (scad-sketch-session-tree session)
+         ordered-ids
+         replacement-node))
+
+  (if focus-ref
+      (progn
+        (setf (scad-sketch-session-selection session) (list focus-ref))
+        (setf (scad-sketch-session-focus-ref session) focus-ref))
+    ;; Keep the constituent shapes selected. Existing boolean rendering already
+    ;; uses selected shape refs to highlight containing boolean groups.
+    (setf (scad-sketch-session-selection session)
+          (mapcar #'scad-sketch--shape-ref ordered-ids)))
+
+  (setf (scad-sketch-session-hover-index session) 0)
+  replacement-node)
+
+(defun scad-sketch-wrap-selection-as-union ()
+  "Wrap selected whole shapes in a union node."
+  (interactive)
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((ordered-ids
+             (scad-sketch--selected-shape-ids-in-tree-order
+              s 2 "Union"))
+            (group-id (scad-sketch--next-editor-group-id s 'union))
+            (node
+             (scad-sketch-session--tree-boolean
+              'union
+              group-id
+              (scad-sketch--shape-leaf-nodes ordered-ids))))
+       (scad-sketch--wrap-selected-shapes-with-node
+        s ordered-ids node nil)))))
+
+(defun scad-sketch-wrap-selection-as-intersection ()
+  "Wrap selected whole shapes in an intersection node."
+  (interactive)
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((ordered-ids
+             (scad-sketch--selected-shape-ids-in-tree-order
+              s 2 "Intersection"))
+            (group-id (scad-sketch--next-editor-group-id s 'intersection))
+            (node
+             (scad-sketch-session--tree-boolean
+              'intersection
+              group-id
+              (scad-sketch--shape-leaf-nodes ordered-ids))))
+       (scad-sketch--wrap-selected-shapes-with-node
+        s ordered-ids node nil)))))
+
+(defun scad-sketch-wrap-selection-as-difference ()
+  "Wrap selected whole shapes in a difference node.
+
+The first selected shape in tree order is the positive child.  Remaining
+selected shapes become subtractive children."
+  (interactive)
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((ordered-ids
+             (scad-sketch--selected-shape-ids-in-tree-order
+              s 2 "Difference"))
+            (group-id (scad-sketch--next-editor-group-id s 'difference))
+            (node
+             (scad-sketch-session--tree-boolean
+              'difference
+              group-id
+              (scad-sketch--shape-leaf-nodes ordered-ids))))
+       (scad-sketch--wrap-selected-shapes-with-node
+        s ordered-ids node nil)))))
+
+(defun scad-sketch-wrap-selection-as-mirror ()
+  "Wrap selected whole shapes in a mirror node.
+
+The new mirror uses default normal vector [1, 0].  Use
+`scad-sketch-set-mirror-axis' afterward to set the mirror normal."
+  (interactive)
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((ordered-ids
+             (scad-sketch--selected-shape-ids-in-tree-order
+              s 1 "Mirror"))
+            (mirror-id (scad-sketch--next-editor-group-id s 'mirror))
+            (child
+             (if (= (length ordered-ids) 1)
+                 (scad-sketch-session--tree-shape (car ordered-ids))
+               (scad-sketch-session--tree-boolean
+                'union
+                (scad-sketch--next-editor-group-id s 'union)
+                (scad-sketch--shape-leaf-nodes ordered-ids))))
+            (node
+             (scad-sketch-session--tree-mirror
+              mirror-id
+              1.0
+              0.0
+              child)))
+       (scad-sketch--wrap-selected-shapes-with-node
+        s
+        ordered-ids
+        node
+        (scad-sketch--mirror-ref mirror-id))))))
+
 ;;; Focus/selection commands
 (defun scad-sketch--set-focus-ref (session ref)
   "Set SESSION global focus to REF and move cursor to REF's anchor.

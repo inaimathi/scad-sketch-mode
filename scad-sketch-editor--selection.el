@@ -552,6 +552,84 @@ while hover is represented by `hover-index' over `scad-sketch--hover-candidates'
                     (scad-sketch--ref-shape-id ref)))
                 (scad-sketch-session-selection session))))
 
+(defun scad-sketch--selected-shape-ids-strict (session)
+  "Return explicitly selected whole-shape ids in SESSION.
+
+Point refs, primitive handles, mirror refs, and mirror handles are ignored.
+Signals unless at least one whole shape is selected."
+  (let ((shape-ids (scad-sketch--selected-shape-ids session)))
+    (unless shape-ids
+      (user-error "Select one or more whole shapes first"))
+    shape-ids))
+
+(defun scad-sketch--tree-selected-shape-ids-in-order (tree selected-ids)
+  "Return SELECTED-IDS that occur in TREE, in tree traversal order."
+  (pcase (and tree (plist-get tree :kind))
+    ('shape
+     (let ((shape-id (plist-get tree :shape-id)))
+       (if (memq shape-id selected-ids)
+           (list shape-id)
+         nil)))
+
+    ('boolean
+     (apply #'append
+            (mapcar (lambda (child)
+                      (scad-sketch--tree-selected-shape-ids-in-order
+                       child selected-ids))
+                    (plist-get tree :children))))
+
+    ('mirror
+     (scad-sketch--tree-selected-shape-ids-in-order
+      (plist-get tree :child)
+      selected-ids))
+
+    (_ nil)))
+
+(defun scad-sketch--tree-selected-shape-ids-in-order (tree selected-ids)
+  "Return SELECTED-IDS that occur in TREE, in tree traversal order."
+  (pcase (and tree (plist-get tree :kind))
+    ('shape
+     (let ((shape-id (plist-get tree :shape-id)))
+       (if (memq shape-id selected-ids)
+           (list shape-id)
+         nil)))
+
+    ('boolean
+     (apply #'append
+            (mapcar (lambda (child)
+                      (scad-sketch--tree-selected-shape-ids-in-order
+                       child selected-ids))
+                    (plist-get tree :children))))
+
+    ('mirror
+     (scad-sketch--tree-selected-shape-ids-in-order
+      (plist-get tree :child)
+      selected-ids))
+
+    (_ nil)))
+
+(defun scad-sketch--selected-shape-ids-in-tree-order
+    (session &optional min-count op-name)
+  "Return selected whole-shape ids in SESSION, ordered by tree traversal.
+
+MIN-COUNT, when non-nil, is the minimum number of selected shapes required.
+OP-NAME is used in the user-facing error message."
+  (let* ((selected-ids (scad-sketch--selected-shape-ids-strict session))
+         (ordered-ids
+          (scad-sketch--tree-selected-shape-ids-in-order
+           (scad-sketch-session-tree session)
+           selected-ids))
+         (min-count (or min-count 1))
+         (op-name   (or op-name "Operation")))
+    (unless ordered-ids
+      (user-error "Selected shapes were not found in tree"))
+    (when (< (length ordered-ids) min-count)
+      (user-error "%s needs at least %d selected shape%s"
+                  op-name
+                  min-count
+                  (if (= min-count 1) "" "s")))
+    ordered-ids))
+
 (defun scad-sketch--selected-point-locs (session &optional fallback-to-active)
   "Return selected point/handle locations as (SHAPE-ID . INDEX) conses.
 

@@ -81,6 +81,12 @@
     (define-key map (kbd "O")           #'scad-sketch-draw-circle-from-mark)
     (define-key map (kbd "P")           #'scad-sketch-draw-polygon-from-marks)
 
+    ;; ── Selection boolean commands ────────────────────────────────────
+    (define-key map (kbd "U") #'scad-sketch-wrap-selection-as-union)
+    (define-key map (kbd "D") #'scad-sketch-wrap-selection-as-difference)
+    (define-key map (kbd "I") #'scad-sketch-wrap-selection-as-intersection)
+    (define-key map (kbd "V") #'scad-sketch-wrap-selection-as-mirror)
+
     ;; ── Hover / focus / selection ─────────────────────────────────────
     (define-key map (kbd "TAB")         #'scad-sketch-next-hovered)
     (define-key map (kbd "<backtab>")   #'scad-sketch-previous-hovered)
