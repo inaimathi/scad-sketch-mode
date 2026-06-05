@@ -1072,11 +1072,13 @@ The new mirror uses default normal vector [1, 0].  Use
 
 ;;; Focus/selection commands
 (defun scad-sketch--current-breakable-group-ref (session)
-  "Return the currently attentioned group ref to break apart.
+  "Return the currently attentioned group wrapper ref to break apart.
 
-Groups are attention targets, not selection targets.  This function therefore
-uses only current attention.  It does not inspect selection and it does not infer
-a containing group from an attentioned shape."
+Break works only on direct group refs:
+  - :boolean
+  - :mirror
+
+It does not work on :boolean-members, shapes, points, or selected child shapes."
   (let* ((ref  (scad-sketch--attention-ref session))
          (kind (and ref (scad-sketch--ref-kind ref))))
     (pcase kind
@@ -1162,17 +1164,16 @@ new root is a sequence node."
          (t (scad-sketch-session--tree-sequence children)))))))
 
 (defun scad-sketch-break-apart-group ()
-  "Break apart the currently attentioned boolean or mirror group.
+  "Break apart the currently attentioned boolean or mirror group wrapper.
 
-Groups are not separately selected.  To choose a break target, put point over a
-group and use hover cycling, or use global focus cycling, until the desired
-group has attention."
+To break a boolean group, put attention on the group wrapper itself, not on
+`:boolean-members' and not on a child shape."
   (interactive)
   (scad-sketch--edit
    (lambda (s)
      (let ((ref (scad-sketch--current-breakable-group-ref s)))
        (unless ref
-         (user-error "No attentioned boolean or mirror group to break apart"))
+         (user-error "Break needs attention on a boolean or mirror group wrapper"))
        (setf (scad-sketch-session-tree s)
              (scad-sketch--tree-break-ref
               (scad-sketch-session-tree s)

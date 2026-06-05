@@ -34,6 +34,10 @@ When SHAPE-ID is nil, the caller must supply it before use."
   "Return a boolean group ref for GROUP-ID."
   (list :kind 'boolean :group-id group-id))
 
+(defun scad-sketch--boolean-members-ref (group-id)
+  "Return a ref meaning all member shapes of boolean GROUP-ID."
+  (list :kind 'boolean-members :group-id group-id))
+
 ;;; Accessors
 (defun scad-sketch--ref-mirror-id (ref)
   "Return mirror id from REF, or nil."
@@ -76,7 +80,9 @@ When SHAPE-ID is nil, the caller must supply it before use."
              (scad-sketch--ref-shape-id ref)
              (scad-sketch--ref-index ref)))
     ('boolean
-     (format "%s" (scad-sketch--ref-group-id ref)))
+     (format "%s.group" (scad-sketch--ref-group-id ref)))
+    ('boolean-members
+     (format "%s.members" (scad-sketch--ref-group-id ref)))
     ('mirror
      (format "%s" (scad-sketch--ref-mirror-id ref)))
     ('mirror-point

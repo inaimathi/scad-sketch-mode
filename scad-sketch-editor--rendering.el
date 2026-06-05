@@ -651,6 +651,32 @@ Halos should only appear for actual hover attention."
                     (plist-get tree :children))))
       (_ nil))))
 
+(defun scad-sketch--draw-group-box-halo (svg transform session group)
+  "Draw a dashed rectangular halo around boolean GROUP itself."
+  (let ((bounds (scad-sketch--tree-bounds session group)))
+    (when bounds
+      (pcase-let ((`(,min-x ,max-x ,min-y ,max-y) bounds))
+        (let* ((p0 (funcall transform (list min-x min-y)))
+               (p1 (funcall transform (list max-x max-y)))
+               (x  (min (nth 0 p0) (nth 0 p1)))
+               (y  (min (nth 1 p0) (nth 1 p1)))
+               (w  (abs (- (nth 0 p1) (nth 0 p0))))
+               (h  (abs (- (nth 1 p1) (nth 1 p0)))))
+          ;; Soft box halo.
+          (svg-rectangle svg x y w h
+                         :fill "none"
+                         :stroke "#0057c2"
+                         :stroke-width 9
+                         :stroke-opacity 0.12
+                         :stroke-dasharray "14,8")
+          ;; Crisp dashed group rectangle.
+          (svg-rectangle svg x y w h
+                         :fill "none"
+                         :stroke "#0057c2"
+                         :stroke-width 2.5
+                         :stroke-opacity 0.85
+                         :stroke-dasharray "14,8"))))))
+
 (defun scad-sketch--draw-compound-halo (parent-node compound-d)
   "Draw an attention halo around COMPOUND-D.
 
@@ -699,11 +725,10 @@ uses `scad-sketch--draw-attention-halo' instead."
   "Draw a geometry-level attention halo for REF.
 
 Point refs intentionally do nothing here; point refs are haloed at the point
-renderer.  Shape refs halo the whole shape path.  Boolean refs halo the whole
-boolean subtree.
+renderer.
 
-Boolean refs are supported as plists of the form:
-  (:kind boolean :group-id GROUP-ID)"
+Boolean group wrapper refs get a dashed group rectangle.
+Boolean member refs get the child-object compound halo."
   (when ref
     (pcase (scad-sketch--ref-kind ref)
       ('point
@@ -718,17 +743,35 @@ Boolean refs are supported as plists of the form:
            (scad-sketch--draw-compound-halo svg d))))
 
       ('boolean
-       (let* ((group-id (plist-get ref :group-id))
-              (tree     (scad-sketch-session-tree session))
+       (let* ((group-id (scad-sketch--ref-group-id ref))
               (group    (and group-id
-                              (scad-sketch--tree-find-group-by-id
-                               tree group-id)))
+                              (scad-sketch-session--tree-find-group
+                               (scad-sketch-session-tree session)
+                               group-id))))
+         (when group
+           (scad-sketch--draw-group-box-halo svg transform session group))))
+
+      ('boolean-members
+       (let* ((group-id (scad-sketch--ref-group-id ref))
+              (group    (and group-id
+                              (scad-sketch-session--tree-find-group
+                               (scad-sketch-session-tree session)
+                               group-id)))
               (ds       (and group
                              (scad-sketch--tree-path-ds
                               session transform group)))
               (compound (and ds (scad-sketch--compound-d ds))))
          (when compound
-           (scad-sketch--draw-compound-halo svg compound)))))))
+           (scad-sketch--draw-compound-halo svg compound))))
+
+      ('mirror
+       (let* ((mirror-id (scad-sketch--ref-mirror-id ref))
+              (mirror    (and mirror-id
+                              (scad-sketch-session--tree-find-mirror
+                               (scad-sketch-session-tree session)
+                               mirror-id))))
+         (when mirror
+           (scad-sketch--draw-mirror-axis svg transform session mirror)))))))
 
 (defun scad-sketch--draw-attention-halo (svg screen &optional radius)
   "Draw a visible attention halo around SCREEN.
@@ -1195,17 +1238,13 @@ Circle handle indices:
             (apply #'max (mapcar #'cadddr bl))))))
 
 (defun scad-sketch--tree-bounds (session tree)
-  "Return (MIN-X MAX-X MIN-Y MAX-Y) for TREE."
-  (pcase (plist-get tree :kind)
-    ('shape
-     (let ((shape (scad-sketch-session-shape-by-id
-                   session (plist-get tree :shape-id))))
-       (and shape (scad-sketch--shape-bounds shape))))
-    ('boolean
-     (scad-sketch--merge-bounds
-      (mapcar (lambda (c) (scad-sketch--tree-bounds session c))
-              (plist-get tree :children))))
-    (_ nil)))
+  "Return model-space bounds for TREE as (MIN-X MAX-X MIN-Y MAX-Y)."
+  (let ((pts (scad-sketch--tree-xy-points session tree)))
+    (when pts
+      (list (apply #'min (mapcar #'car pts))
+            (apply #'max (mapcar #'car pts))
+            (apply #'min (mapcar #'cadr pts))
+            (apply #'max (mapcar #'cadr pts))))))
 
 (defun scad-sketch--draw-boolean-boxes (svg transform session tree)
   "Draw labelled dotted bounding boxes for boolean groups in TREE."

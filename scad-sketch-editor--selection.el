@@ -270,15 +270,66 @@ Text handles:
 (defun scad-sketch--boolean-hover-candidates (session)
   "Return boolean group refs hovered by SESSION cursor.
 
-Deepest groups are returned first so TAB reaches the most specific group before
-outer containing groups."
+For each hovered group, return two attention targets:
+  - :boolean-members, meaning all child objects
+  - :boolean, meaning the group wrapper itself
+
+Deepest groups are returned first."
   (let (refs)
     (dolist (group (reverse (scad-sketch-session--tree-groups
                              (scad-sketch-session-tree session))))
       (when (scad-sketch--tree-hovered-p session group)
-        (push (scad-sketch--boolean-ref (plist-get group :group-id))
-              refs)))
+        (let ((group-id (plist-get group :group-id)))
+          ;; Push in reverse of desired final order because we nreverse.
+          (push (scad-sketch--boolean-ref group-id) refs)
+          (push (scad-sketch--boolean-members-ref group-id) refs))))
     (nreverse refs)))
+
+(defun scad-sketch--boolean-ref-group (session ref)
+  "Return boolean group node described by REF, or nil."
+  (let ((group-id (scad-sketch--ref-group-id ref)))
+    (and group-id
+         (scad-sketch-session--tree-find-group
+          (scad-sketch-session-tree session)
+          group-id))))
+
+(defun scad-sketch--group-child-shape-ids (session ref)
+  "Return all child shape ids for boolean REF."
+  (let ((group (scad-sketch--boolean-ref-group session ref)))
+    (unless group
+      (user-error "No such boolean group: %s"
+                  (scad-sketch--ref-group-id ref)))
+    (scad-sketch-session--tree-shape-ids group)))
+
+(defun scad-sketch--remove-shapes-and-subpoints (selection shape-ids)
+  "Return SELECTION with SHAPE-IDS and their point refs removed."
+  (cl-remove-if
+   (lambda (ref)
+     (let ((shape-id (scad-sketch--ref-shape-id ref)))
+       (and shape-id (memq shape-id shape-ids))))
+   selection))
+
+(defun scad-sketch--all-child-shapes-selected-p (session shape-ids)
+  "Return non-nil if every SHAPE-ID is selected as a whole shape."
+  (cl-every (lambda (shape-id)
+              (scad-sketch--shape-selected-p session shape-id))
+            shape-ids))
+
+(defun scad-sketch--toggle-group-children-selection (session ref)
+  "Toggle selection of child shapes for boolean group REF.
+
+The group itself is never stored in selection.  Selection expands to direct
+whole-shape refs for the group's child leaves."
+  (let* ((shape-ids (scad-sketch--group-child-shape-ids session ref))
+         (selection (scad-sketch-session-selection session)))
+    (if (scad-sketch--all-child-shapes-selected-p session shape-ids)
+        (setf (scad-sketch-session-selection session)
+              (scad-sketch--remove-shapes-and-subpoints selection shape-ids))
+      (setf (scad-sketch-session-selection session)
+            (append
+             (mapcar #'scad-sketch--shape-ref shape-ids)
+             (scad-sketch--remove-shapes-and-subpoints
+              selection shape-ids))))))
 
 (defun scad-sketch--hover-candidates (session)
   "Return hovered refs under SESSION's current point.
@@ -332,7 +383,7 @@ but not selectable."
   "Return all focusable refs for SESSION in global cycle order.
 
 Despite the historical name, this includes attention/focus targets that are not
-selection targets, such as boolean groups."
+direct selection targets, such as boolean groups."
   (let (refs)
     (dolist (shape (scad-sketch-session-shapes session))
       (let ((shape-id (scad-sketch-shape-id shape)))
@@ -346,10 +397,12 @@ selection targets, such as boolean groups."
            (dotimes (idx (scad-sketch--primitive-handle-count shape))
              (push (scad-sketch--point-ref idx shape-id) refs))))))
 
-    ;; Boolean groups: focusable/attentionable, not selectable.
+    ;; Boolean groups: attentionable.  The wrapper and members are separate.
     (dolist (group (scad-sketch-session--tree-groups
                     (scad-sketch-session-tree session)))
-      (push (scad-sketch--boolean-ref (plist-get group :group-id)) refs))
+      (let ((group-id (plist-get group :group-id)))
+        (push (scad-sketch--boolean-ref group-id) refs)
+        (push (scad-sketch--boolean-members-ref group-id) refs)))
 
     ;; Mirror axes and handles.
     (dolist (mirror (scad-sketch-session--tree-mirrors
@@ -415,7 +468,7 @@ selection targets, such as boolean groups."
          (_
           (copy-sequence (scad-sketch-session-point session))))))
 
-    ('boolean
+    ((or 'boolean 'boolean-members)
      (let ((group (scad-sketch-session--tree-find-group
                    (scad-sketch-session-tree session)
                    (scad-sketch--ref-group-id ref))))
@@ -551,14 +604,15 @@ A selected shape makes all of its points effectively selected."
 (defun scad-sketch--toggle-ref-selection (session ref)
   "Toggle REF in SESSION selection.
 
-Boolean groups are attention/focus targets, not selection targets."
+Boolean group refs are attention targets.  Selecting either the group wrapper
+or its members expands to direct whole-shape child selection."
   (let* ((kind      (scad-sketch--ref-kind ref))
          (shape-id  (scad-sketch--ref-shape-id ref))
          (mirror-id (scad-sketch--ref-mirror-id ref))
          (selection (scad-sketch-session-selection session)))
     (pcase kind
-      ('boolean
-       (user-error "Boolean groups are attention targets, not selection targets"))
+      ((or 'boolean 'boolean-members)
+       (scad-sketch--toggle-group-children-selection session ref))
 
       ('shape
        (if (scad-sketch--shape-selected-p session shape-id)
