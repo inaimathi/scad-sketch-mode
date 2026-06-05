@@ -57,19 +57,29 @@ C-c C-s and C-c C-o are intentionally left free for `scad-mode'.")
   (scad-sketch--open-session (scad-sketch-session-insert-array-at-point name)))
 
 ;;;###autoload
-(defun scad-sketch-or-insert-at-point ()
-  "Edit the supported form at point, or insert a new array if none is found.
+(defun scad-sketch-insert-block-at-point ()
+  "Open a new generic scad-sketch block at point.
 
-Only `scad-sketch-no-edit-target' falls through to insertion.  Unsupported
-forms are real errors and should be reported rather than silently switching to
-new-array insertion."
+This starts with no source text and no shapes.  Draw shapes in the editor, then
+write back to insert the emitted OpenSCAD forms at point."
   (interactive)
-  (unless (image-type-available-p 'svg)
-    (user-error "This Emacs was not built with SVG image support"))
+  (scad-sketch--ensure-svg)
+  (scad-sketch--open-session
+   (scad-sketch-session-insert-block-at-point)))
+
+;;;###autoload
+(defun scad-sketch-or-insert-at-point ()
+  "Edit the supported form at point, or open a generic blank sketch block.
+
+Only `scad-sketch-no-edit-target' falls through to blank-block insertion.
+Unsupported forms are real errors and should be reported rather than silently
+switching to new-block insertion."
+  (interactive)
+  (scad-sketch--ensure-svg)
   (condition-case err
       (scad-sketch-at-point)
     (scad-sketch-no-edit-target
-     (call-interactively #'scad-sketch-insert-array-at-point))
+     (scad-sketch-insert-block-at-point))
     (scad-sketch-unsupported-edit-target
      (signal (car err) (cdr err)))))
 

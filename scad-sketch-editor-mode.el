@@ -25,6 +25,36 @@
 (require 'scad-sketch-editor--rendering)
 
 ;;; Keymap
+(defvar scad-sketch-editor-insert-map
+  (let ((map (make-sparse-keymap)))
+    ;; Existing polygon/array point editing.
+    (define-key map (kbd "a") #'scad-sketch-append-point)
+    (define-key map (kbd "i") #'scad-sketch-insert-point-after-selected)
+
+    ;; Drawing from marks + point.
+    (define-key map (kbd "l") #'scad-sketch-line-from-mark)
+    (define-key map (kbd "r") #'scad-sketch-rectangle-from-mark)
+    (define-key map (kbd "p") #'scad-sketch-draw-polygon-from-marks)
+    (define-key map (kbd "b") #'scad-sketch-draw-square-from-marks)
+    (define-key map (kbd "s") #'scad-sketch-draw-square-from-marks)
+    (define-key map (kbd "c") #'scad-sketch-draw-circle-from-mark)
+    (define-key map (kbd "o") #'scad-sketch-draw-circle-from-mark)
+    (define-key map (kbd "t") #'scad-sketch-draw-text-at-point)
+    map)
+  "Prefix map for scad-sketch insertion/drawing commands.")
+
+(defvar scad-sketch-editor-group-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "u") #'scad-sketch-wrap-selection-as-union)
+    (define-key map (kbd "d") #'scad-sketch-wrap-selection-as-difference)
+    (define-key map (kbd "i") #'scad-sketch-wrap-selection-as-intersection)
+    (define-key map (kbd "m") #'scad-sketch-wrap-selection-as-mirror)
+    (define-key map (kbd "v") #'scad-sketch-wrap-selection-as-mirror)
+    (define-key map (kbd "b") #'scad-sketch-break-apart-group)
+    (define-key map (kbd "x") #'scad-sketch-break-apart-group)
+    map)
+  "Prefix map for scad-sketch grouping/boolean commands.")
+
 (defvar scad-sketch-editor-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
@@ -43,7 +73,7 @@
     (define-key map (kbd "C-<up>")      #'scad-sketch-move-point-coarse-up)
     (define-key map (kbd "C-<down>")    #'scad-sketch-move-point-coarse-down)
 
-    ;; ── Selected vertex / primitive handle movement ──────────────────
+    ;; ── Selected geometry movement ──────────────────────────────────
     (define-key map (kbd "S-<left>")    #'scad-sketch-move-selected-left)
     (define-key map (kbd "S-<right>")   #'scad-sketch-move-selected-right)
     (define-key map (kbd "S-<up>")      #'scad-sketch-move-selected-up)
@@ -57,7 +87,7 @@
     (define-key map (kbd "C-S-<up>")    #'scad-sketch-move-selected-coarse-up)
     (define-key map (kbd "C-S-<down>")  #'scad-sketch-move-selected-coarse-down)
 
-    ;; ── Marks / transient clears ─────────────────────────────────────
+    ;; ── Marks and transient clears ──────────────────────────────────
     (define-key map (kbd "m")           #'scad-sketch-set-mark)
     (define-key map (kbd "M")           #'scad-sketch-push-mark)
     (define-key map (kbd "`")           #'scad-sketch-pop-mark)
@@ -66,28 +96,17 @@
     (define-key map (kbd "s")           #'scad-sketch-clear-selection)
     (define-key map (kbd "<escape>")    #'scad-sketch-clear-transient-state)
 
-    ;; ── Vertex / shape editing ────────────────────────────────────────
-    (define-key map (kbd "p")           #'scad-sketch-append-point)
-    (define-key map (kbd "i")           #'scad-sketch-insert-point-after-selected)
+    ;; ── Prefix maps ─────────────────────────────────────────────────
+    (define-key map (kbd "i")           scad-sketch-editor-insert-map)
+    (define-key map (kbd "b")           scad-sketch-editor-group-map)
+
+    ;; ── Shape/parameter editing ─────────────────────────────────────
     (define-key map (kbd "k")           #'scad-sketch-delete-selected)
     (define-key map (kbd "c")           #'scad-sketch-toggle-closed)
     (define-key map (kbd "R")           #'scad-sketch-set-radius)
     (define-key map (kbd "A")           #'scad-sketch-set-mirror-axis)
 
-    ;; ── Drawing from marks + point ────────────────────────────────────
-    (define-key map (kbd "l")           #'scad-sketch-line-from-mark)
-    (define-key map (kbd "r")           #'scad-sketch-rectangle-from-mark)
-    (define-key map (kbd "B")           #'scad-sketch-draw-square-from-marks)
-    (define-key map (kbd "O")           #'scad-sketch-draw-circle-from-mark)
-    (define-key map (kbd "P")           #'scad-sketch-draw-polygon-from-marks)
-
-    ;; ── Selection boolean commands ────────────────────────────────────
-    (define-key map (kbd "U") #'scad-sketch-wrap-selection-as-union)
-    (define-key map (kbd "D") #'scad-sketch-wrap-selection-as-difference)
-    (define-key map (kbd "I") #'scad-sketch-wrap-selection-as-intersection)
-    (define-key map (kbd "V") #'scad-sketch-wrap-selection-as-mirror)
-
-    ;; ── Hover / focus / selection ─────────────────────────────────────
+    ;; ── Hover / focus / selection ───────────────────────────────────
     (define-key map (kbd "TAB")         #'scad-sketch-next-hovered)
     (define-key map (kbd "<backtab>")   #'scad-sketch-previous-hovered)
     (define-key map (kbd ".")           #'scad-sketch-next-hovered)
@@ -97,7 +116,7 @@
     (define-key map (kbd "M-<backtab>") #'scad-sketch-previous-selectable)
     (define-key map (kbd "SPC")         #'scad-sketch-toggle-attention-selection)
 
-    ;; ── Coordinate / constraint commands ─────────────────────────────
+    ;; ── Coordinate / constraint commands ────────────────────────────
     (define-key map (kbd "x")           #'scad-sketch-set-x)
     (define-key map (kbd "y")           #'scad-sketch-set-y)
     (define-key map (kbd "X")           #'scad-sketch-set-delta-x)
@@ -106,11 +125,11 @@
     (define-key map (kbd "a")           #'scad-sketch-set-angle-from-mark)
     (define-key map (kbd "g")           #'scad-sketch-set-grid)
 
-    ;; ── Session ───────────────────────────────────────────────────────
+    ;; ── Session/help ────────────────────────────────────────────────
     (define-key map (kbd "u")           #'scad-sketch-undo)
     (define-key map (kbd "w")           #'scad-sketch-write-back)
     (define-key map (kbd "q")           #'scad-sketch-quit)
-    (define-key map (kbd "?")           #'scad-sketch-help)
+    (define-key map (kbd "?")           #'describe-mode)
     map)
   "Keymap for `scad-sketch-editor-mode'.")
 
@@ -200,23 +219,10 @@ Session:
       (set-window-configuration wconf))))
 
 ;;; Help
-
 (defun scad-sketch-help ()
-  "Display a key binding summary in the echo area.
-For full documentation use \\[describe-mode]."
+  "Show native Emacs mode help for `scad-sketch-editor-mode'."
   (interactive)
-  (scad-sketch--assert-session)
-  (message
-   (concat
-    "arrows=move cursor(clean)  C-arrows=coarse  M-arrows=fine | "
-    "TAB/S-TAB=focus shape/point  ./,=cycle hovered  "
-    "SPC=toggle selection  s=clear selection | "
-    "S-arrows=move selected geometry(dirty) | "
-    "p=append  i=insert  k=delete | "
-    "m=set-mark  M=push  `=pop  '=jump  C=clear marks | "
-    "R=radius  c=closed  l=line  r=rect | "
-    "x/y=coord  X/Y=delta  d=dist  a=angle  g=grid | "
-    "w=write  u=undo  q=quit  C-h m=full help")))
+  (call-interactively #'describe-mode))
 
 (provide 'scad-sketch-editor-mode)
 ;;; scad-sketch-editor-mode.el ends here

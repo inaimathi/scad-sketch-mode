@@ -190,6 +190,12 @@ using the average basis-vector length for this first pass."
        2.0)))
 
 ;;;; Tree helpers
+(defun scad-sketch-session--tree-sequence (children)
+  "Return a sequence tree node.
+
+A sequence is not an OpenSCAD operation; it emits children as adjacent source
+forms.  It is used when breaking apart a root-level boolean group."
+  (list :kind 'sequence :children children))
 
 (defun scad-sketch-session--tree-shape (shape-id)
   "Return a tree node for SHAPE-ID."
@@ -902,28 +908,33 @@ This is a model-level helper.  It does not select or focus the new shape."
           (scad-sketch-session--fmt-array points indent force-radii)))
 
 (defun scad-sketch-session--emit-polygon-call
-    (points indent polyround &optional source-name extracted-name)
+    (points indent polyround &optional source-name _extracted-name)
   "Emit a polygon call at INDENT.
 
-POINTS are used for inline emission.  POLYROUND is the optional polyRound
-fragment count.  SOURCE-NAME emits polygon(SOURCE-NAME).  EXTRACTED-NAME emits
-polygon(EXTRACTED-NAME) and is used when a preceding assignment was generated."
-  (let ((ref (or extracted-name source-name)))
-    (cond
-     ((and ref polyround)
-      (format "%spolygon(polyRound(%s, %s));\n"
-              indent ref (scad-sketch-session--fmt-num polyround)))
-     (ref
-      (format "%spolygon(%s);\n" indent ref))
-     (polyround
-      (format "%spolygon(polyRound(%s, %s));\n"
-              indent
-              (scad-sketch-session--fmt-inline-array points t)
-              (scad-sketch-session--fmt-num polyround)))
-     (t
-      (format "%spolygon(%s);\n"
-              indent
-              (scad-sketch-session--fmt-inline-array points nil))))))
+If SOURCE-NAME is non-nil, preserve the variable-reference style and emit
+polygon(SOURCE-NAME) or polygon(polyRound(SOURCE-NAME, FN)).
+
+Otherwise emit points inline, always.  Do not extract large inline polygons."
+  (cond
+   ((and source-name polyround)
+    (format "%spolygon(polyRound(%s, %s));\n"
+            indent
+            source-name
+            (scad-sketch-session--fmt-num polyround)))
+
+   (source-name
+    (format "%spolygon(%s);\n" indent source-name))
+
+   (polyround
+    (format "%spolygon(polyRound(%s, %s));\n"
+            indent
+            (scad-sketch-session--fmt-inline-array points t)
+            (scad-sketch-session--fmt-num polyround)))
+
+   (t
+    (format "%spolygon(%s);\n"
+            indent
+            (scad-sketch-session--fmt-inline-array points nil)))))
 
 ;;;; Session construction
 (defun scad-sketch-session--shape-initial-point (shape)
@@ -1018,14 +1029,20 @@ polygon(EXTRACTED-NAME) and is used when a preceding assignment was generated."
           &optional ast path root-node)
   "Create a sketch session.
 
-NAME is the display name.  SHAPES are editor objects.  TREE is the boolean/shape
-tree used for write-back.  TARGETS and ROOT-TARGET-ID define the write plan."
+NAME is the display name.  SHAPES are editor objects.  TREE is the shape/
+boolean/mirror tree used for write-back.  TARGETS and ROOT-TARGET-ID define
+the write plan.
+
+SHAPES may be nil for a newly inserted generic block."
   (let* ((active-shape
-          (or (cl-find-if (lambda (shape)
-                            (eq (scad-sketch-shape-id shape) active-shape-id))
-                          shapes)
+          (or (and active-shape-id
+                   (cl-find-if (lambda (shape)
+                                 (eq (scad-sketch-shape-id shape)
+                                     active-shape-id))
+                               shapes))
               (car shapes)))
-         (shape-id (and active-shape (scad-sketch-shape-id active-shape)))
+         (shape-id (and active-shape
+                        (scad-sketch-shape-id active-shape)))
          (points   (and active-shape
                         (eq (scad-sketch-shape-kind active-shape) 'polygon)
                         (copy-tree (or (scad-sketch-shape-points active-shape)
@@ -1038,7 +1055,9 @@ tree used for write-back.  TARGETS and ROOT-TARGET-ID define the write plan."
      :coarse-step (float scad-sketch-default-coarse-step)
      :closed (if active-shape (scad-sketch-shape-closed active-shape) t)
      :points points
-     :point (scad-sketch-session--shape-initial-point active-shape)
+     :point (if active-shape
+                (scad-sketch-session--shape-initial-point active-shape)
+              '(0.0 0.0))
      :marks nil
      :named-marks nil
      :selected-index (if points 0 nil)
@@ -1048,9 +1067,13 @@ tree used for write-back.  TARGETS and ROOT-TARGET-ID define the write plan."
      :targets targets
      :root-target-id root-target-id
      :selection nil
-     :focus-ref (if points
-                    (list :kind 'point :shape-id shape-id :index 0)
+     :focus-ref (cond
+                 (points
+                  (list :kind 'point :shape-id shape-id :index 0))
+                 (shape-id
                   (list :kind 'shape :shape-id shape-id))
+                 (t
+                  nil))
      :hover-index 0
      :source-buffer (current-buffer)
      :content-beg beg-marker
@@ -1159,6 +1182,45 @@ source region is replaced and its matrix can be flattened into editable shapes."
               (list (format "Unsupported scad-sketch form: %S"
                             (plist-get node :type))))))))
 
+(defun scad-sketch-session-insert-block-at-point ()
+  "Create an empty generic editable block at point and return its session.
+
+Unlike `scad-sketch-session-insert-array-at-point', this does not insert an
+array assignment.  It creates a zero-width root target.  Drawing commands can
+add shapes to the session, and write-back inserts the emitted shape tree at
+the original point."
+  (let* ((beg    (point-marker))
+         (end    (copy-marker (point) t))
+         (offset (1- (marker-position beg)))
+         (node   (list :type 'block
+                       :beg offset
+                       :end offset))
+         (target
+          (make-scad-sketch-target
+           :id 'root-0
+           :kind 'block
+           :role 'root
+           :node node
+           :source-node nil
+           :beg-marker beg
+           :end-marker end
+           :name "block"
+           :polyround nil
+           :write-p t
+           :metadata (list :inserted-block t))))
+    (scad-sketch-session--make-session
+     "block"
+     nil
+     nil
+     nil
+     (list target)
+     (scad-sketch-target-id target)
+     beg
+     end
+     nil
+     (list node)
+     node)))
+
 (defun scad-sketch-session-insert-array-at-point (name)
   "Insert a new empty array named NAME at point and return its session."
   (let (beg end node target shape tree)
@@ -1212,16 +1274,6 @@ source region is replaced and its matrix can be flattened into editable shapes."
   "Return SHAPE's source variable name, if any."
   (let ((target (scad-sketch-session--shape-source-target session shape)))
     (and target (scad-sketch-target-name target))))
-
-(defun scad-sketch-session--shape-extracted-name (shape)
-  "Return SHAPE's generated extraction name, if one exists."
-  (plist-get (scad-sketch-shape-metadata shape) :extracted-name))
-
-(defun scad-sketch-session--set-shape-extracted-name (shape name)
-  "Record NAME as SHAPE's generated extraction name."
-  (setf (scad-sketch-shape-metadata shape)
-        (plist-put (scad-sketch-shape-metadata shape)
-                   :extracted-name name)))
 
 (defun scad-sketch-session--emit-square-shape (shape indent)
   "Emit square SHAPE at INDENT."
@@ -1334,7 +1386,12 @@ source region is replaced and its matrix can be flattened into editable shapes."
      points indent polyround source)))
 
 (defun scad-sketch-session--emit-shape-with-assignments (session shape indent)
-  "Return (:assignments STR :call STR) for SHAPE in SESSION."
+  "Return (:assignments STR :call STR) for SHAPE in SESSION.
+
+Polygon source style is preserved:
+  - variable-reference polygons keep polygon(name)
+  - inline polygons stay inline
+  - newly created polygons are inline"
   (pcase (scad-sketch-shape-kind shape)
     ('circle
      (list :assignments ""
@@ -1351,51 +1408,46 @@ source region is replaced and its matrix can be flattened into editable shapes."
     ('polygon
      (let* ((shape-points (scad-sketch-shape-points shape))
             (polyround    (scad-sketch-shape-polyround shape))
+            ;; This intentionally returns non-nil only for true source-target
+            ;; variable refs.  Flattened/transformed refs and created polygons
+            ;; have no source target and therefore emit inline.
             (source       (scad-sketch-session--shape-source-name session shape)))
-       (cond
-        (source
-         (list :assignments ""
-               :call (scad-sketch-session--emit-polygon-call
-                      shape-points indent polyround source)))
-
-        ((<= (length shape-points) scad-sketch-session-inline-polygon-threshold)
-         (list :assignments ""
-               :call (scad-sketch-session--emit-polygon-call
-                      shape-points indent polyround)))
-
-        (t
-         (let ((name (or (scad-sketch-session--shape-extracted-name shape)
-                         (scad-sketch-session--unique-sketch-name session))))
-           (scad-sketch-session--set-shape-extracted-name shape name)
-           (list :assignments
-                 (scad-sketch-session--emit-array-assignment
-                  name shape-points "" polyround)
-                 :call
-                 (scad-sketch-session--emit-polygon-call
-                  shape-points indent polyround nil name)))))))
+       (list :assignments ""
+             :call (scad-sketch-session--emit-polygon-call
+                    shape-points indent polyround source))))
 
     (_
      (list :assignments "" :call ""))))
 
 (defun scad-sketch-session--emit-tree (session tree indent)
   "Emit TREE for SESSION at INDENT."
-  (pcase (plist-get tree :kind)
+  (pcase (and tree (plist-get tree :kind))
     ('shape
      (let* ((shape-id (plist-get tree :shape-id))
-            (shape (scad-sketch-session-shape-by-id session shape-id))
-            (emitted (scad-sketch-session--emit-shape-with-assignments
-                      session shape indent)))
-       (concat (plist-get emitted :assignments)
-               (plist-get emitted :call))))
+            (shape    (scad-sketch-session-shape-by-id session shape-id))
+            (emitted  (and shape
+                            (scad-sketch-session--emit-shape-with-assignments
+                             session shape indent))))
+       (if emitted
+           (concat (plist-get emitted :assignments)
+                   (plist-get emitted :call))
+         "")))
+
+    ('sequence
+     (mapconcat (lambda (child)
+                  (scad-sketch-session--emit-tree session child indent))
+                (plist-get tree :children)
+                ""))
 
     ('boolean
-     (let ((op (plist-get tree :op))
+     (let ((op       (plist-get tree :op))
            (children (plist-get tree :children))
-           (body ""))
+           (body     ""))
        (dolist (child children)
-         (let ((emitted (scad-sketch-session--emit-tree
-                         session child (concat indent "  "))))
-           (setq body (concat body emitted))))
+         (setq body
+               (concat body
+                       (scad-sketch-session--emit-tree
+                        session child (concat indent "  ")))))
        (format "%s%s() {\n%s%s}\n"
                indent op body indent)))
 

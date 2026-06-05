@@ -610,6 +610,35 @@ default to radius 0."
     (mapcar #'scad-sketch--make-model-point
             (append marks (list point)))))
 
+(defun scad-sketch-draw-text-at-point (text size font)
+  "Draw a text primitive at the current cursor point.
+
+TEXT is the string.  SIZE is the OpenSCAD text size.  FONT may be empty/nil."
+  (interactive
+   (let* ((text (read-string "Text: "))
+          (size (read-number "Text size: " 10.0))
+          (font (when (fboundp 'scad-sketch--available-font-families)
+                  (completing-read
+                   "Font family (empty for default): "
+                   (scad-sketch--available-font-families)
+                   nil nil ""))))
+     (list text size (and font (not (string-empty-p font)) font))))
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((pt       (scad-sketch-session-point s))
+            (shape-id (scad-sketch-session-next-shape-id s))
+            (shape
+             (scad-sketch-session--make-text-shape
+              shape-id
+              text
+              (nth 0 pt)
+              (nth 1 pt)
+              size
+              0.0
+              font
+              (list :created-in-session t))))
+       (scad-sketch--add-drawn-shape s shape)))))
+
 (defun scad-sketch-draw-square-from-marks ()
   "Draw a square/rectangle primitive from marks and cursor point.
 
@@ -1042,6 +1071,173 @@ The new mirror uses default normal vector [1, 0].  Use
         (scad-sketch--mirror-ref mirror-id))))))
 
 ;;; Focus/selection commands
+(defun scad-sketch--tree-contains-shape-for-break-p (tree shape-id)
+  "Return non-nil if TREE contains SHAPE-ID."
+  (pcase (and tree (plist-get tree :kind))
+    ('shape
+     (eq (plist-get tree :shape-id) shape-id))
+    ('boolean
+     (cl-some (lambda (child)
+                (scad-sketch--tree-contains-shape-for-break-p child shape-id))
+              (plist-get tree :children)))
+    ('mirror
+     (scad-sketch--tree-contains-shape-for-break-p
+      (plist-get tree :child)
+      shape-id))
+    ('sequence
+     (cl-some (lambda (child)
+                (scad-sketch--tree-contains-shape-for-break-p child shape-id))
+              (plist-get tree :children)))
+    (_ nil)))
+
+(defun scad-sketch--deepest-boolean-containing-shape-for-break
+    (tree shape-id)
+  "Return deepest boolean node in TREE containing SHAPE-ID, or nil."
+  (when (scad-sketch--tree-contains-shape-for-break-p tree shape-id)
+    (pcase (and tree (plist-get tree :kind))
+      ('boolean
+       (or (cl-some
+            (lambda (child)
+              (scad-sketch--deepest-boolean-containing-shape-for-break
+               child shape-id))
+            (plist-get tree :children))
+           tree))
+      ('mirror
+       (scad-sketch--deepest-boolean-containing-shape-for-break
+        (plist-get tree :child)
+        shape-id))
+      ('sequence
+       (cl-some
+        (lambda (child)
+          (scad-sketch--deepest-boolean-containing-shape-for-break
+           child shape-id))
+        (plist-get tree :children)))
+      (_ nil))))
+
+(defun scad-sketch--current-breakable-group-ref (session)
+  "Return the current boolean/mirror group ref to break apart."
+  (let* ((ref  (scad-sketch--attention-ref session))
+         (kind (and ref (scad-sketch--ref-kind ref))))
+    (pcase kind
+      ('boolean
+       ref)
+
+      ('mirror
+       ref)
+
+      ('mirror-point
+       (scad-sketch--mirror-ref (scad-sketch--ref-mirror-id ref)))
+
+      ((or 'shape 'point)
+       (let* ((shape-id (scad-sketch--ref-shape-id ref))
+              (group
+               (and shape-id
+                    (scad-sketch--deepest-boolean-containing-shape-for-break
+                     (scad-sketch-session-tree session)
+                     shape-id))))
+         (when group
+           (list :kind 'boolean
+                 :group-id (plist-get group :group-id)))))
+
+      (_ nil))))
+
+(defun scad-sketch--tree-break-ref (tree ref)
+  "Return TREE with boolean/mirror REF broken apart.
+
+A matched boolean node is replaced by its children.  A matched mirror node is
+replaced by its child.  If breaking a root node yields multiple children, the
+new root is a sequence node."
+  (let ((changed nil))
+    (cl-labels
+        ((match-p
+          (node)
+          (pcase (and node (plist-get node :kind))
+            ('boolean
+             (and (eq (scad-sketch--ref-kind ref) 'boolean)
+                  (equal (plist-get node :group-id)
+                         (plist-get ref :group-id))))
+            ('mirror
+             (and (eq (scad-sketch--ref-kind ref) 'mirror)
+                  (eq (plist-get node :mirror-id)
+                      (scad-sketch--ref-mirror-id ref))))
+            (_ nil)))
+
+         (walk-list
+          (nodes)
+          (apply #'append (mapcar #'walk nodes)))
+
+         (walk
+          (node)
+          (cond
+           ((null node)
+            nil)
+
+           ((match-p node)
+            (setq changed t)
+            (pcase (plist-get node :kind)
+              ('boolean (plist-get node :children))
+              ('mirror  (list (plist-get node :child)))))
+
+           (t
+            (pcase (plist-get node :kind)
+              ('boolean
+               (list
+                (plist-put
+                 (copy-sequence node)
+                 :children
+                 (walk-list (plist-get node :children)))))
+
+              ('mirror
+               (let ((children (walk (plist-get node :child))))
+                 (cond
+                  ((null children) nil)
+                  ((null (cdr children))
+                   (list (plist-put
+                          (copy-sequence node)
+                          :child (car children))))
+                  (t
+                   (list (plist-put
+                          (copy-sequence node)
+                          :child
+                          (scad-sketch-session--tree-sequence children)))))))
+
+              ('sequence
+               (list
+                (plist-put
+                 (copy-sequence node)
+                 :children
+                 (walk-list (plist-get node :children)))))
+
+              (_
+               (list node)))))))
+      (let ((children (walk tree)))
+        (unless changed
+          (user-error "No breakable group found"))
+        (cond
+         ((null children) nil)
+         ((null (cdr children)) (car children))
+         (t (scad-sketch-session--tree-sequence children)))))))
+
+(defun scad-sketch-break-apart-group ()
+  "Break apart the currently attended boolean or mirror group.
+
+If attention is on a shape inside a boolean group, breaks the deepest boolean
+group containing that shape.  If attention is on a mirror axis/handle, removes
+the mirror wrapper."
+  (interactive)
+  (scad-sketch--edit
+   (lambda (s)
+     (let ((ref (scad-sketch--current-breakable-group-ref s)))
+       (unless ref
+         (user-error "No boolean or mirror group to break apart"))
+       (setf (scad-sketch-session-tree s)
+             (scad-sketch--tree-break-ref
+              (scad-sketch-session-tree s)
+              ref))
+       (setf (scad-sketch-session-selection s) nil)
+       (setf (scad-sketch-session-focus-ref s) nil)
+       (setf (scad-sketch-session-hover-index s) 0)))))
+
 (defun scad-sketch--set-focus-ref (session ref)
   "Set SESSION global focus to REF and move cursor to REF's anchor.
 

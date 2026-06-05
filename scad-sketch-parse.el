@@ -970,42 +970,15 @@ Returns the source string."
     name))
 
 (defun scad-sketch-unparse-top-level (nodes)
-  "Unparse a list of top-level NODES to an OpenSCAD source string.
-Handles extraction of large polygons to named assignments."
-  ;; First pass: collect polygons that need extraction and assign names.
-  (let ((extracted (make-hash-table :test 'eq))
-        (counters  (make-hash-table :test 'equal))
-        (used-names (scad-sketch-parse--collect-array-names nodes))
-        result)
-    (dolist (node nodes)
-      (scad-sketch-parse--walk
-       node
-       (lambda (n)
-         (when (eq (plist-get n :type) 'polygon)
-           (let* ((pts  (plist-get n :points))
-                  (src  (plist-get n :source))
-                  (n-pts (length (or pts '()))))
-             (when (and (null src) (> n-pts scad-sketch-inline-threshold))
-               (unless (gethash n extracted)
-                 (puthash n (scad-sketch-parse--fresh-extracted-name
-                             used-names counters)
-                          extracted))))))))
-    ;; Second pass: emit extracted assignments first, then the shapes.
-    ;; Build a list of (name . points) for all extracted polygons.
-    (let (extractions)
-      (maphash (lambda (node name)
-                 (push (cons name (plist-get node :points)) extractions))
-               extracted)
-      ;; Emit array assignments for extracted polygons.
-      (dolist (ext (sort extractions (lambda (a b) (string< (car a) (car b)))))
-        (push (format "%s = %s;
-" (car ext)
-                      (scad-sketch-parse--fmt-array (cdr ext)))
-              result))
-      ;; Emit the shapes, with extracted polygons using their names.
-      (dolist (node nodes)
-        (push (scad-sketch-unparse node 0 extracted) result))
-      (mapconcat #'identity (nreverse result) ""))))
+  "Unparse a list of top-level NODES to OpenSCAD source.
+
+Preserve polygon source style.  Inline polygons remain inline; variable-ref
+polygons remain variable refs.  No automatic extraction is performed."
+  (let ((extracted (make-hash-table :test 'eq)))
+    (mapconcat (lambda (node)
+                 (scad-sketch-unparse node 0 extracted))
+               nodes
+               "")))
 
 (provide 'scad-sketch-parse)
 ;;; scad-sketch-parse.el ends here
