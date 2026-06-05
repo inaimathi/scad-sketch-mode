@@ -89,6 +89,12 @@
           (scad-sketch--fmt-num (nth 1 xy))))
 
 ;;;; ── Bounds and coordinate transform ────────────────────────────────────────
+(defun scad-sketch--transform-xy-points (matrix xy-points)
+  "Apply affine MATRIX to XY-POINTS."
+  (mapcar (lambda (xy)
+            (scad-sketch-session--mat-apply matrix xy))
+          xy-points))
+
 (defun scad-sketch--mirror-transform (mx my transform)
   "Return a transform closure that mirrors model XY before TRANSFORM."
   (let ((m (scad-sketch-session--mat-mirror mx my)))
@@ -132,41 +138,83 @@
           (apply #'max ys))))
 
 (defun scad-sketch--shape-xy-points (shape)
-  "Return representative XY points for SHAPE (for bounds computation only)."
+  "Return representative XY points for SHAPE, for bounds computation."
   (pcase (scad-sketch-shape-kind shape)
     ('polygon
-     (mapcar #'scad-sketch--point-xy (scad-sketch-shape-points shape)))
+     (mapcar #'scad-sketch--point-xy
+             (scad-sketch-shape-points shape)))
+
     ('circle
-     (let ((b (scad-sketch--circle-bounds shape)))
-       (list (list (nth 0 b) (nth 2 b))
-             (list (nth 1 b) (nth 3 b)))))
+     (let* ((md (scad-sketch-shape-metadata shape))
+            (cx (float (or (plist-get md :cx) 0.0)))
+            (cy (float (or (plist-get md :cy) 0.0)))
+            (r  (float (or (plist-get md :r) 0.0))))
+       (list (list (- cx r) cy)
+             (list (+ cx r) cy)
+             (list cx (- cy r))
+             (list cx (+ cy r)))))
+
     ('square
      (scad-sketch--square-corner-points shape))
+
     ('text
      (pcase-let ((`(,min-x ,max-x ,min-y ,max-y)
                   (scad-sketch--text-rough-bounds shape)))
        (list (list min-x min-y)
-             (list max-x max-y))))
+             (list max-x min-y)
+             (list max-x max-y)
+             (list min-x max-y))))
+
     (_ nil)))
 
 (defun scad-sketch--bounds (session)
-  "Return (MIN-X MAX-X MIN-Y MAX-Y) covering all shapes, marks, and cursor."
+  "Return (MIN-X MAX-X MIN-Y MAX-Y) covering the visible sketch scene.
+
+Bounds include:
+  - source-side editable shapes
+  - semantic tree preview geometry, including mirrored output
+  - mirror axis handles
+  - marks
+  - cursor point"
   (scad-sketch-session-sync-active-shape-from-points session)
-  (let* ((shape-points
+  (let* ((source-shape-points
           (apply #'append
                  (mapcar #'scad-sketch--shape-xy-points
                          (scad-sketch-session-shapes session))))
-         (extra (delq nil (cons (scad-sketch-session-point session)
-                                (scad-sketch-session-marks session))))
-         (all   (append shape-points extra)))
+
+         ;; This is the important part for mirror support.  The mirrored object
+         ;; is not present in `session-shapes'; it only exists through the tree.
+         (tree-points
+          (scad-sketch--tree-xy-points
+           session
+           (scad-sketch-session-tree session)))
+
+         (mirror-handle-points
+          (scad-sketch--mirror-handle-xy-points session))
+
+         (extra
+          (delq nil
+                (cons (scad-sketch-session-point session)
+                      (scad-sketch-session-marks session))))
+
+         (all
+          (append source-shape-points
+                  tree-points
+                  mirror-handle-points
+                  extra)))
+
     (if (null all)
         (list -10 10 -10 10)
       (let ((min-x (apply #'min (mapcar #'car  all)))
             (max-x (apply #'max (mapcar #'car  all)))
             (min-y (apply #'min (mapcar #'cadr all)))
             (max-y (apply #'max (mapcar #'cadr all))))
-        (when (= min-x max-x) (setq min-x (- min-x 10) max-x (+ max-x 10)))
-        (when (= min-y max-y) (setq min-y (- min-y 10) max-y (+ max-y 10)))
+        (when (= min-x max-x)
+          (setq min-x (- min-x 10)
+                max-x (+ max-x 10)))
+        (when (= min-y max-y)
+          (setq min-y (- min-y 10)
+                max-y (+ max-y 10)))
         (let ((px (max 1 (* 0.15 (- max-x min-x))))
               (py (max 1 (* 0.15 (- max-y min-y)))))
           (list (- min-x px) (+ max-x px)
@@ -282,6 +330,41 @@
   (let ((root (scad-sketch-session-root-target session)))
     (and root (eq (scad-sketch-target-kind root) 'boolean))))
 
+(defun scad-sketch--tree-xy-points (session tree &optional matrix)
+  "Return representative model-space XY points for TREE.
+
+Unlike `scad-sketch-session-shapes', TREE includes semantic preview geometry
+such as mirror output.  MATRIX is an accumulated model-space affine transform."
+  (let ((matrix (or matrix (scad-sketch-session--mat-identity))))
+    (pcase (and tree (plist-get tree :kind))
+      ('shape
+       (let ((shape (scad-sketch-session-shape-by-id
+                     session (plist-get tree :shape-id))))
+         (if shape
+             (scad-sketch--transform-xy-points
+              matrix
+              (scad-sketch--shape-xy-points shape))
+           nil)))
+
+      ('boolean
+       (apply #'append
+              (mapcar (lambda (child)
+                        (scad-sketch--tree-xy-points session child matrix))
+                      (plist-get tree :children))))
+
+      ('mirror
+       (let* ((mx (float (or (plist-get tree :mx) 1.0)))
+              (my (float (or (plist-get tree :my) 0.0)))
+              (mirror-matrix (scad-sketch-session--mat-mirror mx my))
+              (next-matrix   (scad-sketch-session--mat-mul
+                              matrix mirror-matrix)))
+         (scad-sketch--tree-xy-points
+          session
+          (plist-get tree :child)
+          next-matrix)))
+
+      (_ nil))))
+
 (defun scad-sketch--tree-path-ds (session transform tree)
   "Return all SVG path-data strings for shape leaves in TREE.
 
@@ -341,6 +424,17 @@ For mirror nodes, returns the mirrored output paths."
 ;;
 ;; This is the core primitive for all boolean preview rendering.
 ;; See the Commentary section for the explanation of why this works.
+(defun scad-sketch--mirror-handle-xy-points (session)
+  "Return model-space XY points for all mirror handles in SESSION."
+  (let (points)
+    (dolist (mirror (scad-sketch-session--tree-mirrors
+                     (scad-sketch-session-tree session)))
+      (dotimes (idx 2)
+        (let ((xy (scad-sketch--mirror-handle-xy session mirror idx)))
+          (when xy
+            (push xy points)))))
+    (nreverse points)))
+
 (defun scad-sketch--draw-mirror-axis (svg transform session mirror)
   "Draw MIRROR axis and editable normal handles."
   (let* ((mirror-id (plist-get mirror :mirror-id))
