@@ -103,14 +103,29 @@
     ('circle
      (let* ((md (scad-sketch-shape-metadata shape))
             (cx (float (or (plist-get md :cx) 0.0)))
-            (cy (float (or (plist-get md :cy) 0.0)))
-            (dx (- (nth 0 xy) cx))
-            (dy (- (nth 1 xy) cy))
-            (r  (sqrt (+ (* dx dx) (* dy dy)))))
-       (setq md (plist-put md :r (max 0.0001 r)))
-       (setf (scad-sketch-shape-metadata shape) md)))
+            (cy (float (or (plist-get md :cy) 0.0))))
+       (if (= idx 0)
+           (progn
+             (setq md (plist-put md :cx (nth 0 xy)))
+             (setq md (plist-put md :cy (nth 1 xy)))
+             (setf (scad-sketch-shape-metadata shape) md))
+         (let* ((dx (- (nth 0 xy) cx))
+                (dy (- (nth 1 xy) cy))
+                (r  (sqrt (+ (* dx dx) (* dy dy)))))
+           (setq md (plist-put md :r (max 0.0001 r)))
+           (setf (scad-sketch-shape-metadata shape) md)))))
     ('square
-     (scad-sketch--move-square-corner-to shape idx xy))
+     (if (= idx 4)
+         (let* ((old-center (scad-sketch--square-center shape))
+                (dx (- (nth 0 xy) (nth 0 old-center)))
+                (dy (- (nth 1 xy) (nth 1 old-center))))
+           (scad-sketch--move-shape shape dx dy))
+       (scad-sketch--move-square-corner-to shape idx xy)))
+    ('text
+     (let ((md (scad-sketch-shape-metadata shape)))
+       (setq md (plist-put md :x (nth 0 xy)))
+       (setq md (plist-put md :y (nth 1 xy)))
+       (setf (scad-sketch-shape-metadata shape) md)))
     (_
      (user-error "Selected point is not editable for this shape"))))
 
@@ -505,9 +520,10 @@ An empty FONT clears the explicit font."
        (setf (scad-sketch-shape-metadata shape) md)))))
 
 ;;; Focus/selection commands
-
 (defun scad-sketch--set-focus-ref (session ref)
-  "Set SESSION focus to REF and move cursor to REF's anchor."
+  "Set SESSION global focus to REF and move cursor to REF's anchor.
+
+This is used by global selectable cycling, not by hover cycling."
   (setf (scad-sketch-session-focus-ref session) ref)
   (when (scad-sketch--ref-shape-id ref)
     (scad-sketch-session-set-active-shape
@@ -521,7 +537,9 @@ An empty FONT clears the explicit font."
     (setf (scad-sketch-session-selected-index session) nil)))
 
 (defun scad-sketch--cycle-selectable (delta)
-  "Cycle focus by DELTA through all selectable refs."
+  "Cycle global focus by DELTA through all selectable refs.
+
+Unlike hover cycling, this moves the editor cursor to the selected ref's anchor."
   (scad-sketch--clean-change
    (lambda (s)
      (let* ((refs  (scad-sketch--selectable-refs s))
@@ -545,7 +563,9 @@ An empty FONT clears the explicit font."
   (scad-sketch--cycle-selectable -1))
 
 (defun scad-sketch--cycle-hovered (delta)
-  "Cycle attention by DELTA among hovered refs under point."
+  "Cycle hover by DELTA among refs under the cursor point.
+
+This does not move the cursor and does not update global focus."
   (scad-sketch--clean-change
    (lambda (s)
      (let* ((candidates (scad-sketch--hover-candidates s))

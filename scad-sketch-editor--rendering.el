@@ -680,69 +680,112 @@ When SUPPRESS-STROKE is non-nil, skip path stroke; vertex dots still drawn."
 
 (defun scad-sketch--draw-one-circle-shape (svg transform session shape
                                                &optional suppress-stroke)
-  "Draw circle SHAPE editor overlay, including its radius handle."
-  (let* ((shape-id    (scad-sketch-shape-id shape))
-         (md          (scad-sketch-shape-metadata shape))
-         (center      (list (plist-get md :cx) (plist-get md :cy)))
-         (r           (plist-get md :r))
-         (screen      (funcall transform center))
-         (pr          (scad-sketch--pixel-radius r transform))
-         (handle-ref  (scad-sketch--point-ref 0 shape-id))
-         (handle-xy   (scad-sketch--primitive-handle-xy shape 0))
-         (handle-s    (funcall transform handle-xy))
-         (shape-sel   (scad-sketch--shape-selected-p session shape-id))
-         (handle-sel  (scad-sketch--point-selected-p session shape-id 0))
-         (attention   (scad-sketch--attention-ref session))
-         (shape-attn  (and attention
-                           (eq (scad-sketch--ref-kind attention) 'shape)
-                           (eq (scad-sketch--ref-shape-id attention) shape-id)))
-         (handle-attn (and attention
-                           (scad-sketch--same-ref-p attention handle-ref)))
+  "Draw circle SHAPE editor overlay, including center and radius handles.
+
+Circle handle indices:
+  0 center
+  1 east radius
+  2 north radius
+  3 west radius
+  4 south radius"
+  (let* ((shape-id     (scad-sketch-shape-id shape))
+         (md           (scad-sketch-shape-metadata shape))
+         (center       (list (float (or (plist-get md :cx) 0.0))
+                             (float (or (plist-get md :cy) 0.0))))
+         (r            (float (or (plist-get md :r) 0.0)))
+         (screen       (funcall transform center))
+         (pr           (scad-sketch--pixel-radius r transform))
+         (shape-sel    (scad-sketch--shape-selected-p session shape-id))
+         (attention    (scad-sketch--attention-ref session))
+         (shape-attn   (and attention
+                            (eq (scad-sketch--ref-kind attention) 'shape)
+                            (eq (scad-sketch--ref-shape-id attention) shape-id)))
          (active-shape (eq shape-id
-                           (scad-sketch-session-active-shape-id session))))
+                           (scad-sketch-session-active-shape-id session)))
+         (boolean-session (scad-sketch--root-is-boolean-p session))
+         (ghosted      (and boolean-session
+                            (not shape-sel)
+                            (not shape-attn)
+                            (not active-shape)))
+         (stroke       (cond (shape-sel    "#d13f00")
+                             (shape-attn   "#0057c2")
+                             (active-shape "#333333")
+                             (ghosted      "#9a9a9a")
+                             (t            "#777777"))))
+
+    ;; Circle outline.
     (unless suppress-stroke
-      (let* ((boolean-session (scad-sketch--root-is-boolean-p session))
-             (ghosted (and boolean-session
-                           (not shape-sel)
-                           (not shape-attn)
-                           (not active-shape)))
-             (stroke  (cond (shape-sel    "#d13f00")
-                            (shape-attn   "#0057c2")
-                            (active-shape "#333333")
-                            (ghosted      "#9a9a9a")
-                            (t            "#777777"))))
-        (svg-circle svg (nth 0 screen) (nth 1 screen) pr
-                    :stroke stroke
-                    :stroke-width (cond (shape-sel 5) (shape-attn 4) (t 2))
-                    :stroke-dasharray (if ghosted "6,4" nil)
-                    :fill "none")))
-    (scad-sketch--svg-line svg transform center handle-xy
-                           :stroke "#777777"
-                           :stroke-width 1
-                           :stroke-dasharray "3,3")
-    (svg-circle svg (nth 0 screen) (nth 1 screen)
-                (cond (shape-sel 8) (shape-attn 7) (active-shape 6) (t 5))
-                :stroke (cond (shape-sel    "#d13f00")
-                              (shape-attn   "#0057c2")
-                              (active-shape "#333333")
-                              (t            "#777777"))
-                :stroke-width 2
-                :fill "#ffffff")
-    (svg-circle svg (nth 0 handle-s) (nth 1 handle-s)
-                (cond (handle-sel 8) (handle-attn 7) (active-shape 6) (t 5))
-                :stroke (cond (handle-sel  "#d13f00")
-                              (handle-attn "#0057c2")
-                              (active-shape "#333333")
-                              (t "#777777"))
-                :stroke-width 2
-                :fill (cond (handle-sel  "#fff0e8")
-                            (handle-attn "#dfefff")
-                            (t "#f8f8f8")))
-    (svg-text svg (format "%s:r=%s" shape-id (scad-sketch--fmt-num r))
-              :x (+ (nth 0 handle-s) 8)
-              :y (- (nth 1 handle-s) 8)
-              :font-size 11
-              :fill "#333333")))
+      (svg-circle svg (nth 0 screen) (nth 1 screen) pr
+                  :stroke stroke
+                  :stroke-width (cond (shape-sel 5)
+                                      (shape-attn 4)
+                                      (active-shape 3)
+                                      (t 2))
+                  :stroke-dasharray (if ghosted "6,4" nil)
+                  :fill "none"))
+
+    ;; Radius guide lines.  Draw these even when the outline is suppressed,
+    ;; because they are interactive handles rather than semantic boolean strokes.
+    (dotimes (idx 4)
+      (let ((handle-xy (scad-sketch--primitive-handle-xy shape (1+ idx))))
+        (when handle-xy
+          (scad-sketch--svg-line svg transform center handle-xy
+                                 :stroke "#999999"
+                                 :stroke-width 1
+                                 :stroke-dasharray "3,3"))))
+
+    ;; Center + radius handles.
+    (dotimes (idx (scad-sketch--primitive-handle-count shape))
+      (let* ((handle-xy  (scad-sketch--primitive-handle-xy shape idx))
+             (handle-ref (scad-sketch--point-ref idx shape-id)))
+        (when handle-xy
+          (let* ((handle-s (funcall transform handle-xy))
+                 (sel      (scad-sketch--point-selected-p session shape-id idx))
+                 (attn     (and attention
+                                (scad-sketch--same-ref-p attention handle-ref)))
+                 (is-center (= idx 0))
+                 (radius   (cond (sel 8)
+                                 (attn 7)
+                                 (active-shape 6)
+                                 (is-center 5)
+                                 (t 5)))
+                 (handle-stroke
+                  (cond (sel "#d13f00")
+                        (attn "#0057c2")
+                        (active-shape "#333333")
+                        (is-center "#555555")
+                        (t "#777777")))
+                 (handle-fill
+                  (cond (sel "#fff0e8")
+                        (attn "#dfefff")
+                        (is-center "#ffffff")
+                        (t "#f8f8f8"))))
+            (svg-circle svg
+                        (nth 0 handle-s)
+                        (nth 1 handle-s)
+                        radius
+                        :stroke handle-stroke
+                        :stroke-width 2
+                        :fill handle-fill)
+            (svg-text svg
+                      (if is-center
+                          (format "%s:center" shape-id)
+                        (format "%s:r%d" shape-id idx))
+                      :x (+ (nth 0 handle-s) 8)
+                      :y (- (nth 1 handle-s) 8)
+                      :font-size 11
+                      :fill "#333333")))))
+
+    ;; Radius label, placed near the east radius handle if available.
+    (let ((east (scad-sketch--primitive-handle-xy shape 1)))
+      (when east
+        (let ((east-s (funcall transform east)))
+          (svg-text svg
+                    (format "r=%s" (scad-sketch--fmt-num r))
+                    :x (+ (nth 0 east-s) 8)
+                    :y (+ (nth 1 east-s) 16)
+                    :font-size 11
+                    :fill "#333333"))))))
 
 (defun scad-sketch--draw-one-text-shape (svg transform session shape
                                              &optional suppress-stroke)

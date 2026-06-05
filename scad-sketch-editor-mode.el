@@ -25,7 +25,6 @@
 (require 'scad-sketch-editor--rendering)
 
 ;;; Keymap
-
 (defvar scad-sketch-editor-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
@@ -44,7 +43,7 @@
     (define-key map (kbd "C-<up>")      #'scad-sketch-move-point-coarse-up)
     (define-key map (kbd "C-<down>")    #'scad-sketch-move-point-coarse-down)
 
-    ;; ── Selected vertex movement ──────────────────────────────────────
+    ;; ── Selected vertex / primitive handle movement ──────────────────
     (define-key map (kbd "S-<left>")    #'scad-sketch-move-selected-left)
     (define-key map (kbd "S-<right>")   #'scad-sketch-move-selected-right)
     (define-key map (kbd "S-<up>")      #'scad-sketch-move-selected-up)
@@ -74,11 +73,18 @@
     (define-key map (kbd "c")           #'scad-sketch-toggle-closed)
     (define-key map (kbd "R")           #'scad-sketch-set-radius)
 
-    ;; ── Focus / selection ─────────────────────────────────────────────
-    (define-key map (kbd "TAB")         #'scad-sketch-next-selectable)
-    (define-key map (kbd "<backtab>")   #'scad-sketch-previous-selectable)
+    ;; ── Hover / focus / selection ─────────────────────────────────────
+    ;; TAB cycles the hovered stack under the cursor.
+    (define-key map (kbd "TAB")         #'scad-sketch-next-hovered)
+    (define-key map (kbd "<backtab>")   #'scad-sketch-previous-hovered)
     (define-key map (kbd ".")           #'scad-sketch-next-hovered)
     (define-key map (kbd ",")           #'scad-sketch-previous-hovered)
+
+    ;; M-TAB keeps the old global selectable cycle behavior.
+    (define-key map (kbd "M-TAB")       #'scad-sketch-next-selectable)
+    (define-key map (kbd "C-M-i")       #'scad-sketch-next-selectable)
+    (define-key map (kbd "M-<backtab>") #'scad-sketch-previous-selectable)
+
     (define-key map (kbd "SPC")         #'scad-sketch-toggle-attention-selection)
     (define-key map (kbd "s")           #'scad-sketch-clear-selection)
 

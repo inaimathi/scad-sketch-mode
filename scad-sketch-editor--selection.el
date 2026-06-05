@@ -81,17 +81,16 @@
 
 (defun scad-sketch--shape-center (session &optional shape-id)
   "Return the model-space center of SHAPE-ID in SESSION."
-  (let ((shape (or (and shape-id
+  (let ((shape (or (and session shape-id
                         (scad-sketch-session-shape-by-id session shape-id))
-                   (scad-sketch-session-active-shape session))))
+                   (and session
+                        (scad-sketch-session-active-shape session)))))
     (pcase (and shape (scad-sketch-shape-kind shape))
       ('circle
        (let ((md (scad-sketch-shape-metadata shape)))
          (list (plist-get md :cx) (plist-get md :cy))))
       ('square
-       (let ((pts (scad-sketch--square-corner-points shape)))
-         (list (/ (+ (nth 0 (nth 0 pts)) (nth 0 (nth 2 pts))) 2.0)
-               (/ (+ (nth 1 (nth 0 pts)) (nth 1 (nth 2 pts))) 2.0))))
+       (scad-sketch--square-center shape))
       ('text
        (pcase-let ((`(,min-x ,max-x ,min-y ,max-y)
                     (scad-sketch--text-rough-bounds shape)))
@@ -160,10 +159,16 @@
                     (scad-sketch--point-in-polygon-p p points))))))
       (_ nil))))
 
+(defun scad-sketch--square-center (shape)
+  "Return model-space center point for square SHAPE."
+  (let ((pts (scad-sketch--square-corner-points shape)))
+    (list (/ (+ (nth 0 (nth 0 pts)) (nth 0 (nth 2 pts))) 2.0)
+          (/ (+ (nth 1 (nth 0 pts)) (nth 1 (nth 2 pts))) 2.0))))
+
 (defun scad-sketch--square-corner-points (shape)
   "Return square SHAPE corner points in model coordinates.
 
-Corners are ordered like a polygon:
+Corners are ordered:
   0 lower-left/origin, 1 lower-right, 2 upper-right, 3 upper-left."
   (let* ((md    (scad-sketch-shape-metadata shape))
          (x     (float (or (plist-get md :x) 0.0)))
@@ -185,24 +190,46 @@ Corners are ordered like a polygon:
     (list p0 p1 p2 p3)))
 
 (defun scad-sketch--primitive-handle-count (shape)
-  "Return the number of point-like handles for primitive SHAPE."
+  "Return the number of point-like handles for primitive SHAPE.
+
+Circle handles:
+  0 center, 1 east radius, 2 north radius, 3 west radius, 4 south radius.
+
+Square handles:
+  0..3 corners, 4 center.
+
+Text handles:
+  0 text origin."
   (pcase (scad-sketch-shape-kind shape)
-    ('circle 1)
-    ('square 4)
+    ('circle 5)
+    ('square 5)
+    ('text   1)
     (_ 0)))
 
 (defun scad-sketch--primitive-handle-xy (shape idx)
   "Return model-space XY for primitive SHAPE handle IDX, or nil."
   (pcase (scad-sketch-shape-kind shape)
     ('circle
-     (when (= idx 0)
-       (let* ((md (scad-sketch-shape-metadata shape))
-              (cx (float (or (plist-get md :cx) 0.0)))
-              (cy (float (or (plist-get md :cy) 0.0)))
-              (r  (float (or (plist-get md :r) 0.0))))
-         (list (+ cx r) cy))))
+     (let* ((md (scad-sketch-shape-metadata shape))
+            (cx (float (or (plist-get md :cx) 0.0)))
+            (cy (float (or (plist-get md :cy) 0.0)))
+            (r  (float (or (plist-get md :r) 0.0))))
+       (pcase idx
+         (0 (list cx cy))
+         (1 (list (+ cx r) cy))
+         (2 (list cx (+ cy r)))
+         (3 (list (- cx r) cy))
+         (4 (list cx (- cy r)))
+         (_ nil))))
     ('square
-     (nth idx (scad-sketch--square-corner-points shape)))
+     (if (= idx 4)
+         (scad-sketch--square-center shape)
+       (nth idx (scad-sketch--square-corner-points shape))))
+    ('text
+     (when (= idx 0)
+       (let ((md (scad-sketch-shape-metadata shape)))
+         (list (float (or (plist-get md :x) 0.0))
+               (float (or (plist-get md :y) 0.0))))))
     (_ nil)))
 
 (defun scad-sketch--text-rough-bounds (shape)
@@ -220,7 +247,7 @@ Corners are ordered like a polygon:
   "Return hovered refs under SESSION's current point.
 
 Point refs are listed before shape refs so exact vertex/handle hovers take
-attention priority over the containing shape."
+attention priority over containing shapes."
   (let ((p          (scad-sketch-session-point session))
         (r          (scad-sketch--hover-radius session))
         candidates)
@@ -233,7 +260,7 @@ attention priority over the containing shape."
                     for xy = (scad-sketch--point-xy model-point)
                     when (<= (scad-sketch--distance p xy) r)
                     do (push (scad-sketch--point-ref idx shape-id) candidates)))
-          ((or 'circle 'square)
+          ((or 'circle 'square 'text)
            (dotimes (idx (scad-sketch--primitive-handle-count shape))
              (let ((xy (scad-sketch--primitive-handle-xy shape idx)))
                (when (and xy (<= (scad-sketch--distance p xy) r))
@@ -244,7 +271,7 @@ attention priority over the containing shape."
 
 ;;; Selectable refs (TAB cycle)
 (defun scad-sketch--selectable-refs (session)
-  "Return all selectable refs for SESSION in tab-cycle order."
+  "Return all selectable refs for SESSION in global cycle order."
   (let (refs)
     (dolist (shape (scad-sketch-session-shapes session))
       (let ((shape-id (scad-sketch-shape-id shape)))
@@ -254,10 +281,10 @@ attention priority over the containing shape."
            (cl-loop for _pt in (scad-sketch-shape-points shape)
                     for idx from 0
                     do (push (scad-sketch--point-ref idx shape-id) refs)))
-          ((or 'circle 'square)
+          ((or 'circle 'square 'text)
            (dotimes (idx (scad-sketch--primitive-handle-count shape))
-             (push (scad-sketch--point-ref idx shape-id) refs))))))
-    (nreverse refs)))
+             (push (scad-sketch--point-ref idx shape-id) refs)))))
+      (nreverse refs))))
 
 (defun scad-sketch--ref-anchor (session ref)
   "Return a model-space anchor point for REF."
@@ -274,7 +301,7 @@ attention priority over the containing shape."
             (if point
                 (scad-sketch--point-xy point)
               (copy-sequence (scad-sketch-session-point session)))))
-         ((or 'circle 'square)
+         ((or 'circle 'square 'text)
           (or (scad-sketch--primitive-handle-xy shape idx)
               (copy-sequence (scad-sketch-session-point session))))
          (_
@@ -312,14 +339,28 @@ A selected shape makes all of its points effectively selected."
                   (eq (scad-sketch--ref-shape-id ref) shape-id))
                 selection))
 
+(defun scad-sketch--hover-ref (session)
+  "Return the currently hovered ref in SESSION, or nil if nothing is hovered."
+  (let* ((candidates (scad-sketch--hover-candidates session))
+         (n          (length candidates)))
+    (when (> n 0)
+      (nth (mod (or (scad-sketch-session-hover-index session) 0) n)
+           candidates))))
+
 (defun scad-sketch--all-point-refs-except (session shape-id idx)
-  "Return point refs for every point in SHAPE-ID except IDX."
+  "Return point refs for every point/handle in SHAPE-ID except IDX."
   (let ((shape (scad-sketch-session-shape-by-id session shape-id))
         refs)
     (when shape
-      (dotimes (i (length (scad-sketch-shape-points shape)))
-        (unless (= i idx)
-          (push (scad-sketch--point-ref i shape-id) refs))))
+      (pcase (scad-sketch-shape-kind shape)
+        ('polygon
+         (dotimes (i (length (scad-sketch-shape-points shape)))
+           (unless (= i idx)
+             (push (scad-sketch--point-ref i shape-id) refs))))
+        ((or 'circle 'square 'text)
+         (dotimes (i (scad-sketch--primitive-handle-count shape))
+           (unless (= i idx)
+             (push (scad-sketch--point-ref i shape-id) refs))))))
     (nreverse refs)))
 
 (defun scad-sketch--toggle-ref-selection (session ref)
@@ -359,26 +400,28 @@ Invariants:
            (push ref (scad-sketch-session-selection session)))))))))
 
 ;;; Attention
-
 (defun scad-sketch--attention-ref (session)
-  "Return the ref currently receiving attention in SESSION."
+  "Return the ref currently receiving attention in SESSION.
+
+Attention is hover-first:
+  - if the cursor is hovering anything, use the current hovered ref;
+  - otherwise fall back to the explicit global focus ref."
+  (or (scad-sketch--hover-ref session)
+      (scad-sketch-session-focus-ref session)))
+
+(defun scad-sketch--normalize-attention (session)
+  "Clamp hover index and align legacy active/selected slots with attention.
+
+Do not overwrite `focus-ref' from hover state; focus is the global fallback,
+while hover is represented by `hover-index' over `scad-sketch--hover-candidates'."
   (let* ((candidates (scad-sketch--hover-candidates session))
          (n          (length candidates)))
     (if (> n 0)
-        (nth (mod (or (scad-sketch-session-hover-index session) 0) n)
-             candidates)
-      (scad-sketch-session-focus-ref session))))
-
-(defun scad-sketch--normalize-attention (session)
-  "Clamp hover index and keep legacy selected-index aligned with attention."
-  (let* ((candidates (scad-sketch--hover-candidates session))
-         (n          (length candidates)))
-    (when (> n 0)
-      (setf (scad-sketch-session-hover-index session)
-            (mod (or (scad-sketch-session-hover-index session) 0) n)))
+        (setf (scad-sketch-session-hover-index session)
+              (mod (or (scad-sketch-session-hover-index session) 0) n))
+      (setf (scad-sketch-session-hover-index session) 0))
     (let ((attention (scad-sketch--attention-ref session)))
       (when attention
-        (setf (scad-sketch-session-focus-ref session) attention)
         (when (scad-sketch--ref-shape-id attention)
           (scad-sketch-session-set-active-shape
            session (scad-sketch--ref-shape-id attention)))
@@ -388,7 +431,6 @@ Invariants:
           (setf (scad-sketch-session-selected-index session) nil))))))
 
 ;;; Selected point expansion
-
 (defun scad-sketch--selected-shape-ids (session)
   "Return explicitly selected shape ids in SESSION."
   (delq nil
@@ -401,7 +443,7 @@ Invariants:
   "Return selected point/handle locations as (SHAPE-ID . INDEX) conses.
 
 Polygon shape selections expand to all vertices.  Primitive shape selections
-remain shape selections and are moved as whole shapes by `scad-sketch--move-selected'."
+remain shape selections and are moved as whole shapes by editing commands."
   (let (locs)
     (dolist (ref (scad-sketch-session-selection session))
       (pcase (scad-sketch--ref-kind ref)
@@ -420,7 +462,7 @@ remain shape selections and are moved as whole shapes by `scad-sketch--move-sele
                ('polygon
                 (when (< idx (length (scad-sketch-shape-points shape)))
                   (push (cons shape-id idx) locs)))
-               ((or 'circle 'square)
+               ((or 'circle 'square 'text)
                 (when (< idx (scad-sketch--primitive-handle-count shape))
                   (push (cons shape-id idx) locs)))))))))
     (setq locs (delete-dups (nreverse locs)))
