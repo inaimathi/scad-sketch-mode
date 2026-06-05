@@ -170,22 +170,33 @@ Text:
        (setq md (plist-put md :y (nth 1 xy)))
        (setf (scad-sketch-shape-metadata shape) md)))))
 
+(defun scad-sketch--move-session-point-by (session dx dy &optional snap)
+  "Move SESSION cursor point by DX DY, snapping when SNAP is non-nil."
+  (let* ((old (scad-sketch-session-point session))
+         (new (scad-sketch--move-xy old dx dy))
+         (new (if snap
+                  (scad-sketch--snap-xy new (scad-sketch--grid session))
+                new)))
+    (setf (scad-sketch-session-point session) new)))
+
 (defun scad-sketch--move-selected (dx dy &optional snap)
   "Move selected vertices/shapes by DX, DY.  Snap to grid when SNAP is non-nil.
 
-For circle and square point refs, this moves the primitive edit handle rather
-than translating the whole shape."
+Also move the editor cursor point by the same delta so selected geometry stays
+under the cursor after keyboard movement."
   (scad-sketch--edit
    (lambda (s)
      (let ((shape-ids (scad-sketch--selected-shape-ids s))
-           (locs      (scad-sketch--selected-point-locs s nil)))
+           (locs      (scad-sketch--selected-point-locs s nil))
+           (moved     nil))
        (cond
         (shape-ids
          (dolist (shape-id shape-ids)
            (let ((shape (scad-sketch-session-shape-by-id s shape-id)))
              (when shape
                (scad-sketch--move-shape shape dx dy snap
-                                        (scad-sketch--grid s))))))
+                                        (scad-sketch--grid s))
+               (setq moved t)))))
 
         (locs
          (dolist (loc locs)
@@ -204,21 +215,31 @@ than translating the whole shape."
                                    new-xy))
                        (new      (scad-sketch--make-model-point snapped old)))
                   (setf (scad-sketch-shape-points shape)
-                        (scad-sketch--replace-nth idx new points))))
-               ((or 'circle 'square)
+                        (scad-sketch--replace-nth idx new points))
+                  (setq moved t)))
+
+               ((or 'circle 'square 'text)
                 (let* ((old-xy  (scad-sketch--primitive-handle-xy shape idx))
                        (new-xy  (scad-sketch--move-xy old-xy dx dy))
                        (snapped (if snap
                                     (scad-sketch--snap-xy new-xy
                                                           (scad-sketch--grid s))
                                   new-xy)))
-                  (scad-sketch--move-primitive-handle-to shape idx snapped)))))))
+                  (scad-sketch--move-primitive-handle-to shape idx snapped)
+                  (setq moved t)))))))
 
         (t
          (let ((shape (scad-sketch-session-active-shape s)))
            (unless shape (user-error "No selected point or shape"))
            (scad-sketch--move-shape shape dx dy snap
-                                    (scad-sketch--grid s)))))))))
+                                    (scad-sketch--grid s))
+           (setq moved t))))
+
+       (when moved
+         (scad-sketch--move-session-point-by s dx dy snap)
+         ;; Preserve the intuitive behavior: after moving the selected thing,
+         ;; hover cycling starts from the top of whatever is now under point.
+         (setf (scad-sketch-session-hover-index s) 0))))))
 
 ;;; Selected-vertex movement interactive commands
 
