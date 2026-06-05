@@ -30,10 +30,18 @@ When SHAPE-ID is nil, the caller must supply it before use."
   "Return a mirror-axis handle ref for IDX in MIRROR-ID."
   (list :kind 'mirror-point :mirror-id mirror-id :index idx))
 
+(defun scad-sketch--boolean-ref (group-id)
+  "Return a boolean group ref for GROUP-ID."
+  (list :kind 'boolean :group-id group-id))
+
 ;;; Accessors
 (defun scad-sketch--ref-mirror-id (ref)
   "Return mirror id from REF, or nil."
   (plist-get ref :mirror-id))
+
+(defun scad-sketch--ref-group-id (ref)
+  "Return boolean group id from REF, or nil."
+  (plist-get ref :group-id))
 
 (defun scad-sketch--ref-kind (ref)
   "Return REF kind symbol ('shape or 'point)."
@@ -54,6 +62,7 @@ When SHAPE-ID is nil, the caller must supply it before use."
        (eq    (scad-sketch--ref-kind      a) (scad-sketch--ref-kind      b))
        (eq    (scad-sketch--ref-shape-id  a) (scad-sketch--ref-shape-id  b))
        (eq    (scad-sketch--ref-mirror-id a) (scad-sketch--ref-mirror-id b))
+       (equal (scad-sketch--ref-group-id  a) (scad-sketch--ref-group-id  b))
        (equal (scad-sketch--ref-index     a) (scad-sketch--ref-index     b))))
 
 ;;; Summary
@@ -66,6 +75,8 @@ When SHAPE-ID is nil, the caller must supply it before use."
      (format "%s[%s]"
              (scad-sketch--ref-shape-id ref)
              (scad-sketch--ref-index ref)))
+    ('boolean
+     (format "%s" (scad-sketch--ref-group-id ref)))
     ('mirror
      (format "%s" (scad-sketch--ref-mirror-id ref)))
     ('mirror-point

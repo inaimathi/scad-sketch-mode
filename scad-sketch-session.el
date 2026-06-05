@@ -48,9 +48,6 @@
   "Default coarse movement step in sketch units."
   :type 'number :group 'scad-sketch)
 
-(defconst scad-sketch-session-inline-polygon-threshold 4
-  "Maximum number of polygon points to keep inline on session write-back.")
-
 (define-error 'scad-sketch-no-edit-target
   "No scad-sketch edit target"
   'user-error)
@@ -240,6 +237,26 @@ geometry.  Rendering/write-back can show/use the mirrored result."
       ('boolean
        (cl-some (lambda (child)
                   (scad-sketch-session--tree-find-mirror child mirror-id))
+                (plist-get tree :children)))
+      (_ nil))))
+
+(defun scad-sketch-session--tree-find-group (tree group-id)
+  "Return boolean group node GROUP-ID in TREE, or nil."
+  (when tree
+    (pcase (plist-get tree :kind)
+      ('boolean
+       (or (and (equal (plist-get tree :group-id) group-id)
+                tree)
+           (cl-some (lambda (child)
+                      (scad-sketch-session--tree-find-group child group-id))
+                    (plist-get tree :children))))
+      ('mirror
+       (scad-sketch-session--tree-find-group
+        (plist-get tree :child)
+        group-id))
+      ('sequence
+       (cl-some (lambda (child)
+                  (scad-sketch-session--tree-find-group child group-id))
                 (plist-get tree :children)))
       (_ nil))))
 
@@ -670,25 +687,7 @@ as used, which is fine for avoiding generated-name collisions."
         (push (match-string-no-properties 0) names)))
     (delete-dups names)))
 
-(defun scad-sketch-session--unique-sketch-name (session)
-  "Return a `_sketch_N' name not already used in SESSION's source buffer."
-  (let* ((source-buffer (scad-sketch-session-source-buffer session))
-         (source
-          (if (buffer-live-p source-buffer)
-              (with-current-buffer source-buffer
-                (buffer-substring-no-properties (point-min) (point-max)))
-            ""))
-         (existing (scad-sketch-session--used-identifiers-in-source source))
-         (i 1)
-         name)
-    (while (progn
-             (setq name (format "_sketch_%d" i))
-             (member name existing))
-      (setq i (1+ i)))
-    name))
-
 ;;;; Shapes
-
 (defun scad-sketch-session--shape-id (n)
   "Return the canonical shape id for index N."
   (intern (format "shape-%d" n)))

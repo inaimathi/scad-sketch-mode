@@ -1071,74 +1071,17 @@ The new mirror uses default normal vector [1, 0].  Use
         (scad-sketch--mirror-ref mirror-id))))))
 
 ;;; Focus/selection commands
-(defun scad-sketch--tree-contains-shape-for-break-p (tree shape-id)
-  "Return non-nil if TREE contains SHAPE-ID."
-  (pcase (and tree (plist-get tree :kind))
-    ('shape
-     (eq (plist-get tree :shape-id) shape-id))
-    ('boolean
-     (cl-some (lambda (child)
-                (scad-sketch--tree-contains-shape-for-break-p child shape-id))
-              (plist-get tree :children)))
-    ('mirror
-     (scad-sketch--tree-contains-shape-for-break-p
-      (plist-get tree :child)
-      shape-id))
-    ('sequence
-     (cl-some (lambda (child)
-                (scad-sketch--tree-contains-shape-for-break-p child shape-id))
-              (plist-get tree :children)))
-    (_ nil)))
-
-(defun scad-sketch--deepest-boolean-containing-shape-for-break
-    (tree shape-id)
-  "Return deepest boolean node in TREE containing SHAPE-ID, or nil."
-  (when (scad-sketch--tree-contains-shape-for-break-p tree shape-id)
-    (pcase (and tree (plist-get tree :kind))
-      ('boolean
-       (or (cl-some
-            (lambda (child)
-              (scad-sketch--deepest-boolean-containing-shape-for-break
-               child shape-id))
-            (plist-get tree :children))
-           tree))
-      ('mirror
-       (scad-sketch--deepest-boolean-containing-shape-for-break
-        (plist-get tree :child)
-        shape-id))
-      ('sequence
-       (cl-some
-        (lambda (child)
-          (scad-sketch--deepest-boolean-containing-shape-for-break
-           child shape-id))
-        (plist-get tree :children)))
-      (_ nil))))
-
 (defun scad-sketch--current-breakable-group-ref (session)
-  "Return the current boolean/mirror group ref to break apart."
+  "Return the currently attentioned group ref to break apart.
+
+Groups are attention targets, not selection targets.  This function therefore
+uses only current attention.  It does not inspect selection and it does not infer
+a containing group from an attentioned shape."
   (let* ((ref  (scad-sketch--attention-ref session))
          (kind (and ref (scad-sketch--ref-kind ref))))
     (pcase kind
-      ('boolean
-       ref)
-
-      ('mirror
-       ref)
-
-      ('mirror-point
-       (scad-sketch--mirror-ref (scad-sketch--ref-mirror-id ref)))
-
-      ((or 'shape 'point)
-       (let* ((shape-id (scad-sketch--ref-shape-id ref))
-              (group
-               (and shape-id
-                    (scad-sketch--deepest-boolean-containing-shape-for-break
-                     (scad-sketch-session-tree session)
-                     shape-id))))
-         (when group
-           (list :kind 'boolean
-                 :group-id (plist-get group :group-id)))))
-
+      ('boolean ref)
+      ('mirror  ref)
       (_ nil))))
 
 (defun scad-sketch--tree-break-ref (tree ref)
@@ -1219,17 +1162,17 @@ new root is a sequence node."
          (t (scad-sketch-session--tree-sequence children)))))))
 
 (defun scad-sketch-break-apart-group ()
-  "Break apart the currently attended boolean or mirror group.
+  "Break apart the currently attentioned boolean or mirror group.
 
-If attention is on a shape inside a boolean group, breaks the deepest boolean
-group containing that shape.  If attention is on a mirror axis/handle, removes
-the mirror wrapper."
+Groups are not separately selected.  To choose a break target, put point over a
+group and use hover cycling, or use global focus cycling, until the desired
+group has attention."
   (interactive)
   (scad-sketch--edit
    (lambda (s)
      (let ((ref (scad-sketch--current-breakable-group-ref s)))
        (unless ref
-         (user-error "No boolean or mirror group to break apart"))
+         (user-error "No attentioned boolean or mirror group to break apart"))
        (setf (scad-sketch-session-tree s)
              (scad-sketch--tree-break-ref
               (scad-sketch-session-tree s)
