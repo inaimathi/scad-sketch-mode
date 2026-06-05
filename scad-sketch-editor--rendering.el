@@ -458,6 +458,107 @@ Returns the outermost <g> node created, or nil."
 ;; deepest boolean group containing that shape, using two-pass compound path
 ;; in the attention/selection colour.  This makes "select the rectangle" light
 ;; up the whole union silhouette in orange/blue, not just the rect outline.
+(defun scad-sketch--hover-attention-ref (session)
+  "Return the ref that should receive an attention halo, or nil.
+
+Unlike `scad-sketch--attention-ref', this does not fall back to global focus.
+Halos should only appear for actual hover attention."
+  (scad-sketch--hover-ref session))
+
+(defun scad-sketch--hover-attention-p (session ref)
+  "Return non-nil if REF is the currently hovered attention ref."
+  (scad-sketch--same-ref-p (scad-sketch--hover-attention-ref session) ref))
+
+(defun scad-sketch--tree-find-group-by-id (tree group-id)
+  "Return the boolean TREE node with GROUP-ID, or nil."
+  (when tree
+    (pcase (plist-get tree :kind)
+      ('boolean
+       (or (and (equal (plist-get tree :group-id) group-id)
+                tree)
+           (cl-some (lambda (child)
+                      (scad-sketch--tree-find-group-by-id child group-id))
+                    (plist-get tree :children))))
+      (_ nil))))
+
+(defun scad-sketch--draw-compound-halo (parent-node compound-d)
+  "Draw an attention halo around COMPOUND-D.
+
+This is for non-point attention: shapes and boolean groups.  Point attention
+uses `scad-sketch--draw-attention-halo' instead."
+  (when (and compound-d (not (string-empty-p compound-d)))
+    ;; Fill pass hides internal seams in compound paths, matching the boolean
+    ;; preview/highlight strategy.
+    (svg-node parent-node 'path
+              :d compound-d
+              :fill "#ffffff"
+              :fill-rule "nonzero"
+              :stroke "none")
+    ;; Wide soft halo.
+    (svg-node parent-node 'path
+              :d compound-d
+              :fill "none"
+              :fill-rule "nonzero"
+              :stroke "#0057c2"
+              :stroke-width 14
+              :stroke-opacity 0.12
+              :stroke-linejoin "round"
+              :stroke-linecap "round")
+    ;; Mid halo.
+    (svg-node parent-node 'path
+              :d compound-d
+              :fill "none"
+              :fill-rule "nonzero"
+              :stroke "#0057c2"
+              :stroke-width 7
+              :stroke-opacity 0.28
+              :stroke-linejoin "round"
+              :stroke-linecap "round")
+    ;; Crisp edge.
+    (svg-node parent-node 'path
+              :d compound-d
+              :fill "none"
+              :fill-rule "nonzero"
+              :stroke "#0057c2"
+              :stroke-width 2.5
+              :stroke-opacity 0.85
+              :stroke-linejoin "round"
+              :stroke-linecap "round")))
+
+(defun scad-sketch--draw-ref-geometry-halo (svg transform session ref)
+  "Draw a geometry-level attention halo for REF.
+
+Point refs intentionally do nothing here; point refs are haloed at the point
+renderer.  Shape refs halo the whole shape path.  Boolean refs halo the whole
+boolean subtree.
+
+Boolean refs are supported as plists of the form:
+  (:kind boolean :group-id GROUP-ID)"
+  (when ref
+    (pcase (scad-sketch--ref-kind ref)
+      ('point
+       nil)
+
+      ('shape
+       (let* ((shape-id (scad-sketch--ref-shape-id ref))
+              (shape    (scad-sketch-session-shape-by-id session shape-id))
+              (d        (and shape
+                             (scad-sketch--shape-path-d shape transform))))
+         (when d
+           (scad-sketch--draw-compound-halo svg d))))
+
+      ('boolean
+       (let* ((group-id (plist-get ref :group-id))
+              (tree     (scad-sketch-session-tree session))
+              (group    (and group-id
+                              (scad-sketch--tree-find-group-by-id
+                               tree group-id)))
+              (ds       (and group
+                             (scad-sketch--tree-path-ds
+                              session transform group)))
+              (compound (and ds (scad-sketch--compound-d ds))))
+         (when compound
+           (scad-sketch--draw-compound-halo svg compound)))))))
 
 (defun scad-sketch--draw-attention-halo (svg screen &optional radius)
   "Draw a visible attention halo around SCREEN.
@@ -479,29 +580,38 @@ attended object remains obvious even when it is already selected."
                 :fill "none")))
 
 (defun scad-sketch--draw-group-highlight (svg transform session)
-  "Draw group-level attention/selection highlight for current session.
+  "Draw boolean group-level highlight for selected refs.
 
-Returns the shape-id whose group was highlighted (so the overlay pass can
-suppress redundant per-shape stroke for it), or nil."
-  (let* ((tree      (scad-sketch-session-tree session))
-         (attention (scad-sketch--attention-ref session))
-         (selection (scad-sketch-session-selection session)))
+Returns the shape ids whose groups were highlighted.  Attention is not handled
+here; `scad-sketch--draw-ref-geometry-halo' handles the current attention ref."
+  (let ((tree (scad-sketch-session-tree session))
+        highlighted)
     (when (and tree (scad-sketch--root-is-boolean-p session))
-      (let* ((ref        (or (and selection (car selection)) attention))
-             (kind       (and ref (scad-sketch--ref-kind ref)))
-             (shape-id   (and ref (scad-sketch--ref-shape-id ref)))
-             (selected-p (and ref
-                              (scad-sketch--selection-contains-ref-p
-                               session ref)))
-             (color      (if selected-p "#d13f00" "#0057c2"))
-             (width      (if selected-p 5 4)))
-        (when (and shape-id (eq kind 'shape))
-          (let ((group (scad-sketch--deepest-containing-group tree shape-id)))
-            (when group
-              (let* ((all-ds   (scad-sketch--tree-path-ds session transform group))
-                     (compound (scad-sketch--compound-d all-ds)))
-                (scad-sketch--draw-compound svg compound "#ffffff" color width))
-              shape-id)))))))
+      (dolist (ref (scad-sketch-session-selection session))
+        (pcase (scad-sketch--ref-kind ref)
+          ('shape
+           (let* ((shape-id (scad-sketch--ref-shape-id ref))
+                  (group    (and shape-id
+                                  (scad-sketch--deepest-containing-group
+                                   tree shape-id))))
+             (when group
+               (let* ((all-ds   (scad-sketch--tree-path-ds
+                                  session transform group))
+                      (compound (scad-sketch--compound-d all-ds)))
+                 (scad-sketch--draw-compound svg compound "#ffffff" "#d13f00" 5))
+               (push shape-id highlighted))))
+
+          ('boolean
+           (let* ((group-id (plist-get ref :group-id))
+                  (group    (and group-id
+                                  (scad-sketch--tree-find-group-by-id
+                                   tree group-id))))
+             (when group
+               (let* ((all-ds   (scad-sketch--tree-path-ds
+                                  session transform group))
+                      (compound (scad-sketch--compound-d all-ds)))
+                 (scad-sketch--draw-compound svg compound "#ffffff" "#d13f00" 5))))))))
+    highlighted))
 
 ;;;; ── Grid ───────────────────────────────────────────────────────────────────
 
@@ -531,14 +641,13 @@ suppress redundant per-shape stroke for it), or nil."
 ;; In boolean sessions, per-shape path strokes are suppressed.  The preview
 ;; and group-highlight layers carry geometry.  Vertex dots always render.
 ;; In non-boolean sessions, full per-shape strokes are drawn as before.
-
 (defun scad-sketch--draw-vertex-dot (svg screen point-ref sel attn
-                                         active-shape _session pt transform
+                                         active-shape session pt transform
                                          closed points idx n)
   "Draw one vertex dot and its polyRound radius annotation."
   (let ((radius (scad-sketch--point-radius pt))
         (xy     (scad-sketch--point-xy pt)))
-    (when attn
+    (when (scad-sketch--hover-attention-p session point-ref)
       (scad-sketch--draw-attention-halo svg screen 11))
     (svg-circle svg (nth 0 screen) (nth 1 screen)
                 (cond (sel 8) (attn 7) (active-shape 6) (t 5))
@@ -645,7 +754,6 @@ When SUPPRESS-STROKE is non-nil, skip path stroke; vertex dots still drawn."
   "Draw square SHAPE editor overlay, including corner and center handles."
   (let* ((shape-id     (scad-sketch-shape-id shape))
          (pts          (scad-sketch--square-corner-points shape))
-         (screen-pts   (mapcar transform pts))
          (shape-sel    (scad-sketch--shape-selected-p session shape-id))
          (attention    (scad-sketch--attention-ref session))
          (shape-attn   (and attention
@@ -653,9 +761,6 @@ When SUPPRESS-STROKE is non-nil, skip path stroke; vertex dots still drawn."
                             (eq (scad-sketch--ref-shape-id attention) shape-id)))
          (active-shape (eq shape-id
                            (scad-sketch-session-active-shape-id session))))
-    (when shape-attn
-      (scad-sketch--draw-attention-halo
-       svg (funcall transform (scad-sketch--square-center shape)) 13))
     (unless suppress-stroke
       (let* ((boolean-session (scad-sketch--root-is-boolean-p session))
              (ghosted (and boolean-session
@@ -687,7 +792,7 @@ When SUPPRESS-STROKE is non-nil, skip path stroke; vertex dots still drawn."
              (attn       (and attention
                               (scad-sketch--same-ref-p attention point-ref)))
              (is-center  (= idx 4)))
-        (when attn
+        (when (scad-sketch--hover-attention-p session point-ref)
           (scad-sketch--draw-attention-halo svg screen 11))
         (svg-circle svg (nth 0 screen) (nth 1 screen)
                     (cond (sel 8) (attn 7) (active-shape 6) (t 5))
@@ -742,9 +847,6 @@ Circle handle indices:
                              (ghosted      "#9a9a9a")
                              (t            "#777777"))))
 
-    (when shape-attn
-      (scad-sketch--draw-attention-halo svg screen 13))
-
     ;; Circle outline.
     (unless suppress-stroke
       (svg-circle svg (nth 0 screen) (nth 1 screen) pr
@@ -791,7 +893,7 @@ Circle handle indices:
                         (attn "#dfefff")
                         (is-center "#ffffff")
                         (t "#f8f8f8"))))
-            (when attn
+            (when (scad-sketch--hover-attention-p session handle-ref)
               (scad-sketch--draw-attention-halo svg handle-s 11))
             (svg-circle svg
                         (nth 0 handle-s)
@@ -958,7 +1060,7 @@ Circle handle indices:
 
 ;;;; ── Main scene draw pass ───────────────────────────────────────────────────
 (defun scad-sketch--draw-path (svg transform session)
-  "Draw the full scene: boolean preview, group highlight, overlays, boxes."
+  "Draw the full scene: boolean preview, selection, hover-attention, overlays, boxes."
   (scad-sketch-session-sync-active-shape-from-points session)
   (let ((boolean-session (scad-sketch--root-is-boolean-p session)))
 
@@ -969,11 +1071,25 @@ Circle handle indices:
         (scad-sketch--render-tree svg defs transform session
                                   (scad-sketch-session-tree session))))
 
-    ;; Layer 2 – Group-level attention / selection highlight.
+    ;; Layer 2 – Selection highlight.
+    ;; In boolean sessions, selected shape refs light up their containing group.
+    ;; In non-boolean sessions, selected shape styling is handled by overlays.
     (when boolean-session
       (scad-sketch--draw-group-highlight svg transform session))
 
-    ;; Layer 3 – Per-shape interactive overlays.
+    ;; Layer 3 – Hover-attention halo.
+    ;; Point attention is drawn by point/handle renderers.  Shape/boolean
+    ;; hover-attention gets a geometry-level halo here.  Global focus does not
+    ;; draw a halo after the cursor moves away.
+    (let ((hover-attention (scad-sketch--hover-attention-ref session)))
+      (unless (eq (and hover-attention
+                       (scad-sketch--ref-kind hover-attention))
+                  'point)
+        (scad-sketch--draw-ref-geometry-halo
+         svg transform session hover-attention)))
+
+    ;; Layer 4 – Per-shape interactive overlays.
+    ;; In boolean sessions, suppress shape strokes unless drilling into a point.
     (dolist (shape (scad-sketch-session-shapes session))
       (let* ((shape-id    (scad-sketch-shape-id shape))
              (point-attn  (let ((att (scad-sketch--attention-ref session)))
@@ -991,7 +1107,7 @@ Circle handle indices:
           ('text    (scad-sketch--draw-one-text-shape
                      svg transform session shape suppress)))))
 
-    ;; Layer 4 – Boolean bounding-box labels.
+    ;; Layer 5 – Boolean bounding-box labels.
     (when (scad-sketch-session-tree session)
       (scad-sketch--draw-boolean-boxes
        svg transform session (scad-sketch-session-tree session)))))
