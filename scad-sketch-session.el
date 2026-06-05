@@ -199,6 +199,44 @@ using the average basis-vector length for this first pass."
   "Return a boolean tree node."
   (list :kind 'boolean :op op :group-id group-id :children children))
 
+(defun scad-sketch-session--tree-mirror (mirror-id mx my child)
+  "Return a mirror tree node.
+
+MX/MY are the OpenSCAD mirror normal vector.  CHILD is the editable source-side
+geometry.  Rendering/write-back can show/use the mirrored result."
+  (list :kind 'mirror
+        :mirror-id mirror-id
+        :mx (float mx)
+        :my (float my)
+        :child child))
+
+(defun scad-sketch-session--tree-mirrors (tree)
+  "Return all mirror tree nodes in TREE, outermost first."
+  (pcase (plist-get tree :kind)
+    ('mirror
+     (cons tree
+           (scad-sketch-session--tree-mirrors
+            (plist-get tree :child))))
+    ('boolean
+     (apply #'append
+            (mapcar #'scad-sketch-session--tree-mirrors
+                    (plist-get tree :children))))
+    (_ nil)))
+
+(defun scad-sketch-session--tree-find-mirror (tree mirror-id)
+  "Return mirror node MIRROR-ID in TREE, or nil."
+  (when tree
+    (pcase (plist-get tree :kind)
+      ('mirror
+       (or (and (eq (plist-get tree :mirror-id) mirror-id) tree)
+           (scad-sketch-session--tree-find-mirror
+            (plist-get tree :child) mirror-id)))
+      ('boolean
+       (cl-some (lambda (child)
+                  (scad-sketch-session--tree-find-mirror child mirror-id))
+                (plist-get tree :children)))
+      (_ nil))))
+
 (defun scad-sketch-session--tree-shape-ids (tree)
   "Return all shape ids in TREE."
   (pcase (plist-get tree :kind)
@@ -208,6 +246,9 @@ using the average basis-vector length for this first pass."
      (apply #'append
             (mapcar #'scad-sketch-session--tree-shape-ids
                     (plist-get tree :children))))
+    ('mirror
+     (scad-sketch-session--tree-shape-ids
+      (plist-get tree :child)))
     (_ nil)))
 
 (defun scad-sketch-session--tree-groups (tree)
@@ -218,6 +259,9 @@ using the average basis-vector length for this first pass."
            (apply #'append
                   (mapcar #'scad-sketch-session--tree-groups
                           (plist-get tree :children)))))
+    ('mirror
+     (scad-sketch-session--tree-groups
+      (plist-get tree :child)))
     (_ nil)))
 
 (defun scad-sketch-session--replace-tree-shape (tree old-id replacement-tree)
@@ -235,13 +279,30 @@ using the average basis-vector length for this first pass."
                 (scad-sketch-session--replace-tree-shape
                  child old-id replacement-tree))
               (plist-get tree :children))))
+    ('mirror
+     (plist-put
+      (copy-sequence tree)
+      :child
+      (scad-sketch-session--replace-tree-shape
+       (plist-get tree :child) old-id replacement-tree)))
     (_ tree)))
 
 (defun scad-sketch-session--append-shape-to-tree (tree shape-id)
-  "Return TREE with SHAPE-ID added in a union context."
+  "Return TREE with SHAPE-ID added in a union context.
+
+If TREE is a mirror node, append into the mirror's child so newly drawn shapes
+are mirrored with the existing mirrored subtree."
   (cond
    ((null tree)
     (scad-sketch-session--tree-shape shape-id))
+
+   ((eq (plist-get tree :kind) 'mirror)
+    (plist-put
+     (copy-sequence tree)
+     :child
+     (scad-sketch-session--append-shape-to-tree
+      (plist-get tree :child) shape-id)))
+
    ((and (eq (plist-get tree :kind) 'boolean)
          (eq (plist-get tree :op) 'union))
     (plist-put
@@ -249,6 +310,7 @@ using the average basis-vector length for this first pass."
      :children
      (append (plist-get tree :children)
              (list (scad-sketch-session--tree-shape shape-id)))))
+
    (t
     (scad-sketch-session--tree-boolean
      'union
@@ -456,29 +518,43 @@ canonicalized into x/y, width, height, and angle."
     (scad-sketch-session--tree-boolean op group-id (nreverse children))))
 
 (defun scad-sketch-session--convert-transform-node (ast node matrix state)
-  "Convert transform NODE by composing it into MATRIX."
-  (let* ((type (plist-get node :type))
-         (local
-          (pcase type
-            ('translate
-             (scad-sketch-session--mat-translate
-              (plist-get node :tx) (plist-get node :ty)))
-            ('rotate
-             (scad-sketch-session--mat-rotate
-              (plist-get node :angle)))
-            ('scale
-             (scad-sketch-session--mat-scale
-              (plist-get node :sx) (plist-get node :sy)))
-            ('mirror
-             (scad-sketch-session--mat-mirror
-              (plist-get node :mx) (plist-get node :my)))
-            (_
-             (scad-sketch-session--mat-identity)))))
-    (scad-sketch-session--convert-node
-     ast
-     (plist-get node :child)
-     (scad-sketch-session--mat-mul matrix local)
-     state)))
+  "Convert transform NODE.
+
+Most transforms are flattened into MATRIX.  `mirror' is preserved as an
+editable tree node so the user can edit the mirror normal vector."
+  (let ((type (plist-get node :type)))
+    (if (eq type 'mirror)
+        (let* ((mirror-id (scad-sketch-session--conversion-group-id state 'mirror))
+               ;; The child is converted without the mirror matrix.  This keeps
+               ;; the source-side geometry editable as the \"real\" shape.
+               (child (scad-sketch-session--convert-node
+                       ast
+                       (plist-get node :child)
+                       matrix
+                       state)))
+          (scad-sketch-session--tree-mirror
+           mirror-id
+           (plist-get node :mx)
+           (plist-get node :my)
+           child))
+      (let* ((local
+              (pcase type
+                ('translate
+                 (scad-sketch-session--mat-translate
+                  (plist-get node :tx) (plist-get node :ty)))
+                ('rotate
+                 (scad-sketch-session--mat-rotate
+                  (plist-get node :angle)))
+                ('scale
+                 (scad-sketch-session--mat-scale
+                  (plist-get node :sx) (plist-get node :sy)))
+                (_
+                 (scad-sketch-session--mat-identity)))))
+        (scad-sketch-session--convert-node
+         ast
+         (plist-get node :child)
+         (scad-sketch-session--mat-mul matrix local)
+         state)))))
 
 (defun scad-sketch-session--convert-node (ast node matrix state)
   "Convert parser NODE under MATRIX into editable shapes and a tree."
@@ -727,27 +803,41 @@ as used, which is fine for avoiding generated-name collisions."
                     :font font)
               metadata)))
 
-(defun scad-sketch-session-add-shape (session points &optional polyround)
-  "Add a new polygon shape with POINTS to SESSION and make it active.
+(defun scad-sketch-session-add-shape-object (session shape)
+  "Add SHAPE to SESSION's model/tree and make it active.
 
-A session can add shapes only when it owns a root target.  Array-only sessions
-have no semantically safe place to serialize multiple shapes."
+This function intentionally does not touch editor selection or focus refs.
+`scad-sketch-session.el' sits below the editor UI layer and must not depend on
+`scad-sketch-editor--refs.el'.  Editor commands that want the new shape selected
+should do that in `scad-sketch-editor--editing.el'."
   (unless (scad-sketch-session-root-target session)
     (signal 'scad-sketch-unsupported-edit-target
             (list "This session only owns an array; open a polygon, shape, or boolean to add shapes")))
+
   (scad-sketch-session-sync-active-shape-from-points session)
+
+  (let ((shape-id (scad-sketch-shape-id shape)))
+    (setf (scad-sketch-session-shapes session)
+          (append (scad-sketch-session-shapes session) (list shape)))
+
+    (setf (scad-sketch-session-tree session)
+          (scad-sketch-session--append-shape-to-tree
+           (scad-sketch-session-tree session) shape-id))
+
+    (scad-sketch-session-set-active-shape session shape-id)
+
+    shape))
+
+(defun scad-sketch-session-add-shape (session points &optional polyround)
+  "Add a new polygon shape with POINTS to SESSION and make it active.
+
+This is a model-level helper.  It does not select or focus the new shape."
   (let* ((shape-id (scad-sketch-session-next-shape-id session))
          (shape
           (scad-sketch-session--make-polygon-shape
            shape-id points polyround nil nil
            (list :created-in-session t))))
-    (setf (scad-sketch-session-shapes session)
-          (append (scad-sketch-session-shapes session) (list shape)))
-    (setf (scad-sketch-session-tree session)
-          (scad-sketch-session--append-shape-to-tree
-           (scad-sketch-session-tree session) shape-id))
-    (scad-sketch-session-set-active-shape session shape-id)
-    shape))
+    (scad-sketch-session-add-shape-object session shape)))
 
 ;;;; Formatting / emission
 
@@ -1297,6 +1387,7 @@ source region is replaced and its matrix can be flattened into editable shapes."
                       session shape indent)))
        (concat (plist-get emitted :assignments)
                (plist-get emitted :call))))
+
     ('boolean
      (let ((op (plist-get tree :op))
            (children (plist-get tree :children))
@@ -1304,11 +1395,22 @@ source region is replaced and its matrix can be flattened into editable shapes."
        (dolist (child children)
          (let ((emitted (scad-sketch-session--emit-tree
                          session child (concat indent "  "))))
-           ;; Generated assignments from child tree are already part of EMITTED.
-           ;; For now, allow them inline before the child call in the boolean body.
            (setq body (concat body emitted))))
        (format "%s%s() {\n%s%s}\n"
                indent op body indent)))
+
+    ('mirror
+     (let* ((mx    (float (or (plist-get tree :mx) 1.0)))
+            (my    (float (or (plist-get tree :my) 0.0)))
+            (child (plist-get tree :child))
+            (body  (scad-sketch-session--emit-tree
+                    session child (concat indent "  "))))
+       (format "%smirror([%s, %s])\n%s"
+               indent
+               (scad-sketch-session--fmt-num mx)
+               (scad-sketch-session--fmt-num my)
+               body)))
+
     (_ "")))
 
 (defun scad-sketch-session--target-indent (target)

@@ -36,7 +36,6 @@
       (error "No scad-sketch session in this buffer")))
 
 ;;; Undo primitives
-
 (defun scad-sketch--push-undo (session)
   "Push a full snapshot of SESSION state onto the undo stack."
   (scad-sketch-session-sync-active-shape-from-points session)
@@ -48,6 +47,7 @@
               :closed          (scad-sketch-session-closed session)
               :shapes          (copy-tree (scad-sketch-session-shapes session))
               :active-shape-id (scad-sketch-session-active-shape-id session)
+              :tree            (copy-tree (scad-sketch-session-tree session))
               :targets         (copy-tree (scad-sketch-session-targets session))
               :root-target-id  (scad-sketch-session-root-target-id session)
               :selection       (copy-tree (scad-sketch-session-selection session))

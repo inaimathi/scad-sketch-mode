@@ -70,10 +70,16 @@
     (define-key map (kbd "p")           #'scad-sketch-append-point)
     (define-key map (kbd "i")           #'scad-sketch-insert-point-after-selected)
     (define-key map (kbd "k")           #'scad-sketch-delete-selected)
-    (define-key map (kbd "l")           #'scad-sketch-line-from-mark)
-    (define-key map (kbd "r")           #'scad-sketch-rectangle-from-mark)
     (define-key map (kbd "c")           #'scad-sketch-toggle-closed)
     (define-key map (kbd "R")           #'scad-sketch-set-radius)
+    (define-key map (kbd "A")           #'scad-sketch-set-mirror-axis)
+
+    ;; ── Drawing from marks + point ────────────────────────────────────
+    (define-key map (kbd "l")           #'scad-sketch-line-from-mark)
+    (define-key map (kbd "r")           #'scad-sketch-rectangle-from-mark)
+    (define-key map (kbd "B")           #'scad-sketch-draw-square-from-marks)
+    (define-key map (kbd "O")           #'scad-sketch-draw-circle-from-mark)
+    (define-key map (kbd "P")           #'scad-sketch-draw-polygon-from-marks)
 
     ;; ── Hover / focus / selection ─────────────────────────────────────
     (define-key map (kbd "TAB")         #'scad-sketch-next-hovered)

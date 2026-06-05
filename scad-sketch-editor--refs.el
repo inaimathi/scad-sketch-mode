@@ -22,7 +22,18 @@ When SHAPE-ID is nil, the caller must supply it before use."
   "Return a point selection ref for IDX in SHAPE-ID."
   (list :kind 'point :shape-id shape-id :index idx))
 
+(defun scad-sketch--mirror-ref (mirror-id)
+  "Return a mirror-axis selection ref for MIRROR-ID."
+  (list :kind 'mirror :mirror-id mirror-id))
+
+(defun scad-sketch--mirror-point-ref (idx mirror-id)
+  "Return a mirror-axis handle ref for IDX in MIRROR-ID."
+  (list :kind 'mirror-point :mirror-id mirror-id :index idx))
+
 ;;; Accessors
+(defun scad-sketch--ref-mirror-id (ref)
+  "Return mirror id from REF, or nil."
+  (plist-get ref :mirror-id))
 
 (defun scad-sketch--ref-kind (ref)
   "Return REF kind symbol ('shape or 'point)."
@@ -37,24 +48,31 @@ When SHAPE-ID is nil, the caller must supply it before use."
   (plist-get ref :shape-id))
 
 ;;; Predicates
-
 (defun scad-sketch--same-ref-p (a b)
   "Return non-nil if selection refs A and B describe the same object."
   (and a b
-       (eq  (scad-sketch--ref-kind     a) (scad-sketch--ref-kind     b))
-       (eq  (scad-sketch--ref-shape-id a) (scad-sketch--ref-shape-id b))
-       (equal (scad-sketch--ref-index  a) (scad-sketch--ref-index    b))))
+       (eq    (scad-sketch--ref-kind      a) (scad-sketch--ref-kind      b))
+       (eq    (scad-sketch--ref-shape-id  a) (scad-sketch--ref-shape-id  b))
+       (eq    (scad-sketch--ref-mirror-id a) (scad-sketch--ref-mirror-id b))
+       (equal (scad-sketch--ref-index     a) (scad-sketch--ref-index     b))))
 
 ;;; Summary
-
 (defun scad-sketch--ref-summary (ref)
   "Return compact human-readable text for REF."
   (pcase (and ref (scad-sketch--ref-kind ref))
-    ('shape (format "%s"    (scad-sketch--ref-shape-id ref)))
-    ('point (format "%s[%s]"
-                   (scad-sketch--ref-shape-id ref)
-                   (scad-sketch--ref-index    ref)))
-    (_      "none")))
+    ('shape
+     (format "%s" (scad-sketch--ref-shape-id ref)))
+    ('point
+     (format "%s[%s]"
+             (scad-sketch--ref-shape-id ref)
+             (scad-sketch--ref-index ref)))
+    ('mirror
+     (format "%s" (scad-sketch--ref-mirror-id ref)))
+    ('mirror-point
+     (format "%s.axis[%s]"
+             (scad-sketch--ref-mirror-id ref)
+             (scad-sketch--ref-index ref)))
+    (_ "none")))
 
 (provide 'scad-sketch-editor--refs)
 ;;; scad-sketch-editor--refs.el ends here

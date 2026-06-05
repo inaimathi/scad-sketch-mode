@@ -89,6 +89,12 @@
           (scad-sketch--fmt-num (nth 1 xy))))
 
 ;;;; ── Bounds and coordinate transform ────────────────────────────────────────
+(defun scad-sketch--mirror-transform (mx my transform)
+  "Return a transform closure that mirrors model XY before TRANSFORM."
+  (let ((m (scad-sketch-session--mat-mirror mx my)))
+    (lambda (xy)
+      (funcall transform
+               (scad-sketch-session--mat-apply m xy)))))
 
 (defun scad-sketch--circle-bounds (shape)
   "Return (MIN-X MAX-X MIN-Y MAX-Y) for circle SHAPE."
@@ -277,18 +283,29 @@
     (and root (eq (scad-sketch-target-kind root) 'boolean))))
 
 (defun scad-sketch--tree-path-ds (session transform tree)
-  "Return all SVG path-data strings for shape leaves in TREE."
+  "Return all SVG path-data strings for shape leaves in TREE.
+
+For mirror nodes, returns the mirrored output paths."
   (pcase (plist-get tree :kind)
     ('shape
      (let* ((shape (scad-sketch-session-shape-by-id
                     session (plist-get tree :shape-id)))
             (d     (and shape (scad-sketch--shape-path-d shape transform))))
        (if d (list d) nil)))
+
     ('boolean
      (apply #'append
             (mapcar (lambda (child)
                       (scad-sketch--tree-path-ds session transform child))
                     (plist-get tree :children))))
+
+    ('mirror
+     (let* ((mx (plist-get tree :mx))
+            (my (plist-get tree :my))
+            (child-transform (scad-sketch--mirror-transform mx my transform)))
+       (scad-sketch--tree-path-ds
+        session child-transform (plist-get tree :child))))
+
     (_ nil)))
 
 (defun scad-sketch--compound-d (path-ds)
@@ -298,10 +315,15 @@
 (defun scad-sketch--tree-contains-shape-p (tree shape-id)
   "Return non-nil if TREE contains a leaf with SHAPE-ID."
   (pcase (plist-get tree :kind)
-    ('shape   (eq (plist-get tree :shape-id) shape-id))
-    ('boolean (cl-some (lambda (child)
-                         (scad-sketch--tree-contains-shape-p child shape-id))
-                       (plist-get tree :children)))
+    ('shape
+     (eq (plist-get tree :shape-id) shape-id))
+    ('boolean
+     (cl-some (lambda (child)
+                (scad-sketch--tree-contains-shape-p child shape-id))
+              (plist-get tree :children)))
+    ('mirror
+     (scad-sketch--tree-contains-shape-p
+      (plist-get tree :child) shape-id))
     (_ nil)))
 
 (defun scad-sketch--deepest-containing-group (tree shape-id)
@@ -319,6 +341,61 @@
 ;;
 ;; This is the core primitive for all boolean preview rendering.
 ;; See the Commentary section for the explanation of why this works.
+(defun scad-sketch--draw-mirror-axis (svg transform session mirror)
+  "Draw MIRROR axis and editable normal handles."
+  (let* ((mirror-id (plist-get mirror :mirror-id))
+         (axis      (scad-sketch--mirror-axis-segment mirror))
+         (a         (nth 0 axis))
+         (b         (nth 1 axis))
+         (attention (scad-sketch--attention-ref session))
+         (axis-ref  (scad-sketch--mirror-ref mirror-id))
+         (axis-attn (and attention
+                         (scad-sketch--same-ref-p attention axis-ref)))
+         (axis-sel  (scad-sketch--mirror-ref-selected-p session mirror-id))
+         (stroke    (cond (axis-sel  "#d13f00")
+                          (axis-attn "#0057c2")
+                          (t         "#0057c2"))))
+    ;; Axis line: long dashed secondary-color line.
+    (scad-sketch--svg-line svg transform a b
+                           :stroke stroke
+                           :stroke-width (cond (axis-sel 4)
+                                               (axis-attn 3)
+                                               (t 2))
+                           :stroke-dasharray "14,8"
+                           :stroke-opacity (if (or axis-sel axis-attn) 0.95 0.55))
+
+    ;; Normal handles on either side of the axis.
+    (dotimes (idx 2)
+      (let* ((xy        (scad-sketch--mirror-handle-xy session mirror idx))
+             (screen    (funcall transform xy))
+             (point-ref (scad-sketch--mirror-point-ref idx mirror-id))
+             (sel       (scad-sketch--mirror-point-selected-p
+                         session mirror-id idx))
+             (attn      (and attention
+                             (scad-sketch--same-ref-p attention point-ref))))
+        (when (and (fboundp 'scad-sketch--hover-attention-p)
+                   (scad-sketch--hover-attention-p session point-ref))
+          (scad-sketch--draw-attention-halo svg screen 11))
+        (svg-circle svg (nth 0 screen) (nth 1 screen)
+                    (cond (sel 8) (attn 7) (t 6))
+                    :stroke (cond (sel "#d13f00")
+                                  (attn "#0057c2")
+                                  (t "#0057c2"))
+                    :stroke-width 2
+                    :fill (cond (sel "#fff0e8")
+                                (attn "#dfefff")
+                                (t "#ffffff")))
+        (svg-text svg (format "%s:axis%d" mirror-id idx)
+                  :x (+ (nth 0 screen) 8)
+                  :y (- (nth 1 screen) 8)
+                  :font-size 11
+                  :fill "#0057c2")))))
+
+(defun scad-sketch--draw-mirror-axes (svg transform session)
+  "Draw all mirror axes in SESSION."
+  (dolist (mirror (scad-sketch-session--tree-mirrors
+                   (scad-sketch-session-tree session)))
+    (scad-sketch--draw-mirror-axis svg transform session mirror)))
 
 (defun scad-sketch--draw-compound (parent-node compound-d
                                                fill-color stroke-color stroke-width
@@ -361,11 +438,10 @@ Optional STROKE-DASH sets stroke-dasharray on both passes."
       (svg-node svg 'defs)))
 
 (defun scad-sketch--render-tree (svg defs transform session tree)
-  "Render boolean TREE into SVG using masks/clips stored in DEFS.
+  "Render TREE into SVG using masks/clips stored in DEFS.
 Returns the outermost <g> node created, or nil."
   (pcase (plist-get tree :kind)
 
-    ;; ── Leaf shape ────────────────────────────────────────────────────────────
     ('shape
      (let* ((shape (scad-sketch-session-shape-by-id
                     session (plist-get tree :shape-id)))
@@ -375,25 +451,31 @@ Returns the outermost <g> node created, or nil."
            (scad-sketch--draw-compound g d "#ffffff" "#888888" 2)
            g))))
 
-    ;; ── Boolean node ──────────────────────────────────────────────────────────
+    ('mirror
+     (let* ((g        (svg-node svg 'g))
+            (mx       (plist-get tree :mx))
+            (my       (plist-get tree :my))
+            (child    (plist-get tree :child))
+            ;; Actual mirrored output.
+            (mxf      (scad-sketch--mirror-transform mx my transform))
+            (mirror-d (scad-sketch--compound-d
+                       (scad-sketch--tree-path-ds session mxf child))))
+       ;; The source-side child is intentionally left to the normal per-shape
+       ;; overlay layer.  The mirror result gets a dashed secondary outline.
+       (scad-sketch--draw-compound g mirror-d "#ffffff" "#0057c2" 2 "14,8")
+       g))
+
     ('boolean
      (let ((op       (plist-get tree :op))
            (children (plist-get tree :children)))
        (pcase op
-
-         ;; ── union ─────────────────────────────────────────────────────────────
-         ;; Compound path of ALL leaves: fill covers seams, stroke on white = gone.
          ('union
-          (let* ((g          (svg-node svg 'g))
-                 (all-ds     (scad-sketch--tree-path-ds session transform tree))
-                 (compound   (scad-sketch--compound-d all-ds)))
+          (let* ((g        (svg-node svg 'g))
+                 (all-ds   (scad-sketch--tree-path-ds session transform tree))
+                 (compound (scad-sketch--compound-d all-ds)))
             (scad-sketch--draw-compound g compound "#ffffff" "#888888" 2)
             g))
 
-         ;; ── difference ────────────────────────────────────────────────────────
-         ;; SVG mask blacks out subtract shapes.  Positive child drawn as a
-         ;; compound path inside the masked group.  Subtract shapes get a
-         ;; dashed compound outline drawn outside the mask.
          ('difference
           (when children
             (let* ((mask-id  (scad-sketch--next-svg-id "diff-mask"))
@@ -408,48 +490,42 @@ Returns the outermost <g> node created, or nil."
                                                session transform sub))
                                             (cdr children))))
                    (sub-d    (scad-sketch--compound-d sub-ds)))
-              ;; Mask: white canvas minus black subtract shapes.
               (svg-node mask 'rect :x 0 :y 0
                         :width scad-sketch-canvas-width
                         :height scad-sketch-canvas-height
-                        :fill "#ffffff")
-              (when (not (string-empty-p sub-d))
-                (svg-node mask 'path :d sub-d :fill "#000000" :fill-rule "nonzero"))
-              ;; Positive child inside masked group (recurse for nested booleans).
-              (scad-sketch--render-tree g defs transform session (car children))
-              ;; Dashed guide outlines for subtract shapes, drawn OUTSIDE the mask.
-              (when (not (string-empty-p sub-d))
-                (scad-sketch--draw-compound svg sub-d "none" "#aaaaaa" 1.5 "5,3"))
+                        :fill "white")
+              (when (and sub-d (not (string-empty-p sub-d)))
+                (svg-node mask 'path :d sub-d
+                          :fill "black" :fill-rule "nonzero"
+                          :stroke "black" :stroke-width 1))
+              (scad-sketch--draw-compound g pos-d "#ffffff" "#888888" 2)
+              (when (and sub-d (not (string-empty-p sub-d)))
+                (scad-sketch--draw-compound svg sub-d "none" "#aaaaaa" 1 "6,4"))
               g)))
 
-         ;; ── intersection ──────────────────────────────────────────────────────
-         ;; clipPath from non-primary children; primary child inside clip group.
          ('intersection
           (when children
-            (let* ((clip-id  (scad-sketch--next-svg-id "int-clip"))
-                   (clip     (svg-node defs 'clipPath :id clip-id))
-                   (g        (svg-node svg 'g
-                                      :clip-path (format "url(#%s)" clip-id)))
-                   (clip-ds  (apply #'append
-                                    (mapcar (lambda (child)
-                                              (scad-sketch--tree-path-ds
-                                               session transform child))
-                                            (cdr children))))
-                   (clip-d   (scad-sketch--compound-d clip-ds)))
-              (when (not (string-empty-p clip-d))
-                (svg-node clip 'path :d clip-d :fill-rule "nonzero"))
-              (scad-sketch--render-tree g defs transform session (car children))
-              ;; Ghost dashed outlines for clip shapes.
-              (when (not (string-empty-p clip-d))
-                (scad-sketch--draw-compound svg clip-d "none" "#aaaaaa" 1.5 "5,3"))
+            (let* ((clip-id (scad-sketch--next-svg-id "intersect-clip"))
+                   (clip    (svg-node defs 'clipPath :id clip-id))
+                   (g       (svg-node svg 'g :clip-path (format "url(#%s)" clip-id)))
+                   (first-d (scad-sketch--compound-d
+                             (scad-sketch--tree-path-ds
+                              session transform (car children))))
+                   (rest-ds (apply #'append
+                                   (mapcar (lambda (sub)
+                                             (scad-sketch--tree-path-ds
+                                              session transform sub))
+                                           (cdr children))))
+                   (rest-d  (scad-sketch--compound-d rest-ds)))
+              (when (and rest-d (not (string-empty-p rest-d)))
+                (svg-node clip 'path :d rest-d :fill "black" :fill-rule "nonzero"))
+              (scad-sketch--draw-compound g first-d "#ffffff" "#888888" 2)
+              (when (and rest-d (not (string-empty-p rest-d)))
+                (scad-sketch--draw-compound svg rest-d "none" "#aaaaaa" 1 "6,4"))
               g)))
 
-         ;; ── fallback ──────────────────────────────────────────────────────────
-         (_
-          (let ((g (svg-node svg 'g)))
-            (dolist (child children)
-              (scad-sketch--render-tree g defs transform session child))
-            g)))))
+         (_ nil))))
+
     (_ nil)))
 
 ;;;; ── Group-level attention highlight ────────────────────────────────────────
@@ -1060,36 +1136,34 @@ Circle handle indices:
 
 ;;;; ── Main scene draw pass ───────────────────────────────────────────────────
 (defun scad-sketch--draw-path (svg transform session)
-  "Draw the full scene: boolean preview, selection, hover-attention, overlays, boxes."
+  "Draw the full scene: preview, mirror axes, selection, attention, overlays."
   (scad-sketch-session-sync-active-shape-from-points session)
   (let ((boolean-session (scad-sketch--root-is-boolean-p session)))
 
-    ;; Layer 1 – Semantic boolean preview.
-    (when (and boolean-session (scad-sketch-session-tree session))
+    ;; Layer 1 – Semantic preview, including mirror output outlines.
+    (when (scad-sketch-session-tree session)
       (let ((defs (scad-sketch--ensure-defs svg)))
         (setq scad-sketch--svg-id-counter 0)
         (scad-sketch--render-tree svg defs transform session
                                   (scad-sketch-session-tree session))))
 
-    ;; Layer 2 – Selection highlight.
-    ;; In boolean sessions, selected shape refs light up their containing group.
-    ;; In non-boolean sessions, selected shape styling is handled by overlays.
+    ;; Layer 2 – Mirror axes and axis handles.
+    (scad-sketch--draw-mirror-axes svg transform session)
+
+    ;; Layer 3 – Selection highlight for boolean sessions.
     (when boolean-session
       (scad-sketch--draw-group-highlight svg transform session))
 
-    ;; Layer 3 – Hover-attention halo.
-    ;; Point attention is drawn by point/handle renderers.  Shape/boolean
-    ;; hover-attention gets a geometry-level halo here.  Global focus does not
-    ;; draw a halo after the cursor moves away.
-    (let ((hover-attention (scad-sketch--hover-attention-ref session)))
-      (unless (eq (and hover-attention
-                       (scad-sketch--ref-kind hover-attention))
-                  'point)
-        (scad-sketch--draw-ref-geometry-halo
-         svg transform session hover-attention)))
+    ;; Layer 4 – Hover-attention geometry halo, if present.
+    (when (fboundp 'scad-sketch--hover-attention-ref)
+      (let ((hover-attention (scad-sketch--hover-attention-ref session)))
+        (unless (eq (and hover-attention
+                         (scad-sketch--ref-kind hover-attention))
+                    'point)
+          (scad-sketch--draw-ref-geometry-halo
+           svg transform session hover-attention))))
 
-    ;; Layer 4 – Per-shape interactive overlays.
-    ;; In boolean sessions, suppress shape strokes unless drilling into a point.
+    ;; Layer 5 – Per-shape source-side interactive overlays.
     (dolist (shape (scad-sketch-session-shapes session))
       (let* ((shape-id    (scad-sketch-shape-id shape))
              (point-attn  (let ((att (scad-sketch--attention-ref session)))
@@ -1107,7 +1181,7 @@ Circle handle indices:
           ('text    (scad-sketch--draw-one-text-shape
                      svg transform session shape suppress)))))
 
-    ;; Layer 5 – Boolean bounding-box labels.
+    ;; Layer 6 – Boolean bounding-box labels.
     (when (scad-sketch-session-tree session)
       (scad-sketch--draw-boolean-boxes
        svg transform session (scad-sketch-session-tree session)))))

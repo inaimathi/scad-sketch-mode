@@ -16,10 +16,39 @@
 (require 'scad-sketch-session)
 (require 'scad-sketch-geometry)
 (require 'scad-sketch-editor-core)
+(require 'scad-sketch-editor--refs)
 (require 'scad-sketch-editor--selection)
 (require 'scad-sketch-editor--cursor)    ; for --grid/--fine/--coarse
 
 ;;; Internal helpers
+(defun scad-sketch--parse-axis-pair (s)
+  "Parse S as \"x,y\" or \"x y\" and return (X Y)."
+  (unless (string-match
+           "\\`[ \t\n]*\\([-+]?[0-9.]+\\(?:[eE][-+]?[0-9]+\\)?\\)[ \t\n]*[,]?[ \t\n]+\\([-+]?[0-9.]+\\(?:[eE][-+]?[0-9]+\\)?\\)[ \t\n]*\\'"
+           s)
+    ;; Try comma with no whitespace.
+    (unless (string-match
+             "\\`[ \t\n]*\\([-+]?[0-9.]+\\(?:[eE][-+]?[0-9]+\\)?\\)[ \t\n]*,[ \t\n]*\\([-+]?[0-9.]+\\(?:[eE][-+]?[0-9]+\\)?\\)[ \t\n]*\\'"
+             s)
+      (user-error "Axis must be two numbers, like 1,0 or 0, 1")))
+  (let ((x (string-to-number (match-string 1 s)))
+        (y (string-to-number (match-string 2 s))))
+    (when (< (+ (* x x) (* y y)) 0.000001)
+      (user-error "Mirror axis vector must be non-zero"))
+    (list (float x) (float y))))
+
+(defun scad-sketch--select-new-shape (session shape)
+  "Make newly created SHAPE the active selected/focused editor object.
+
+This lives in the editor layer because it uses editor refs."
+  (let* ((shape-id (scad-sketch-shape-id shape))
+         (ref      (scad-sketch--shape-ref shape-id)))
+    (scad-sketch-session-set-active-shape session shape-id)
+    (setf (scad-sketch-session-selection session) (list ref))
+    (setf (scad-sketch-session-focus-ref session) ref)
+    (setf (scad-sketch-session-selected-index session) nil)
+    (setf (scad-sketch-session-hover-index session) 0)
+    shape))
 
 (defun scad-sketch--selected-point (session)
   "Return the currently selected model point in SESSION, or nil."
@@ -51,6 +80,71 @@
           (scad-sketch--point-ref idx shape-id))
     (setf (scad-sketch-session-selection session)
           (list (scad-sketch--point-ref idx shape-id)))))
+
+;;; Mirror-related
+(defun scad-sketch--current-mirror-node (session)
+  "Return the mirror node currently targeted by attention/focus.
+
+If attention is not on a mirror ref and the session has exactly one mirror,
+return that mirror."
+  (let* ((ref (scad-sketch--attention-ref session))
+         (mirror-id (and ref (scad-sketch--ref-mirror-id ref)))
+         (tree (scad-sketch-session-tree session)))
+    (or (and mirror-id
+             (scad-sketch-session--tree-find-mirror tree mirror-id))
+        (let ((mirrors (scad-sketch-session--tree-mirrors tree)))
+          (cond
+           ((= (length mirrors) 1) (car mirrors))
+           ((null mirrors) (user-error "No mirror primitive in this session"))
+           (t (user-error "Hover or focus a mirror axis first")))))))
+
+(defun scad-sketch--set-mirror-axis-vector (mirror mx my)
+  "Set MIRROR normal vector to MX MY."
+  (when (< (+ (* mx mx) (* my my)) 0.000001)
+    (user-error "Mirror axis vector must be non-zero"))
+  (plist-put mirror :mx (float mx))
+  (plist-put mirror :my (float my))
+  mirror)
+
+(defun scad-sketch--move-mirror-handle-to (session mirror-id idx xy)
+  "Move mirror handle IDX for MIRROR-ID to XY.
+
+Handle 0 sets the positive normal.  Handle 1 sets the negative normal."
+  (let ((mirror (scad-sketch-session--tree-find-mirror
+                 (scad-sketch-session-tree session)
+                 mirror-id)))
+    (unless mirror
+      (user-error "No such mirror: %s" mirror-id))
+    (pcase idx
+      (0
+       (scad-sketch--set-mirror-axis-vector
+        mirror (nth 0 xy) (nth 1 xy)))
+      (1
+       (scad-sketch--set-mirror-axis-vector
+        mirror (- (nth 0 xy)) (- (nth 1 xy))))
+      (_
+       (user-error "No such mirror handle: %s" idx)))))
+
+(defun scad-sketch-set-mirror-axis (axis)
+  "Set current mirror axis normal vector from minibuffer.
+
+Input is two numbers, for example:
+  1,0
+  0,1
+  1,1"
+  (interactive
+   (let* ((session (scad-sketch--assert-session))
+          (mirror  (scad-sketch--current-mirror-node session))
+          (default (format "%s,%s"
+                           (scad-sketch--fmt-num (plist-get mirror :mx))
+                           (scad-sketch--fmt-num (plist-get mirror :my)))))
+     (list (read-string "Mirror axis normal [x,y]: " default))))
+  (let ((pair (scad-sketch--parse-axis-pair axis)))
+    (scad-sketch--edit
+     (lambda (s)
+       (let ((mirror (scad-sketch--current-mirror-node s)))
+         (scad-sketch--set-mirror-axis-vector
+          mirror (nth 0 pair) (nth 1 pair)))))))
 
 ;;; Selected geometry movement
 (defun scad-sketch--current-edit-shape (session)
@@ -180,16 +274,40 @@ Text:
     (setf (scad-sketch-session-point session) new)))
 
 (defun scad-sketch--move-selected (dx dy &optional snap)
-  "Move selected vertices/shapes by DX, DY.  Snap to grid when SNAP is non-nil.
+  "Move selected vertices/shapes/handles by DX, DY.
 
-Also move the editor cursor point by the same delta so selected geometry stays
-under the cursor after keyboard movement."
+Snap to grid when SNAP is non-nil.  Also move the editor cursor point by the
+same delta so selected geometry stays under the cursor after keyboard movement."
   (scad-sketch--edit
    (lambda (s)
-     (let ((shape-ids (scad-sketch--selected-shape-ids s))
-           (locs      (scad-sketch--selected-point-locs s nil))
-           (moved     nil))
+     (let ((mirror-locs (scad-sketch--selected-mirror-locs s))
+           (shape-ids   (scad-sketch--selected-shape-ids s))
+           (locs        (scad-sketch--selected-point-locs s nil))
+           (moved       nil))
+
        (cond
+        (mirror-locs
+         (dolist (loc mirror-locs)
+           (let* ((mirror-id (car loc))
+                  (idx       (cdr loc))
+                  (mirror    (scad-sketch-session--tree-find-mirror
+                              (scad-sketch-session-tree s)
+                              mirror-id))
+                  (old-xy    (and mirror
+                                  (scad-sketch--mirror-handle-xy
+                                   s mirror idx)))
+                  (new-xy    (and old-xy
+                                  (scad-sketch--move-xy old-xy dx dy)))
+                  (snapped   (and new-xy
+                                  (if snap
+                                      (scad-sketch--snap-xy
+                                       new-xy (scad-sketch--grid s))
+                                    new-xy))))
+             (unless mirror
+               (user-error "No such mirror: %s" mirror-id))
+             (scad-sketch--move-mirror-handle-to s mirror-id idx snapped)
+             (setq moved t))))
+
         (shape-ids
          (dolist (shape-id shape-ids)
            (let ((shape (scad-sketch-session-shape-by-id s shape-id)))
@@ -210,8 +328,8 @@ under the cursor after keyboard movement."
                        (new-xy   (scad-sketch--move-xy
                                   (scad-sketch--point-xy old) dx dy))
                        (snapped  (if snap
-                                     (scad-sketch--snap-xy new-xy
-                                                           (scad-sketch--grid s))
+                                     (scad-sketch--snap-xy
+                                      new-xy (scad-sketch--grid s))
                                    new-xy))
                        (new      (scad-sketch--make-model-point snapped old)))
                   (setf (scad-sketch-shape-points shape)
@@ -222,23 +340,21 @@ under the cursor after keyboard movement."
                 (let* ((old-xy  (scad-sketch--primitive-handle-xy shape idx))
                        (new-xy  (scad-sketch--move-xy old-xy dx dy))
                        (snapped (if snap
-                                    (scad-sketch--snap-xy new-xy
-                                                          (scad-sketch--grid s))
+                                    (scad-sketch--snap-xy
+                                     new-xy (scad-sketch--grid s))
                                   new-xy)))
                   (scad-sketch--move-primitive-handle-to shape idx snapped)
                   (setq moved t)))))))
 
         (t
          (let ((shape (scad-sketch-session-active-shape s)))
-           (unless shape (user-error "No selected point or shape"))
+           (unless shape (user-error "No selected point, shape, or mirror handle"))
            (scad-sketch--move-shape shape dx dy snap
                                     (scad-sketch--grid s))
            (setq moved t))))
 
        (when moved
          (scad-sketch--move-session-point-by s dx dy snap)
-         ;; Preserve the intuitive behavior: after moving the selected thing,
-         ;; hover cycling starts from the top of whatever is now under point.
          (setf (scad-sketch-session-hover-index s) 0))))))
 
 ;;; Selected-vertex movement interactive commands
@@ -389,36 +505,222 @@ active point when no explicit selection exists."
                     (car (scad-sketch-session-points s)))))))))))
 
 ;;; Shape-creation commands
+(defun scad-sketch--marks-oldest-first (session)
+  "Return SESSION marks in geometry order, oldest first."
+  (reverse (scad-sketch-session-marks session)))
+
+(defun scad-sketch--require-mark-count (session min-count &optional max-count)
+  "Return marks when SESSION has between MIN-COUNT and MAX-COUNT marks.
+
+Marks are returned oldest first.  When MAX-COUNT is nil, there is no upper
+bound."
+  (let ((marks (scad-sketch--marks-oldest-first session)))
+    (when (< (length marks) min-count)
+      (user-error "Need at least %d mark%s"
+                  min-count
+                  (if (= min-count 1) "" "s")))
+    (when (and max-count (> (length marks) max-count))
+      (user-error "Need at most %d mark%s"
+                  max-count
+                  (if (= max-count 1) "" "s")))
+    marks))
+
+(defun scad-sketch--distance-xy (a b)
+  "Return Euclidean distance between model-space points A and B."
+  (let ((dx (- (nth 0 a) (nth 0 b)))
+        (dy (- (nth 1 a) (nth 1 b))))
+    (sqrt (+ (* dx dx) (* dy dy)))))
+
+(defun scad-sketch--drawn-square-from-diagonal (mark point)
+  "Return square metadata plist from diagonal MARK and POINT.
+
+This creates an axis-aligned OpenSCAD square/rectangle primitive."
+  (let* ((x1 (float (nth 0 mark)))
+         (y1 (float (nth 1 mark)))
+         (x2 (float (nth 0 point)))
+         (y2 (float (nth 1 point)))
+         (x  (min x1 x2))
+         (y  (min y1 y2))
+         (w  (abs (- x2 x1)))
+         (h  (abs (- y2 y1))))
+    (when (or (< w 0.0001) (< h 0.0001))
+      (user-error "Square needs non-zero width and height"))
+    (list :x x :y y :w w :h h :angle 0.0)))
+
+(defun scad-sketch--drawn-square-from-three-corners (origin width-corner point)
+  "Return square metadata from ORIGIN, WIDTH-CORNER, and POINT.
+
+ORIGIN and WIDTH-CORNER define the local X axis and width.  POINT defines the
+height by projection onto the perpendicular local Y axis.  The result is a
+possibly rotated OpenSCAD square/rectangle primitive."
+  (let* ((ox (float (nth 0 origin)))
+         (oy (float (nth 1 origin)))
+         (wx (- (float (nth 0 width-corner)) ox))
+         (wy (- (float (nth 1 width-corner)) oy))
+         (width (sqrt (+ (* wx wx) (* wy wy)))))
+    (when (< width 0.0001)
+      (user-error "First two square corners must be distinct"))
+
+    (let* ((ux (/ wx width))
+           (uy (/ wy width))
+           ;; Perpendicular to local X.
+           (vx (- uy))
+           (vy ux)
+           (px (- (float (nth 0 point)) ox))
+           (py (- (float (nth 1 point)) oy))
+           (raw-height (+ (* px vx) (* py vy)))
+           (height (abs raw-height))
+           ;; If point is on the negative side of the perpendicular axis,
+           ;; flip local Y by moving origin to that side and using positive h.
+           (x (if (< raw-height 0)
+                  (+ ox (* vx raw-height))
+                ox))
+           (y (if (< raw-height 0)
+                  (+ oy (* vy raw-height))
+                oy))
+           (angle (* 180.0 (/ (atan uy ux) pi))))
+      (when (< height 0.0001)
+        (user-error "Third square corner must not be collinear with first edge"))
+      (list :x x :y y :w width :h height :angle angle))))
+
+(defun scad-sketch--drawn-square-metadata (session)
+  "Return square metadata from SESSION marks and cursor point.
+
+With one mark, the mark and point are opposite diagonal corners.
+With two marks, the two marks and point are interpreted as three corners:
+oldest mark, newest mark, point."
+  (let* ((marks (scad-sketch--require-mark-count session 1 2))
+         (point (scad-sketch-session-point session)))
+    (pcase (length marks)
+      (1
+       (scad-sketch--drawn-square-from-diagonal (car marks) point))
+      (2
+       (scad-sketch--drawn-square-from-three-corners
+        (nth 0 marks) (nth 1 marks) point))
+      (_
+       (user-error "Square drawing expects one or two marks")))))
+
+(defun scad-sketch--polygon-points-from-marks-and-point (session)
+  "Return model polygon points from SESSION marks and cursor point.
+
+Marks are used oldest first, followed by the current cursor point.  New points
+default to radius 0."
+  (let ((marks (scad-sketch--require-mark-count session 1))
+        (point (scad-sketch-session-point session)))
+    (mapcar #'scad-sketch--make-model-point
+            (append marks (list point)))))
+
+(defun scad-sketch-draw-square-from-marks ()
+  "Draw a square/rectangle primitive from marks and cursor point.
+
+With one mark, the mark and point are opposite diagonal corners.
+
+With two marks, the oldest mark is the origin corner, the newest mark is the
+width corner, and point defines the height-side corner."
+  (interactive)
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((md       (scad-sketch--drawn-square-metadata s))
+            (shape-id (scad-sketch-session-next-shape-id s))
+            (shape
+             (scad-sketch-session--make-square-shape
+              shape-id
+              (plist-get md :x)
+              (plist-get md :y)
+              (plist-get md :w)
+              (plist-get md :h)
+              (plist-get md :angle)
+              (list :created-in-session t))))
+       (scad-sketch--add-drawn-shape s shape)))))
+
+(defun scad-sketch--add-drawn-shape (session shape)
+  "Add drawn SHAPE to SESSION and select/focus it.
+
+Model insertion is delegated to `scad-sketch-session-add-shape-object';
+editor selection/focus is handled here to avoid a session→refs dependency."
+  (scad-sketch-session-add-shape-object session shape)
+  (scad-sketch--select-new-shape session shape))
+
+(defun scad-sketch--add-drawn-polygon (session points &optional polyround)
+  "Add a drawn polygon with POINTS to SESSION and select/focus it."
+  (let* ((shape-id (scad-sketch-session-next-shape-id session))
+         (shape
+          (scad-sketch-session--make-polygon-shape
+           shape-id points polyround nil nil
+           (list :created-in-session t))))
+    (scad-sketch--add-drawn-shape session shape)))
+
+(defun scad-sketch-draw-circle-from-mark ()
+  "Draw a circle primitive using cursor point as center and mark as radius point.
+
+Uses the most recent mark as the point on the radius."
+  (interactive)
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((mark     (or (car (scad-sketch-session-marks s))
+                          (user-error "No marks set")))
+            (center   (scad-sketch-session-point s))
+            (radius   (scad-sketch--distance-xy center mark))
+            (shape-id (scad-sketch-session-next-shape-id s))
+            (shape
+             (scad-sketch-session--make-circle-shape
+              shape-id
+              (nth 0 center)
+              (nth 1 center)
+              radius
+              (list :created-in-session t))))
+       (when (< radius 0.0001)
+         (user-error "Circle radius must be non-zero"))
+       (scad-sketch--add-drawn-shape s shape)))))
+
+(defun scad-sketch-draw-polygon-from-marks ()
+  "Draw a closed polygon from marks and cursor point.
+
+Marks are used oldest first, followed by the current cursor point.  New vertices
+default to polyRound radius 0; use `scad-sketch-set-radius' afterward to set
+radii normally."
+  (interactive)
+  (scad-sketch--edit
+   (lambda (s)
+     (let ((points (scad-sketch--polygon-points-from-marks-and-point s)))
+       (when (< (length points) 3)
+         (user-error "Polygon needs at least two marks plus point"))
+       (scad-sketch--add-drawn-polygon s points)))))
 
 (defun scad-sketch-line-from-mark ()
-  "Create a new polygon shape from marks (oldest first) and cursor."
+  "Create a new polygon path from marks, oldest first, and cursor point.
+
+This is retained as the historical `l' command.  For a closed polygon requiring
+at least three vertices, use `scad-sketch-draw-polygon-from-marks'."
   (interactive)
   (scad-sketch--edit
    (lambda (s)
-     (unless (scad-sketch-session-marks s) (user-error "No marks set"))
-     (let ((points
-            (append
-             (mapcar #'scad-sketch--make-model-point
-                     (reverse (scad-sketch-session-marks s)))
-             (list (scad-sketch--make-model-point
-                    (scad-sketch-session-point s))))))
-       (scad-sketch-session-add-shape s points)))))
+     (let ((points (scad-sketch--polygon-points-from-marks-and-point s)))
+       (scad-sketch--add-drawn-polygon s points)))))
 
 (defun scad-sketch-rectangle-from-mark ()
-  "Create a new rectangle polygon shape from most recent mark to cursor."
+  "Create a square/rectangle primitive from most recent mark to cursor.
+
+This is retained as the historical `r' command.  It uses the most recent mark
+and cursor point as opposite diagonal corners."
   (interactive)
   (scad-sketch--edit
    (lambda (s)
-     (let ((mark (or (car (scad-sketch-session-marks s))
-                     (user-error "No marks set")))
-           (pt   (scad-sketch-session-point s)))
-       (let* ((x1 (nth 0 mark)) (y1 (nth 1 mark))
-              (x2 (nth 0 pt))   (y2 (nth 1 pt))
-              (points
-               (mapcar #'scad-sketch--make-model-point
-                       (list (list x1 y1) (list x2 y1)
-                             (list x2 y2) (list x1 y2)))))
-         (scad-sketch-session-add-shape s points))))))
+     (let* ((mark (or (car (scad-sketch-session-marks s))
+                      (user-error "No marks set")))
+            (pt   (scad-sketch-session-point s))
+            (md   (scad-sketch--drawn-square-from-diagonal mark pt))
+            (shape-id (scad-sketch-session-next-shape-id s))
+            (shape
+             (scad-sketch-session--make-square-shape
+              shape-id
+              (plist-get md :x)
+              (plist-get md :y)
+              (plist-get md :w)
+              (plist-get md :h)
+              (plist-get md :angle)
+              (list :created-in-session t))))
+       (scad-sketch--add-drawn-shape s shape)))))
 
 (defun scad-sketch-toggle-closed ()
   "Toggle the closed flag on the active shape."
@@ -646,7 +948,6 @@ This does not mutate source geometry and does not clear global focus."
      (setf (scad-sketch-session-hover-index s) 0))))
 
 ;;; Undo restore command
-
 (defun scad-sketch-undo ()
   "Undo the last sketch edit."
   (interactive)
@@ -661,6 +962,7 @@ This does not mutate source geometry and does not clear global focus."
     (setf (scad-sketch-session-closed          session) (plist-get entry :closed))
     (setf (scad-sketch-session-shapes          session) (plist-get entry :shapes))
     (setf (scad-sketch-session-active-shape-id session) (plist-get entry :active-shape-id))
+    (setf (scad-sketch-session-tree            session) (plist-get entry :tree))
     (setf (scad-sketch-session-targets         session) (plist-get entry :targets))
     (setf (scad-sketch-session-root-target-id  session) (plist-get entry :root-target-id))
     (setf (scad-sketch-session-selection       session) (plist-get entry :selection))
