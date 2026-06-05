@@ -138,54 +138,77 @@
 (define-derived-mode scad-sketch-editor-mode special-mode "SCAD-Sketch"
   "Major mode for the scad-sketch visual editor.
 
-The buffer shows an SVG canvas followed by a live OpenSCAD array preview.
+The buffer shows an SVG canvas followed by a live OpenSCAD preview.
+The preview may represent an array, a single 2D primitive, a polygon,
+a transformed shape, a boolean tree, a mirror tree, or a newly inserted
+generic block.
 
-The canvas displays:
-  - a grid (step set with `g')
-  - the polygon path with arcs where polyRound radii are set
-  - vertex dots labelled SHAPE:INDEX; selected vertex highlighted in orange
-  - dashed radius circles on rounded vertices (orange = capped by edge length)
-  - the cursor crosshair in blue, marks in green
-  - a status bar: name, grid size, cursor coords, dirty flag
+The editor is intended as a small FreeCAD-sketch-like interface for
+OpenSCAD source.  It edits a supported 2D subset directly and writes the
+result back to the source buffer.
 
-Movement:
-  <arrow>             move cursor one grid step; snaps to grid
-  C-<arrow>           move cursor one coarse step; snaps to grid
-  M-<arrow>           move cursor one fine step; intentionally off-grid
-  S-<arrow>           move selected vertex one grid step
-  M-S-<arrow>         move selected vertex one fine step (off-grid)
-  C-S-<arrow>         move selected vertex one coarse step
+Visual model:
+  - The blue cursor crosshair is the editor point.
+  - Green markers are construction marks.
+  - Orange objects are explicitly selected.
+  - A blue halo marks the currently hovered attention target.
+  - Polygon vertices and primitive handles are point-like refs.
+  - Circle, square, text, mirror-axis, and polygon handles can be hovered,
+    selected, and edited.
+  - Boolean and mirror previews are rendered from the session tree.
+  - Mirror output is shown as a dashed secondary outline; the source-side
+    geometry remains directly editable.
 
-Vertex editing:
-  TAB / S-TAB         select next / previous vertex (cursor jumps to it)
-  p                   append cursor as a new vertex at end of array
-  i                   insert cursor after selected vertex; if marks are set,
-                        inserts each mark (oldest first) then cursor
-  k                   delete the selected vertex
+Core concepts:
+  selection
+    Explicit multi-object set toggled by selection commands.
 
-Marks:
-  m                   replace all marks with cursor position
-  M                   push cursor position onto mark stack
-  `                   pop most recent mark and jump cursor there
-  \'                   jump cursor to most recent mark (non-destructive)
-  C                   clear all marks
+  hover
+    Stack of refs under or near the editor point.  Hover cycling chooses
+    which one receives attention without moving point.
 
-Geometry:
-  x / y               set cursor X or Y coordinate
-  X / Y               set cursor X or Y relative to most recent mark (delta)
-  d                   set distance from mark, preserving angle
-  a                   set angle from mark in degrees, preserving distance
-  R                   set polyRound radius on selected vertex
-  c                   toggle closed / open polygon
-  l                   append marks (oldest first) then cursor as vertices
-  r                   append rectangle from most recent mark to cursor
-  g                   change grid step
+  focus
+    Global fallback ref used when nothing is hovered.  Global focus cycling
+    moves point to the focused ref.
 
-Session:
-  w                   write array back to source buffer
-  u                   undo
-  q                   quit (offers to write back if dirty)
-  ?                   key summary in the echo area
+  attention
+    The effective current ref: hovered ref if any exists, otherwise focus.
+
+Editing model:
+  - Plain cursor movement is clean UI state.
+  - Shape, point, primitive-handle, mirror-axis, and tree mutations are dirty
+    source edits and are undoable.
+  - Moving selected geometry also moves point by the same delta.
+  - Drawing commands create inline shape calls.
+  - Existing inline polygons remain inline.
+  - Existing variable-reference polygons continue to reference their source
+    arrays when safe.
+  - Direct array sessions remain array sessions; generic blank sessions emit
+    shape/tree source instead of an array assignment.
+
+Major command groups:
+  point and mark operations
+    Move point, set/push/pop/jump marks, clear transient state.
+
+  hover/focus/selection operations
+    Cycle hovered refs, cycle global focus, toggle selection, clear selection.
+
+  insertion prefix
+    Add polygon points, draw polygons, boxes, circles, text, and legacy
+    mark-based paths.
+
+  group prefix
+    Wrap selected whole shapes as union, difference, intersection, or mirror;
+    break apart boolean/mirror groups.
+
+  parameter editing
+    Set coordinates, grid, radius, mirror axis, text content, text size,
+    text font, and primitive sizes.
+
+  session operations
+    Undo, write back, quit, and native Emacs help.
+
+Use `describe-mode' or `describe-bindings' for the generated key list.
 
 \\{scad-sketch-editor-mode-map}"
   (setq truncate-lines t)
