@@ -42,10 +42,17 @@
 (smark-test--load "scad-sketch-editor--editing.el"    'scad-sketch-editor--editing)
 
 ;; These tests exercise command dispatch, not SVG rendering.
-(unless (fboundp 'scad-sketch--render)
-  (defun scad-sketch--render ()
-    "No-op render stub for mark undo tests."
-    nil))
+(defun smark-test--render-stub ()
+  "No-op render stub for mark undo tests."
+  nil)
+
+
+(defmacro smark-test--with-render-stub (&rest body)
+  "Run BODY with `scad-sketch--render' temporarily disabled."
+  (declare (indent 0))
+  `(cl-letf (((symbol-function 'scad-sketch--render)
+              #'smark-test--render-stub))
+     ,@body))
 
 (defun smark-test--goto-substring (needle &optional offset)
   "Move point to NEEDLE's beginning plus OFFSET."
@@ -59,13 +66,14 @@
 
 Within BODY, `session' is bound and `scad-sketch--session' is buffer-local."
   (declare (indent 0))
-  `(with-temp-buffer
-     (insert "polygon([[0,0], [30,0], [15,26]]);\n")
-     (smark-test--goto-substring "polygon")
-     (let ((session (scad-sketch-session-at-point)))
-       (with-temp-buffer
-         (setq-local scad-sketch--session session)
-         ,@body))))
+  `(smark-test--with-render-stub
+     (with-temp-buffer
+       (insert "polygon([[0,0], [30,0], [15,26]]);\n")
+       (smark-test--goto-substring "polygon")
+       (let ((session (scad-sketch-session-at-point)))
+         (with-temp-buffer
+           (setq-local scad-sketch--session session)
+           ,@body)))))
 
 (defun smark-test--set-point (session point)
   "Set SESSION cursor POINT."
