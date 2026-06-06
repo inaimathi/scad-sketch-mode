@@ -449,7 +449,6 @@ For mirror nodes, returns the mirrored output paths."
          (stroke    (cond (axis-sel  "#d13f00")
                           (axis-attn "#0057c2")
                           (t         "#0057c2"))))
-    ;; Axis line: long dashed secondary-color line.
     (scad-sketch--svg-line svg transform a b
                            :stroke stroke
                            :stroke-width (cond (axis-sel 4)
@@ -458,7 +457,6 @@ For mirror nodes, returns the mirrored output paths."
                            :stroke-dasharray "14,8"
                            :stroke-opacity (if (or axis-sel axis-attn) 0.95 0.55))
 
-    ;; Normal handles on either side of the axis.
     (dotimes (idx 2)
       (let* ((xy        (scad-sketch--mirror-handle-xy session mirror idx))
              (screen    (funcall transform xy))
@@ -479,11 +477,12 @@ For mirror nodes, returns the mirrored output paths."
                     :fill (cond (sel "#fff0e8")
                                 (attn "#dfefff")
                                 (t "#ffffff")))
-        (svg-text svg (format "%s:axis%d" mirror-id idx)
-                  :x (+ (nth 0 screen) 8)
-                  :y (- (nth 1 screen) 8)
-                  :font-size 11
-                  :fill "#0057c2")))))
+        (scad-sketch--draw-label
+         svg
+         (format "%s:axis%d" mirror-id idx)
+         (+ (nth 0 screen) 8)
+         (- (nth 1 screen) 8)
+         sel attn axis-attn)))))
 
 (defun scad-sketch--draw-mirror-axes (svg transform session)
   "Draw all mirror axes in SESSION."
@@ -826,6 +825,90 @@ here; `scad-sketch--draw-ref-geometry-halo' handles the current attention ref."
                  (scad-sketch--draw-compound svg compound "#ffffff" "#d13f00" 5))))))))
     highlighted))
 
+(defun scad-sketch--label-gradient (defs id color-a color-b)
+  "Ensure text gradient ID exists in DEFS and return url(#ID)."
+  (unless (cl-find-if
+           (lambda (node)
+             (and (consp node)
+                  (eq (car node) 'linearGradient)
+                  (equal (plist-get (cadr node) :id) id)))
+           (cddr defs))
+    (let ((grad (svg-node defs 'linearGradient
+                          :id id
+                          :x1 "0%" :y1 "0%"
+                          :x2 "100%" :y2 "0%")))
+      (svg-node grad 'stop
+                :offset "0%"
+                :stop-color color-a)
+      (svg-node grad 'stop
+                :offset "100%"
+                :stop-color color-b)))
+  (format "url(#%s)" id))
+
+(defun scad-sketch--boolean-group-label-state (session group)
+  "Return plist state for GROUP's label.
+
+The label is attention-highlighted when either the group wrapper or group
+members ref has attention.  It is selection-highlighted when all child shapes
+are selected directly."
+  (let* ((group-id    (plist-get group :group-id))
+         (attention   (scad-sketch--attention-ref session))
+         (group-ref   (scad-sketch--boolean-ref group-id))
+         (members-ref (scad-sketch--boolean-members-ref group-id))
+         (shape-ids   (scad-sketch-session--tree-shape-ids group))
+         (selected    (and shape-ids
+                           (cl-every
+                            (lambda (shape-id)
+                              (scad-sketch--shape-selected-p session shape-id))
+                            shape-ids)))
+         (attn        (or (and attention
+                               (scad-sketch--same-ref-p attention group-ref))
+                          (and attention
+                               (scad-sketch--same-ref-p attention members-ref)))))
+    (list :selected selected
+          :attention attn)))
+
+(defun scad-sketch--draw-label (svg label x y &optional selected attention active)
+  "Draw LABEL at X Y with unobtrusive state-aware styling.
+
+Plain labels are small and gray.  Selected labels use an orange gradient.
+Attention labels use a blue gradient matching the attention halo.  Active labels
+get a slightly darker neutral treatment.  This deliberately does not draw a
+label background box."
+  (let* ((text (format "%s" label))
+         (defs (scad-sketch--ensure-defs svg))
+         (fill (cond
+                (attention
+                 (scad-sketch--label-gradient defs
+                                              "scad-sketch-label-attention"
+                                              "#0057c2"
+                                              "#6fa8ff"))
+                (selected
+                 (scad-sketch--label-gradient defs
+                                              "scad-sketch-label-selected"
+                                              "#d13f00"
+                                              "#ff9a55"))
+                (active
+                 "#333333")
+                (t
+                 "#555555")))
+         (stroke (cond
+                  (attention "#dfefff")
+                  (selected  "#fff0e8")
+                  (t         nil))))
+    (apply #'svg-text svg text
+           (append
+            (list :x x
+                  :y y
+                  :font-size 11
+                  :font-weight (if (or selected attention) "bold" "normal")
+                  :fill fill)
+            ;; A very thin pale stroke keeps gradient text readable without
+            ;; turning labels into badges/boxes.
+            (when stroke
+              (list :stroke stroke
+                    :stroke-width 0.35))))))
+
 ;;;; ── Grid ───────────────────────────────────────────────────────────────────
 
 (defun scad-sketch--draw-grid (svg bounds transform session)
@@ -873,9 +956,12 @@ here; `scad-sketch--draw-ref-geometry-halo' handles the current attention ref."
                                     (attn         "#dfefff")
                                     (active-shape "#ffffff")
                                     (t            "#f8f8f8")))
-    (svg-text svg (format "%s:%d" (scad-sketch--ref-shape-id point-ref) idx)
-              :x (+ (nth 0 screen) 8) :y (- (nth 1 screen) 8)
-              :font-size 11 :fill "#333333")
+    (scad-sketch--draw-label
+     svg
+     (format "%s:%d" (scad-sketch--ref-shape-id point-ref) idx)
+     (+ (nth 0 screen) 8)
+     (- (nth 1 screen) 8)
+     sel attn active-shape)
     (when (> radius 0)
       (let* ((prev    (cond ((> idx 0)      (nth (1- idx) points))
                             (closed         (nth (1- n)   points))))
@@ -886,19 +972,21 @@ here; `scad-sketch--draw-ref-geometry-halo' handles the current attention ref."
                          (scad-sketch--point-xy prev) xy
                          (scad-sketch--point-xy next) radius)))
              (actual-r (if corner (plist-get corner :radius) radius))
-             (capped   (and corner (< (+ actual-r 0.001) radius))))
+             (capped   (and corner (< (+ actual-r 0.001) radius)))
+             (r-label  (if capped
+                           (format "r=%s→%s"
+                                   (scad-sketch--fmt-num radius)
+                                   (scad-sketch--fmt-num actual-r))
+                         (format "r=%s" (scad-sketch--fmt-num actual-r)))))
         (svg-circle svg (nth 0 screen) (nth 1 screen)
                     (scad-sketch--pixel-radius actual-r transform)
                     :stroke (if capped "#c04000" "#804000")
                     :stroke-width 1 :stroke-dasharray "3,3" :fill "none")
-        (svg-text svg (if capped
-                          (format "r=%s→%s"
-                                  (scad-sketch--fmt-num radius)
-                                  (scad-sketch--fmt-num actual-r))
-                        (format "r=%s" (scad-sketch--fmt-num actual-r)))
-                  :x (+ (nth 0 screen) 8) :y (+ (nth 1 screen) 18)
-                  :font-size 11
-                  :fill (if capped "#c04000" "#804000"))))))
+        (scad-sketch--draw-label
+         svg r-label
+         (+ (nth 0 screen) 8)
+         (+ (nth 1 screen) 18)
+         sel attn active-shape)))))
 
 (defun scad-sketch--draw-one-polygon-shape (svg transform session shape
                                                 &optional suppress-stroke)
@@ -1004,7 +1092,10 @@ When SUPPRESS-STROKE is non-nil, skip path stroke; vertex dots still drawn."
              (sel        (scad-sketch--point-selected-p session shape-id idx))
              (attn       (and attention
                               (scad-sketch--same-ref-p attention point-ref)))
-             (is-center  (= idx 4)))
+             (is-center  (= idx 4))
+             (label      (if is-center
+                             (format "%s:center" shape-id)
+                           (format "%s:%d" shape-id idx))))
         (when (scad-sketch--hover-attention-p session point-ref)
           (scad-sketch--draw-attention-halo svg screen 11))
         (svg-circle svg (nth 0 screen) (nth 1 screen)
@@ -1019,13 +1110,11 @@ When SUPPRESS-STROKE is non-nil, skip path stroke; vertex dots still drawn."
                                 (attn "#dfefff")
                                 (active-shape "#ffffff")
                                 (t "#f8f8f8")))
-        (svg-text svg (if is-center
-                          (format "%s:center" shape-id)
-                        (format "%s:%d" shape-id idx))
-                  :x (+ (nth 0 screen) 8)
-                  :y (- (nth 1 screen) 8)
-                  :font-size 11
-                  :fill "#333333")))))
+        (scad-sketch--draw-label
+         svg label
+         (+ (nth 0 screen) 8)
+         (- (nth 1 screen) 8)
+         sel attn active-shape)))))
 
 (defun scad-sketch--draw-one-circle-shape (svg transform session shape
                                                &optional suppress-stroke)
@@ -1060,7 +1149,6 @@ Circle handle indices:
                              (ghosted      "#9a9a9a")
                              (t            "#777777"))))
 
-    ;; Circle outline.
     (unless suppress-stroke
       (svg-circle svg (nth 0 screen) (nth 1 screen) pr
                   :stroke stroke
@@ -1071,7 +1159,6 @@ Circle handle indices:
                   :stroke-dasharray (if ghosted "6,4" nil)
                   :fill "none"))
 
-    ;; Radius guide lines, east and north only.
     (dolist (idx '(1 2))
       (let ((handle-xy (scad-sketch--primitive-handle-xy shape idx)))
         (when handle-xy
@@ -1080,7 +1167,6 @@ Circle handle indices:
                                  :stroke-width 1
                                  :stroke-dasharray "3,3"))))
 
-    ;; Center + radius handles.
     (dotimes (idx (scad-sketch--primitive-handle-count shape))
       (let* ((handle-xy  (scad-sketch--primitive-handle-xy shape idx))
              (handle-ref (scad-sketch--point-ref idx shape-id)))
@@ -1105,7 +1191,13 @@ Circle handle indices:
                   (cond (sel "#fff0e8")
                         (attn "#dfefff")
                         (is-center "#ffffff")
-                        (t "#f8f8f8"))))
+                        (t "#f8f8f8")))
+                 (label
+                  (pcase idx
+                    (0 (format "%s:center" shape-id))
+                    (1 (format "%s:r-east" shape-id))
+                    (2 (format "%s:r-north" shape-id))
+                    (_ (format "%s:%d" shape-id idx)))))
             (when (scad-sketch--hover-attention-p session handle-ref)
               (scad-sketch--draw-attention-halo svg handle-s 11))
             (svg-circle svg
@@ -1115,27 +1207,21 @@ Circle handle indices:
                         :stroke handle-stroke
                         :stroke-width 2
                         :fill handle-fill)
-            (svg-text svg
-                      (pcase idx
-                        (0 (format "%s:center" shape-id))
-                        (1 (format "%s:r-east" shape-id))
-                        (2 (format "%s:r-north" shape-id))
-                        (_ (format "%s:%d" shape-id idx)))
-                      :x (+ (nth 0 handle-s) 8)
-                      :y (- (nth 1 handle-s) 8)
-                      :font-size 11
-                      :fill "#333333")))))
+            (scad-sketch--draw-label
+             svg label
+             (+ (nth 0 handle-s) 8)
+             (- (nth 1 handle-s) 8)
+             sel attn active-shape)))))
 
-    ;; Radius label near east radius handle.
     (let ((east (scad-sketch--primitive-handle-xy shape 1)))
       (when east
         (let ((east-s (funcall transform east)))
-          (svg-text svg
-                    (format "r=%s" (scad-sketch--fmt-num r))
-                    :x (+ (nth 0 east-s) 8)
-                    :y (+ (nth 1 east-s) 16)
-                    :font-size 11
-                    :fill "#333333"))))))
+          (scad-sketch--draw-label
+           svg
+           (format "r=%s" (scad-sketch--fmt-num r))
+           (+ (nth 0 east-s) 8)
+           (+ (nth 1 east-s) 16)
+           shape-sel shape-attn active-shape))))))
 
 (defun scad-sketch--draw-one-text-shape (svg transform session shape
                                              &optional suppress-stroke)
@@ -1155,6 +1241,10 @@ Circle handle indices:
          (shape-attn  (and attention
                            (eq (scad-sketch--ref-kind attention) 'shape)
                            (eq (scad-sketch--ref-shape-id attention) shape-id)))
+         (origin-ref  (scad-sketch--point-ref 0 shape-id))
+         (origin-sel  (scad-sketch--point-selected-p session shape-id 0))
+         (origin-attn (and attention
+                           (scad-sketch--same-ref-p attention origin-ref)))
          (active-shape (eq shape-id
                            (scad-sketch-session-active-shape-id session))))
     (unless suppress-stroke
@@ -1190,19 +1280,31 @@ Circle handle indices:
                             (scad-sketch--fmt-num (- angle))
                             (scad-sketch--fmt-num (nth 0 screen))
                             (scad-sketch--fmt-num (nth 1 screen)))))))
+    (when (scad-sketch--hover-attention-p session origin-ref)
+      (scad-sketch--draw-attention-halo svg screen 11))
     (svg-circle svg (nth 0 screen) (nth 1 screen)
-                (cond (shape-sel 8) (shape-attn 7) (active-shape 6) (t 5))
-                :stroke (cond (shape-sel "#d13f00")
+                (cond (origin-sel 8)
+                      (origin-attn 7)
+                      (shape-sel 8)
+                      (shape-attn 7)
+                      (active-shape 6)
+                      (t 5))
+                :stroke (cond (origin-sel "#d13f00")
+                              (origin-attn "#0057c2")
+                              (shape-sel "#d13f00")
                               (shape-attn "#0057c2")
                               (active-shape "#333333")
                               (t "#777777"))
                 :stroke-width 2
                 :fill "#ffffff")
-    (svg-text svg (format "%s" shape-id)
-              :x (+ (nth 0 screen) 8)
-              :y (- (nth 1 screen) 8)
-              :font-size 11
-              :fill "#333333")))
+    (scad-sketch--draw-label
+     svg
+     (format "%s" shape-id)
+     (+ (nth 0 screen) 8)
+     (- (nth 1 screen) 8)
+     (or origin-sel shape-sel)
+     (or origin-attn shape-attn)
+     active-shape)))
 
 ;;;; ── Boolean bounding boxes ─────────────────────────────────────────────────
 (defun scad-sketch--shape-bounds (shape)
@@ -1247,25 +1349,53 @@ Circle handle indices:
             (apply #'max (mapcar #'cadr pts))))))
 
 (defun scad-sketch--draw-boolean-boxes (svg transform session tree)
-  "Draw labelled dotted bounding boxes for boolean groups in TREE."
-  (when (eq (plist-get tree :kind) 'boolean)
-    (let* ((op     (plist-get tree :op))
-           (bounds (scad-sketch--tree-bounds session tree)))
-      (when bounds
-        (pcase-let ((`(,min-x ,max-x ,min-y ,max-y) bounds))
-          (let* ((p0 (funcall transform (list min-x min-y)))
-                 (p1 (funcall transform (list max-x max-y)))
-                 (x  (min (nth 0 p0) (nth 0 p1)))
-                 (y  (min (nth 1 p0) (nth 1 p1)))
-                 (w  (abs (- (nth 0 p1) (nth 0 p0))))
-                 (h  (abs (- (nth 1 p1) (nth 1 p0)))))
-            (svg-rectangle svg x y w h :stroke "#6a5acd" :stroke-width 1
-                           :stroke-dasharray "6,4" :fill "none")
-            (svg-text svg (format "%s" op)
-                      :x (+ x 6) :y (+ y 14)
-                      :font-size 12 :fill "#6a5acd")))))
-    (dolist (child (plist-get tree :children))
-      (scad-sketch--draw-boolean-boxes svg transform session child))))
+  "Draw labelled dotted bounding boxes for boolean groups in TREE.
+
+Boolean labels use the same unobtrusive state-aware styling as point/shape
+labels."
+  (pcase (and tree (plist-get tree :kind))
+    ('boolean
+     (let* ((op     (plist-get tree :op))
+            (bounds (scad-sketch--tree-bounds session tree)))
+       (when bounds
+         (pcase-let ((`(,min-x ,max-x ,min-y ,max-y) bounds))
+           (let* ((p0    (funcall transform (list min-x min-y)))
+                  (p1    (funcall transform (list max-x max-y)))
+                  (x     (min (nth 0 p0) (nth 0 p1)))
+                  (y     (min (nth 1 p0) (nth 1 p1)))
+                  (w     (abs (- (nth 0 p1) (nth 0 p0))))
+                  (h     (abs (- (nth 1 p1) (nth 1 p0))))
+                  (state (scad-sketch--boolean-group-label-state
+                          session tree))
+                  (selected  (plist-get state :selected))
+                  (attention (plist-get state :attention)))
+             (svg-rectangle svg x y w h
+                            :stroke (cond (attention "#0057c2")
+                                          (selected  "#d13f00")
+                                          (t         "#6a5acd"))
+                            :stroke-width (cond (attention 2.5)
+                                                (selected  2)
+                                                (t         1))
+                            :stroke-dasharray "6,4"
+                            :fill "none")
+             (scad-sketch--draw-label
+              svg
+              (format "%s" op)
+              (+ x 6)
+              (+ y 14)
+              selected
+              attention
+              nil)))))
+     (dolist (child (plist-get tree :children))
+       (scad-sketch--draw-boolean-boxes svg transform session child)))
+
+    ('mirror
+     (scad-sketch--draw-boolean-boxes
+      svg transform session (plist-get tree :child)))
+
+    ('sequence
+     (dolist (child (plist-get tree :children))
+       (scad-sketch--draw-boolean-boxes svg transform session child)))))
 
 ;;;; ── Main scene draw pass ───────────────────────────────────────────────────
 (defun scad-sketch--draw-path (svg transform session)
