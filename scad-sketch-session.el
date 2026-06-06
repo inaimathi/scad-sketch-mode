@@ -707,6 +707,34 @@ as used, which is fine for avoiding generated-name collisions."
                 (eq (scad-sketch-shape-id shape) shape-id))
               (scad-sketch-session-shapes session)))
 
+(defun scad-sketch-session--shape-metadata-put (shape key value)
+  "Set SHAPE metadata KEY to VALUE.
+
+When VALUE is nil, KEY remains present with nil value.  This is fine because
+metadata flags are read with `plist-get'."
+  (let ((md (copy-sequence (or (scad-sketch-shape-metadata shape) nil))))
+    (setf (scad-sketch-shape-metadata shape)
+          (plist-put md key value)))
+  shape)
+
+(defun scad-sketch-session--shape-points-var-name (shape)
+  "Return SHAPE's local points variable name, or nil."
+  (plist-get (scad-sketch-shape-metadata shape) :points-var-name))
+
+(defun scad-sketch-session--shape-force-inline-p (shape)
+  "Return non-nil if SHAPE should ignore source refs and emit inline."
+  (plist-get (scad-sketch-shape-metadata shape) :force-inline-p))
+
+(defun scad-sketch-session--shape-source-target-suppressed-p (shape target-id)
+  "Return non-nil if SHAPE suppresses source TARGET-ID write-back.
+
+This is used when a polygon that originally referenced an external array is
+toggled back inline.  The polygon call should emit inline points, and the source
+array should not be rewritten as part of this session."
+  (and (eq (scad-sketch-shape-kind shape) 'polygon)
+       (eq (scad-sketch-shape-source-target-id shape) target-id)
+       (scad-sketch-session--shape-force-inline-p shape)))
+
 (defun scad-sketch-session-active-shape (session)
   "Return SESSION's active shape."
   (or (scad-sketch-session-shape-by-id
@@ -855,6 +883,56 @@ This is a model-level helper.  It does not select or focus the new shape."
 
 ;;;; Formatting / emission
 
+(defun scad-sketch-session-polygon-extracted-p (session shape)
+  "Return non-nil if polygon SHAPE currently emits through a variable.
+
+This includes both editor-created local extraction and original source variable
+references, unless SHAPE is currently forced inline."
+  (and (eq (scad-sketch-shape-kind shape) 'polygon)
+       (or (scad-sketch-session--shape-points-var-name shape)
+           (scad-sketch-session--shape-source-name session shape))))
+
+(defun scad-sketch-session-set-polygon-extraction (session shape name)
+  "Make polygon SHAPE emit through local points variable NAME.
+
+NAME should be a valid OpenSCAD identifier string.  The variable assignment is
+emitted at the same local indentation level as the polygon call."
+  (unless (eq (scad-sketch-shape-kind shape) 'polygon)
+    (user-error "Only polygon-like shapes can extract points"))
+  (unless (and name (string-match-p "\\`[A-Za-z_$][A-Za-z0-9_$]*\\'" name))
+    (user-error "Invalid points variable name: %S" name))
+  (scad-sketch-session--shape-metadata-put shape :points-var-name name)
+  (scad-sketch-session--shape-metadata-put shape :force-inline-p nil)
+  shape)
+
+(defun scad-sketch-session-set-polygon-inline (shape)
+  "Make polygon SHAPE emit inline points.
+
+For an originally variable-reference polygon, this suppresses source-array
+write-back and emits the edited points in the polygon call."
+  (unless (eq (scad-sketch-shape-kind shape) 'polygon)
+    (user-error "Only polygon-like shapes can inline points"))
+  (scad-sketch-session--shape-metadata-put shape :points-var-name nil)
+  (scad-sketch-session--shape-metadata-put shape :force-inline-p t)
+  shape)
+
+(defun scad-sketch-session-toggle-polygon-extraction
+    (session shape &optional name)
+  "Toggle polygon SHAPE between inline points and variable-ref points.
+
+When SHAPE currently emits through a variable, force it inline.
+When SHAPE currently emits inline, extract points into NAME, defaulting to
+\"pts\"."
+  (unless (eq (scad-sketch-shape-kind shape) 'polygon)
+    (user-error "Only polygon-like shapes can toggle point extraction"))
+  (if (scad-sketch-session-polygon-extracted-p session shape)
+      (progn
+        (scad-sketch-session-set-polygon-inline shape)
+        'inline)
+    (scad-sketch-session-set-polygon-extraction
+     session shape (or name "pts"))
+    'extracted))
+
 (defun scad-sketch-session--any-radius-p (points)
   "Return non-nil if POINTS contains any non-zero radius."
   (cl-some (lambda (p) (and (nth 2 p) (> (nth 2 p) 0))) points))
@@ -914,6 +992,16 @@ This is a model-level helper.  It does not select or focus the new shape."
           indent
           name
           (scad-sketch-session--fmt-array points indent force-radii)))
+
+(defun scad-sketch-session--emit-points-assignment
+    (name points indent &optional force-r)
+  "Emit NAME = POINTS assignment at INDENT.
+
+When FORCE-R is non-nil, emit points as [x, y, r] triples."
+  (format "%s%s = %s;\n"
+          indent
+          name
+          (scad-sketch-session--fmt-inline-array points force-r)))
 
 (defun scad-sketch-session--emit-polygon-call
     (points indent polyround &optional source-name _extracted-name)
@@ -985,12 +1073,41 @@ Otherwise emit points inline, always.  Do not extract large inline polygons."
     (scad-sketch-session-target-by-id
      session (scad-sketch-session-root-target-id session))))
 
-(defun scad-sketch-session-source-targets (session)
-  "Return writable source targets in SESSION."
+(defun scad-sketch-session-inline-deleted-source-targets (session)
+  "Return source targets that should be deleted on write-back.
+
+When a polygon originally backed by a source array is explicitly forced inline,
+the polygon call emits the points directly and the backing array assignment is
+removed from the editable source region."
   (cl-remove-if-not
    (lambda (target)
      (and (eq (scad-sketch-target-role target) 'source)
-          (scad-sketch-target-write-p target)))
+          (scad-sketch-target-write-p target)
+          (cl-some
+           (lambda (shape)
+             (scad-sketch-session--shape-source-target-suppressed-p
+              shape
+              (scad-sketch-target-id target)))
+           (scad-sketch-session-shapes session))))
+   (scad-sketch-session-targets session)))
+
+(defun scad-sketch-session-source-targets (session)
+  "Return writable source targets in SESSION.
+
+If a shape originally came from a source array but has been forced inline, do
+not write that source array back.  The edited points will be emitted inline in
+the polygon call instead."
+  (cl-remove-if-not
+   (lambda (target)
+     (and (eq (scad-sketch-target-role target) 'source)
+          (scad-sketch-target-write-p target)
+          (not
+           (cl-some
+            (lambda (shape)
+              (scad-sketch-session--shape-source-target-suppressed-p
+               shape
+               (scad-sketch-target-id target)))
+            (scad-sketch-session-shapes session)))))
    (scad-sketch-session-targets session)))
 
 (defun scad-sketch-session--make-marker-pair (node)
@@ -1279,9 +1396,20 @@ the original point."
      session (scad-sketch-shape-source-target-id shape))))
 
 (defun scad-sketch-session--shape-source-name (session shape)
-  "Return SHAPE's source variable name, if any."
-  (let ((target (scad-sketch-session--shape-source-target session shape)))
-    (and target (scad-sketch-target-name target))))
+  "Return original source variable name for SHAPE, or nil.
+
+This does not include local extraction names created by the editor.  Those are
+handled separately by `scad-sketch-session--shape-points-var-name'.
+
+When SHAPE is forced inline, ignore any original variable reference."
+  (unless (scad-sketch-session--shape-force-inline-p shape)
+    (let* ((md        (scad-sketch-shape-metadata shape))
+           (target-id (scad-sketch-shape-source-target-id shape))
+           (target    (and target-id
+                           (scad-sketch-session-target-by-id
+                            session target-id))))
+      (or (plist-get md :source-name)
+          (and target (scad-sketch-target-name target))))))
 
 (defun scad-sketch-session--emit-square-shape (shape indent)
   "Emit square SHAPE at INDENT."
@@ -1396,10 +1524,10 @@ the original point."
 (defun scad-sketch-session--emit-shape-with-assignments (session shape indent)
   "Return (:assignments STR :call STR) for SHAPE in SESSION.
 
-Polygon source style is preserved:
-  - variable-reference polygons keep polygon(name)
-  - inline polygons stay inline
-  - newly created polygons are inline"
+Polygon source style is controlled by shape metadata:
+  - :points-var-name emits a local points assignment and calls polygon(NAME)
+  - :force-inline-p ignores original source refs and emits inline
+  - otherwise original source refs are preserved when present"
   (pcase (scad-sketch-shape-kind shape)
     ('circle
      (list :assignments ""
@@ -1416,11 +1544,20 @@ Polygon source style is preserved:
     ('polygon
      (let* ((shape-points (scad-sketch-shape-points shape))
             (polyround    (scad-sketch-shape-polyround shape))
-            ;; This intentionally returns non-nil only for true source-target
-            ;; variable refs.  Flattened/transformed refs and created polygons
-            ;; have no source target and therefore emit inline.
-            (source       (scad-sketch-session--shape-source-name session shape)))
-       (list :assignments ""
+            (local-name   (scad-sketch-session--shape-points-var-name shape))
+            (source       (or local-name
+                              (scad-sketch-session--shape-source-name
+                               session shape)))
+            (force-r      (or polyround
+                              (cl-some (lambda (p)
+                                          (and (nth 2 p)
+                                               (> (nth 2 p) 0)))
+                                        shape-points)))
+            (assignments  (if local-name
+                              (scad-sketch-session--emit-points-assignment
+                               local-name shape-points indent force-r)
+                            "")))
+       (list :assignments assignments
              :call (scad-sketch-session--emit-polygon-call
                     shape-points indent polyround source))))
 
@@ -1533,11 +1670,17 @@ Polygon source style is preserved:
     (set-marker (scad-sketch-target-end-marker target) (point))))
 
 (defun scad-sketch-session-write-back (session)
-  "Write SESSION edits back to its source buffer."
+  "Write SESSION edits back to its source buffer.
+
+Normal source targets are rewritten.  Source targets made obsolete by an
+explicit inline-points toggle are deleted.  Root targets are rewritten after
+session tree emission."
   (scad-sketch-session-sync-active-shape-from-points session)
-  (let* ((source (scad-sketch-session-source-buffer session))
-         (root   (scad-sketch-session-root-target session))
-         (source-targets (scad-sketch-session-source-targets session)))
+  (let* ((source         (scad-sketch-session-source-buffer session))
+         (root           (scad-sketch-session-root-target session))
+         (source-targets (scad-sketch-session-source-targets session))
+         (delete-targets (scad-sketch-session-inline-deleted-source-targets
+                          session)))
     (unless (buffer-live-p source)
       (user-error "Source buffer is gone"))
 
@@ -1547,11 +1690,19 @@ Polygon source style is preserved:
               (list "This session only owns arrays; open a polygon, shape, or boolean to write multiple shapes")))
 
     (let (write-items)
+      ;; Rewrite normal source targets.
       (dolist (target source-targets)
         (push (cons target
                     (scad-sketch-session--source-target-replacement
                      session target))
               write-items))
+
+      ;; Delete source arrays that have been explicitly forced inline.
+      (dolist (target delete-targets)
+        (push (cons target "") write-items))
+
+      ;; Rewrite the root call/tree last logically; actual buffer replacement is
+      ;; sorted bottom-to-top below.
       (when root
         (push (cons root
                     (scad-sketch-session--root-target-replacement

@@ -105,6 +105,7 @@
     (define-key map (kbd "c")           #'scad-sketch-toggle-closed)
     (define-key map (kbd "R")           #'scad-sketch-set-radius)
     (define-key map (kbd "A")           #'scad-sketch-set-mirror-axis)
+    (define-key map (kbd "e")           #'scad-sketch-toggle-points-extraction)
 
     ;; ── Hover / focus / selection ───────────────────────────────────
     (define-key map (kbd "TAB")         #'scad-sketch-next-hovered)
@@ -127,6 +128,7 @@
 
     ;; ── Session/help ────────────────────────────────────────────────
     (define-key map (kbd "u")           #'scad-sketch-undo)
+    (define-key map (kbd "z")           #'scad-sketch-undo)
     (define-key map (kbd "w")           #'scad-sketch-write-back)
     (define-key map (kbd "q")           #'scad-sketch-quit)
     (define-key map (kbd "?")           #'describe-mode)

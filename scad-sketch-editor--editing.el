@@ -762,6 +762,55 @@ and cursor point as opposite diagonal corners."
        (setf (scad-sketch-session-closed s)
              (scad-sketch-shape-closed shape))))))
 
+(defun scad-sketch--attention-polygon-shape (session)
+  "Return the polygon shape currently under attention in SESSION.
+
+Point refs resolve to their parent shape.  Shape refs resolve directly.  If no
+attention ref exists, fall back to the active shape."
+  (let* ((ref      (scad-sketch--attention-ref session))
+         (shape-id (and ref
+                        (pcase (scad-sketch--ref-kind ref)
+                          ((or 'shape 'point)
+                           (scad-sketch--ref-shape-id ref))
+                          (_ nil))))
+         (shape    (or (and shape-id
+                            (scad-sketch-session-shape-by-id
+                             session shape-id))
+                       (scad-sketch-session-active-shape session))))
+    (unless (and shape
+                 (eq (scad-sketch-shape-kind shape) 'polygon))
+      (user-error "Attention is not on a polygon-like shape"))
+    shape))
+
+(defun scad-sketch-toggle-points-extraction (name)
+  "Toggle current polygon points between inline and variable-reference output.
+
+When the current polygon is inline, prompt for NAME and emit:
+
+  NAME = [[...]];
+  polygon(NAME);
+
+When the current polygon is already variable-backed, force it back inline."
+  (interactive
+   (let* ((session (scad-sketch--assert-session))
+          (shape   (scad-sketch--attention-polygon-shape session)))
+     (if (scad-sketch-session-polygon-extracted-p session shape)
+         (list nil)
+       (list (read-string "Points variable name: " "pts")))))
+  (scad-sketch--edit
+   (lambda (s)
+     (let* ((shape (scad-sketch--attention-polygon-shape s))
+            (style (scad-sketch-session-toggle-polygon-extraction
+                    s shape name)))
+       (message "Polygon points now emit %s"
+                (pcase style
+                  ('inline "inline")
+                  ('extracted
+                   (format "through `%s'"
+                           (scad-sketch-session--shape-points-var-name
+                            shape)))
+                  (_ (format "%S" style))))))))
+
 (defun scad-sketch-set-radius (radius)
   "Set radius.
 
