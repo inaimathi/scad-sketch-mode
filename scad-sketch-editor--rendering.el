@@ -146,6 +146,78 @@ the sketch session and does not affect write-back or undo.")
           (apply #'min ys)
           (apply #'max ys))))
 
+(defun scad-sketch--draw-text-bounds-halo (svg transform shape)
+  "Draw a no-fill attention halo around text SHAPE's rough bounds.
+
+Text does not use `scad-sketch--draw-compound-halo' because that helper paints a
+white fill pass, which makes the text bounding box look like a solid selected
+rectangle."
+  (pcase-let ((`(,min-x ,max-x ,min-y ,max-y)
+               (scad-sketch--text-rough-bounds shape)))
+    (let* ((p0 (funcall transform (list min-x min-y)))
+           (p1 (funcall transform (list max-x max-y)))
+           (x  (min (nth 0 p0) (nth 0 p1)))
+           (y  (min (nth 1 p0) (nth 1 p1)))
+           (w  (abs (- (nth 0 p1) (nth 0 p0))))
+           (h  (abs (- (nth 1 p1) (nth 1 p0)))))
+      (svg-rectangle svg x y w h
+                     :fill "none"
+                     :stroke "#0057c2"
+                     :stroke-width 8
+                     :stroke-opacity 0.14
+                     :stroke-dasharray "8,5")
+      (svg-rectangle svg x y w h
+                     :fill "none"
+                     :stroke "#0057c2"
+                     :stroke-width 2.5
+                     :stroke-opacity 0.85
+                     :stroke-dasharray "8,5"))))
+
+(defun scad-sketch--draw-visible-text-shape (svg transform shape)
+  "Draw text SHAPE as visible content.
+
+Visible text is rendered white with a dark outline so it reads on both filled
+geometry and the editor background.  This deliberately uses two text passes
+instead of relying on SVG `paint-order', which is not reliable in every Emacs
+SVG renderer.
+
+Do not use this for masks."
+  (let* ((md      (scad-sketch-shape-metadata shape))
+         (str     (or (plist-get md :str) ""))
+         (x       (float (or (plist-get md :x) 0.0)))
+         (y       (float (or (plist-get md :y) 0.0)))
+         (size    (float (or (plist-get md :size) 10.0)))
+         (angle   (float (or (plist-get md :angle) 0.0)))
+         (font    (plist-get md :font))
+         (screen  (funcall transform (list x y)))
+         (font-px (max 8 (scad-sketch--pixel-radius size transform)))
+         (base-attrs
+          (append
+           (list :x (nth 0 screen)
+                 :y (nth 1 screen)
+                 :font-size font-px)
+           (when font
+             (list :font-family font))
+           (unless (< (abs angle) 0.000001)
+             (list :transform
+                   (format "rotate(%s %s %s)"
+                           (scad-sketch--fmt-num (- angle))
+                           (scad-sketch--fmt-num (nth 0 screen))
+                           (scad-sketch--fmt-num (nth 1 screen))))))))
+    ;; Stroke pass.  Slightly thicker than before; this is the visible outline.
+    (apply #'svg-text svg str
+           (append base-attrs
+                   (list :fill "#ffffff"
+                         :stroke "#111111"
+                         :stroke-width 1.15)))
+
+    ;; Fill pass.  Drawn over the stroke pass so the outline does not eat too
+    ;; far into the glyphs.
+    (apply #'svg-text svg str
+           (append base-attrs
+                   (list :fill "#ffffff"
+                         :stroke "none")))))
+
 (defun scad-sketch--shape-xy-points (shape)
   "Return representative XY points for SHAPE, for bounds computation."
   (pcase (scad-sketch-shape-kind shape)
@@ -786,7 +858,10 @@ and is replayed."
     (scad-sketch--render)))
 
 (defun scad-sketch--draw-preview-text-shape (svg transform shape &optional fill)
-  "Draw text SHAPE as actual preview content."
+  "Draw text SHAPE as flat filled text.
+
+This helper is suitable for masks and simple preview drawing.  It intentionally
+does not add an outline."
   (let* ((md      (scad-sketch-shape-metadata shape))
          (str     (or (plist-get md :str) ""))
          (x       (float (or (plist-get md :x) 0.0)))
@@ -801,7 +876,7 @@ and is replayed."
             (list :x (nth 0 screen)
                   :y (nth 1 screen)
                   :font-size font-px
-                  :fill (or fill "#111111"))
+                  :fill (or fill "#ffffff"))
             (when font
               (list :font-family font))
             (unless (< (abs angle) 0.000001)
@@ -843,8 +918,7 @@ Text inside boolean masks is rendered as actual SVG text, not as a bounding box.
            (cond
             ((eq kind 'text)
              ;; Text as actual semantic geometry.
-             (scad-sketch--draw-preview-text-shape
-              g transform shape "#ffffff"))
+             (scad-sketch--draw-visible-text-shape g transform shape))
 
             (d
              (scad-sketch--draw-compound
@@ -1085,7 +1159,8 @@ uses `scad-sketch--draw-attention-halo' instead."
 Point refs intentionally do nothing here; point refs are haloed at the point
 renderer.
 
-Boolean group wrapper refs get a dashed group rectangle.
+Text shape refs use a no-fill bounding-box halo.  Other shape refs use the
+normal compound halo.  Boolean group wrapper refs get a dashed group rectangle.
 Boolean member refs get the child-object compound halo."
   (when ref
     (pcase (scad-sketch--ref-kind ref)
@@ -1095,10 +1170,14 @@ Boolean member refs get the child-object compound halo."
       ('shape
        (let* ((shape-id (scad-sketch--ref-shape-id ref))
               (shape    (scad-sketch-session-shape-by-id session shape-id))
+              (kind     (and shape (scad-sketch-shape-kind shape)))
               (d        (and shape
                              (scad-sketch--shape-path-d shape transform))))
-         (when d
-           (scad-sketch--draw-compound-halo svg d))))
+         (cond
+          ((eq kind 'text)
+           (scad-sketch--draw-text-bounds-halo svg transform shape))
+          (d
+           (scad-sketch--draw-compound-halo svg d)))))
 
       ('boolean
        (let* ((group-id (scad-sketch--ref-group-id ref))
@@ -1115,11 +1194,13 @@ Boolean member refs get the child-object compound halo."
                               (scad-sketch-session--tree-find-group
                                (scad-sketch-session-tree session)
                                group-id)))
+              ;; Use helper paths here, not raw tree paths, so text does not
+              ;; sneak back in as a rough rectangular bbox.
               (ds       (and group
-                             (scad-sketch--tree-path-ds
+                             (scad-sketch--tree-helper-path-ds
                               session transform group)))
               (compound (and ds (scad-sketch--compound-d ds))))
-         (when compound
+         (when (and compound (not (string-empty-p compound)))
            (scad-sketch--draw-compound-halo svg compound))))
 
       ('mirror
@@ -1589,28 +1670,28 @@ Circle handle indices:
 When SUPPRESS-STROKE is non-nil, do not draw the actual text overlay.  This is
 important in boolean sessions: semantic tree rendering decides whether text is
 positive geometry or subtractive geometry."
-  (let* ((shape-id    (scad-sketch-shape-id shape))
-         (md          (scad-sketch-shape-metadata shape))
-         (str         (or (plist-get md :str) ""))
-         (x           (float (or (plist-get md :x) 0.0)))
-         (y           (float (or (plist-get md :y) 0.0)))
-         (size        (float (or (plist-get md :size) 10.0)))
-         (angle       (float (or (plist-get md :angle) 0.0)))
-         (font        (plist-get md :font))
-         (screen      (funcall transform (list x y)))
-         (font-px     (max 8 (scad-sketch--pixel-radius size transform)))
-         (shape-sel   (scad-sketch--shape-selected-p session shape-id))
-         (attention   (scad-sketch--attention-ref session))
-         (shape-attn  (and attention
-                           (eq (scad-sketch--ref-kind attention) 'shape)
-                           (eq (scad-sketch--ref-shape-id attention) shape-id)))
-         (origin-ref  (scad-sketch--point-ref 0 shape-id))
-         (origin-sel  (scad-sketch--point-selected-p session shape-id 0))
-         (origin-attn (and attention
-                           (scad-sketch--same-ref-p attention origin-ref)))
+  (let* ((shape-id     (scad-sketch-shape-id shape))
+         (md           (scad-sketch-shape-metadata shape))
+         (x            (float (or (plist-get md :x) 0.0)))
+         (y            (float (or (plist-get md :y) 0.0)))
+         (screen       (funcall transform (list x y)))
+         (shape-sel    (scad-sketch--shape-selected-p session shape-id))
+         (attention    (scad-sketch--attention-ref session))
+         (shape-attn   (and attention
+                             (eq (scad-sketch--ref-kind attention) 'shape)
+                             (eq (scad-sketch--ref-shape-id attention) shape-id)))
+         (origin-ref   (scad-sketch--point-ref 0 shape-id))
+         (origin-sel   (scad-sketch--point-selected-p session shape-id 0))
+         (origin-attn  (and attention
+                             (scad-sketch--same-ref-p attention origin-ref)))
          (active-shape (eq shape-id
-                           (scad-sketch-session-active-shape-id session))))
+                            (scad-sketch-session-active-shape-id session))))
 
+    ;; Visible editor text + rough bounds overlay.
+    ;;
+    ;; In boolean sessions this may be suppressed because semantic tree
+    ;; rendering owns whether the text appears as positive geometry or as a
+    ;; subtractive mask.
     (unless suppress-stroke
       (pcase-let ((`(,min-x ,max-x ,min-y ,max-y)
                    (scad-sketch--text-rough-bounds shape)))
@@ -1621,35 +1702,22 @@ positive geometry or subtractive geometry."
                (rw (abs (- (nth 0 p1) (nth 0 p0))))
                (rh (abs (- (nth 1 p1) (nth 1 p0)))))
           (svg-rectangle svg rx ry rw rh
-                         :stroke (cond (shape-sel "#d13f00")
+                         :stroke (cond (shape-sel  "#d13f00")
                                        (shape-attn "#0057c2")
                                        (active-shape "#333333")
-                                       (t "#777777"))
-                         :stroke-width (cond (shape-sel 4)
+                                       (t           "#777777"))
+                         :stroke-width (cond (shape-sel  4)
                                              (shape-attn 3)
-                                             (t 1))
+                                             (t          1))
                          :stroke-dasharray "4,4"
                          :fill "none")))
 
-      ;; Actual text overlay is editor affordance only.  In boolean sessions,
-      ;; suppressed text must not draw on top of semantic output.
-      (apply #'svg-text svg str
-             (append
-              (list :x (nth 0 screen)
-                    :y (nth 1 screen)
-                    :font-size font-px
-                    :fill "#111111")
-              (when font
-                (list :font-family font))
-              (unless (< (abs angle) 0.000001)
-                (list :transform
-                      (format "rotate(%s %s %s)"
-                              (scad-sketch--fmt-num (- angle))
-                              (scad-sketch--fmt-num (nth 0 screen))
-                              (scad-sketch--fmt-num (nth 1 screen))))))))
+      ;; Actual visible text content.
+      ;; This is white with a thin dark outline, unlike mask text.
+      (scad-sketch--draw-visible-text-shape svg transform shape))
 
-    ;; If the shape overlay is suppressed and this text is not actively being
-    ;; edited, omit its handle/label too.
+    ;; If the overlay is suppressed and this text is not actively selected or
+    ;; attended, omit the origin handle/label too.
     (unless (and suppress-stroke
                  (not origin-attn)
                  (not shape-attn)
@@ -1657,21 +1725,23 @@ positive geometry or subtractive geometry."
                  (not shape-sel))
       (when (scad-sketch--hover-attention-p session origin-ref)
         (scad-sketch--draw-attention-halo svg screen 11))
+
       (svg-circle svg (nth 0 screen) (nth 1 screen)
-                  (cond (origin-sel 8)
-                        (origin-attn 7)
-                        (shape-sel 8)
-                        (shape-attn 7)
+                  (cond (origin-sel   8)
+                        (origin-attn  7)
+                        (shape-sel    8)
+                        (shape-attn   7)
                         (active-shape 6)
-                        (t 5))
-                  :stroke (cond (origin-sel "#d13f00")
-                                (origin-attn "#0057c2")
-                                (shape-sel "#d13f00")
-                                (shape-attn "#0057c2")
+                        (t            5))
+                  :stroke (cond (origin-sel   "#d13f00")
+                                (origin-attn  "#0057c2")
+                                (shape-sel    "#d13f00")
+                                (shape-attn   "#0057c2")
                                 (active-shape "#333333")
-                                (t "#777777"))
+                                (t            "#777777"))
                   :stroke-width 2
                   :fill "#ffffff")
+
       (scad-sketch--draw-label
        svg
        (format "%s" shape-id)
