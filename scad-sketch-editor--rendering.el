@@ -339,6 +339,144 @@ Bounds include:
   (let ((root (scad-sketch-session-root-target session)))
     (and root (eq (scad-sketch-target-kind root) 'boolean))))
 
+(defun scad-sketch--tree-contains-text-p (session tree)
+  "Return non-nil if TREE contains a text shape."
+  (pcase (and tree (plist-get tree :kind))
+    ('shape
+     (let ((shape (scad-sketch-session-shape-by-id
+                   session (plist-get tree :shape-id))))
+       (and shape (eq (scad-sketch-shape-kind shape) 'text))))
+
+    ('boolean
+     (cl-some (lambda (child)
+                (scad-sketch--tree-contains-text-p session child))
+              (plist-get tree :children)))
+
+    ('mirror
+     (scad-sketch--tree-contains-text-p
+      session (plist-get tree :child)))
+
+    ('sequence
+     (cl-some (lambda (child)
+                (scad-sketch--tree-contains-text-p session child))
+              (plist-get tree :children)))
+
+    (_ nil)))
+
+(defun scad-sketch--draw-mask-tree (parent defs transform session tree fill)
+  "Draw TREE's semantic output into SVG mask/group PARENT using FILL.
+
+This is for mask construction, not visible editor rendering.  Unlike
+`scad-sketch--tree-path-ds', this renders text nodes as actual SVG text instead
+of using their rough bounding boxes."
+  (pcase (and tree (plist-get tree :kind))
+    ('shape
+     (let* ((shape (scad-sketch-session-shape-by-id
+                    session (plist-get tree :shape-id)))
+            (kind  (and shape (scad-sketch-shape-kind shape)))
+            (d     (and shape
+                        (scad-sketch--shape-path-d shape transform))))
+       (when shape
+         (cond
+          ((eq kind 'text)
+           (scad-sketch--draw-preview-text-shape
+            parent transform shape fill))
+          (d
+           (svg-node parent 'path
+                     :d d
+                     :fill fill
+                     :fill-rule "nonzero"
+                     :stroke "none"))))))
+
+    ('sequence
+     (dolist (child (plist-get tree :children))
+       (scad-sketch--draw-mask-tree
+        parent defs transform session child fill)))
+
+    ('mirror
+     (let* ((mx    (float (or (plist-get tree :mx) 1.0)))
+            (my    (float (or (plist-get tree :my) 0.0)))
+            (child (plist-get tree :child))
+            (mxf   (scad-sketch--mirror-transform mx my transform)))
+       (scad-sketch--draw-mask-tree
+        parent defs transform session child fill)
+       (scad-sketch--draw-mask-tree
+        parent defs mxf session child fill)))
+
+    ('boolean
+     (let ((op       (plist-get tree :op))
+           (children (plist-get tree :children)))
+       (pcase op
+         ('union
+          (dolist (child children)
+            (scad-sketch--draw-mask-tree
+             parent defs transform session child fill)))
+
+         ('difference
+          (when children
+            (scad-sketch--draw-mask-tree
+             parent defs transform session (car children) fill)
+            (dolist (sub (cdr children))
+              ;; Inside a mask, black erases, white contributes.
+              (scad-sketch--draw-mask-tree
+               parent defs transform session sub
+               (if (string= fill "#000000") "#ffffff" "#000000")))))
+
+         ('intersection
+          (when children
+            (let* ((clip-id (scad-sketch--next-svg-id "mask-intersection"))
+                   (clip    (svg-node defs 'clipPath :id clip-id))
+                   (g       (svg-node parent 'g
+                                      :clip-path (format "url(#%s)" clip-id))))
+              (dolist (clip-child (cdr children))
+                (scad-sketch--draw-mask-tree
+                 clip defs transform session clip-child "#000000"))
+              (scad-sketch--draw-mask-tree
+               g defs transform session (car children) fill))))
+
+         (_
+          (dolist (child children)
+            (scad-sketch--draw-mask-tree
+             parent defs transform session child fill))))))))
+
+(defun scad-sketch--tree-helper-path-ds (session transform tree)
+  "Return helper SVG path strings for TREE, skipping text shapes.
+
+Used for dashed editor helper outlines.  Text helper outlines should not use the
+rough text bounding box because that makes text look like a rectangular cutter."
+  (pcase (and tree (plist-get tree :kind))
+    ('shape
+     (let* ((shape (scad-sketch-session-shape-by-id
+                    session (plist-get tree :shape-id)))
+            (kind  (and shape (scad-sketch-shape-kind shape)))
+            (d     (and shape
+                         (not (eq kind 'text))
+                         (scad-sketch--shape-path-d shape transform))))
+       (if d (list d) nil)))
+
+    ('boolean
+     (apply #'append
+            (mapcar (lambda (child)
+                      (scad-sketch--tree-helper-path-ds
+                       session transform child))
+                    (plist-get tree :children))))
+
+    ('mirror
+     (let* ((mx  (plist-get tree :mx))
+            (my  (plist-get tree :my))
+            (mxf (scad-sketch--mirror-transform mx my transform)))
+       (scad-sketch--tree-helper-path-ds
+        session mxf (plist-get tree :child))))
+
+    ('sequence
+     (apply #'append
+            (mapcar (lambda (child)
+                      (scad-sketch--tree-helper-path-ds
+                       session transform child))
+                    (plist-get tree :children))))
+
+    (_ nil)))
+
 (defun scad-sketch--tree-xy-points (session tree &optional matrix)
   "Return representative model-space XY points for TREE.
 
@@ -691,149 +829,156 @@ and is replayed."
   "Render TREE into SVG using masks/clips stored in DEFS.
 
 Normal editor rendering includes helper/ghost outlines for booleans and mirrors.
-Preview rendering omits helper geometry and draws only solid semantic output."
-  (let ((preview (scad-sketch--preview-p)))
-    (pcase (and tree (plist-get tree :kind))
+Text inside boolean masks is rendered as actual SVG text, not as a bounding box."
+  (pcase (and tree (plist-get tree :kind))
 
-      ;; ── Leaf shape ─────────────────────────────────────────────────────────
-      ('shape
-       (let* ((shape (scad-sketch-session-shape-by-id
-                      session (plist-get tree :shape-id)))
-              (kind  (and shape (scad-sketch-shape-kind shape)))
-              (d     (and shape
-                           (scad-sketch--shape-path-d shape transform))))
-         (when shape
-           (let ((g (svg-node svg 'g)))
-             (cond
-              ;; Text labels are editor labels; text shapes are content.
-              ((and preview (eq kind 'text))
-               (scad-sketch--draw-preview-text-shape g transform shape))
+    ('shape
+     (let* ((shape (scad-sketch-session-shape-by-id
+                    session (plist-get tree :shape-id)))
+            (kind  (and shape (scad-sketch-shape-kind shape)))
+            (d     (and shape
+                         (scad-sketch--shape-path-d shape transform))))
+       (when shape
+         (let ((g (svg-node svg 'g)))
+           (cond
+            ((eq kind 'text)
+             ;; Text as actual semantic geometry.
+             (scad-sketch--draw-preview-text-shape
+              g transform shape "#ffffff"))
 
-              (d
-               (scad-sketch--draw-compound
-                g
-                d
-                "#ffffff"
-                (if preview "#111111" "#888888")
-                (if preview 2 2))))
-             g))))
-
-      ;; ── Sequence node ──────────────────────────────────────────────────────
-      ('sequence
-       (let ((g (svg-node svg 'g)))
-         (dolist (child (plist-get tree :children))
-           (scad-sketch--render-tree g defs transform session child))
-         g))
-
-      ;; ── Mirror node ────────────────────────────────────────────────────────
-      ('mirror
-       (let* ((g     (svg-node svg 'g))
-              (mx    (float (or (plist-get tree :mx) 1.0)))
-              (my    (float (or (plist-get tree :my) 0.0)))
-              (child (plist-get tree :child))
-              (mxf   (scad-sketch--mirror-transform mx my transform)))
-         (if preview
-             (progn
-               ;; Preview: source-side geometry and mirror output both appear
-               ;; solid; no axis, handles, labels, or dashed ghost styling.
-               (scad-sketch--render-tree g defs transform session child)
-               (scad-sketch--render-tree g defs mxf       session child))
-           ;; Editor: source-side geometry is drawn by the normal overlay layer;
-           ;; mirror output is a dashed secondary outline.
-           (let* ((mirror-d
-                   (scad-sketch--compound-d
-                    (scad-sketch--tree-path-ds session mxf child))))
+            (d
              (scad-sketch--draw-compound
-              g mirror-d "#ffffff" "#0057c2" 2 "14,8")))
-         g))
+              g d "#ffffff" "#888888" 2)))
+           g))))
 
-      ;; ── Boolean node ───────────────────────────────────────────────────────
-      ('boolean
-       (let ((op       (plist-get tree :op))
-             (children (plist-get tree :children)))
-         (pcase op
+    ('sequence
+     (let ((g (svg-node svg 'g)))
+       (dolist (child (plist-get tree :children))
+         (scad-sketch--render-tree g defs transform session child))
+       g))
 
-           ;; Union: one compound path, so internal seams disappear.
-           ('union
-            (let* ((g        (svg-node svg 'g))
-                   (all-ds   (scad-sketch--tree-path-ds session transform tree))
-                   (compound (scad-sketch--compound-d all-ds)))
+    ('mirror
+     (let* ((g        (svg-node svg 'g))
+            (mx       (float (or (plist-get tree :mx) 1.0)))
+            (my       (float (or (plist-get tree :my) 0.0)))
+            (child    (plist-get tree :child))
+            (mxf      (scad-sketch--mirror-transform mx my transform))
+            (mirror-d (scad-sketch--compound-d
+                       (scad-sketch--tree-helper-path-ds
+                        session mxf child))))
+       ;; Source-side child is drawn by the normal overlay layer.  The mirrored
+       ;; output is shown as dashed helper geometry.
+       (when (and mirror-d (not (string-empty-p mirror-d)))
+         (scad-sketch--draw-compound
+          g mirror-d "#ffffff" "#0057c2" 2 "14,8"))
+       g))
+
+    ('boolean
+     (let ((op       (plist-get tree :op))
+           (children (plist-get tree :children)))
+       (pcase op
+         ('union
+          (let* ((g        (svg-node svg 'g))
+                 (all-ds   (scad-sketch--tree-helper-path-ds
+                            session transform tree))
+                 (compound (scad-sketch--compound-d all-ds)))
+            (when (and compound (not (string-empty-p compound)))
               (scad-sketch--draw-compound
-               g compound "#ffffff" (if preview "#111111" "#888888") 2)
-              g))
+               g compound "#ffffff" "#888888" 2))
+            ;; Text leaves are not in the compound path, so draw them
+            ;; semantically as text.
+            (dolist (child children)
+              (when (scad-sketch--tree-contains-text-p session child)
+                (scad-sketch--render-tree g defs transform session child)))
+            g))
 
-           ;; Difference: draw positive child through a mask.  In normal editor
-           ;; mode, subtractors get dashed helper outlines; in preview, they do
-           ;; not appear at all.
-           ('difference
-            (when children
-              (let* ((mask-id (scad-sketch--next-svg-id "diff-mask"))
-                     (mask    (svg-node defs 'mask :id mask-id))
-                     (g       (svg-node svg 'g
-                                        :mask (format "url(#%s)" mask-id)))
-                     (sub-ds  (apply #'append
-                                     (mapcar
-                                      (lambda (sub)
-                                        (scad-sketch--tree-path-ds
-                                         session transform sub))
-                                      (cdr children))))
-                     (sub-d   (scad-sketch--compound-d sub-ds)))
-                (svg-node mask 'rect
-                          :x 0
-                          :y 0
-                          :width scad-sketch-canvas-width
-                          :height scad-sketch-canvas-height
-                          :fill "#ffffff")
-                (when (and sub-d (not (string-empty-p sub-d)))
-                  (svg-node mask 'path
-                            :d sub-d
-                            :fill "#000000"
-                            :fill-rule "nonzero"))
-                (scad-sketch--render-tree
-                 g defs transform session (car children))
-                (when (and (not preview)
-                           sub-d
-                           (not (string-empty-p sub-d)))
-                  (scad-sketch--draw-compound
-                   svg sub-d "none" "#aaaaaa" 1.5 "5,3"))
-                g)))
+         ('difference
+          (when children
+            (let* ((mask-id (scad-sketch--next-svg-id "diff-mask"))
+                   (mask    (svg-node defs 'mask
+                                      :id mask-id
+                                      :x 0
+                                      :y 0
+                                      :width scad-sketch-canvas-width
+                                      :height scad-sketch-canvas-height
+                                      :maskUnits "userSpaceOnUse"))
+                   (g       (svg-node svg 'g
+                                      :mask (format "url(#%s)" mask-id)))
+                   (sub-ds  (apply #'append
+                                   (mapcar
+                                    (lambda (sub)
+                                      (scad-sketch--tree-helper-path-ds
+                                       session transform sub))
+                                    (cdr children))))
+                   (sub-d   (scad-sketch--compound-d sub-ds)))
+              ;; Start with full visibility, then erase subtractors.  Text
+              ;; subtractors are drawn into this mask as actual text.
+              (svg-node mask 'rect
+                        :x 0
+                        :y 0
+                        :width scad-sketch-canvas-width
+                        :height scad-sketch-canvas-height
+                        :fill "#ffffff")
+              (dolist (sub (cdr children))
+                (scad-sketch--draw-mask-tree
+                 mask defs transform session sub "#000000"))
 
-           ;; Intersection: draw first child clipped by the rest.  In preview,
-           ;; the clip helpers are invisible.
-           ('intersection
-            (when children
-              (let* ((clip-id (scad-sketch--next-svg-id "int-clip"))
-                     (clip    (svg-node defs 'clipPath :id clip-id))
-                     (g       (svg-node svg 'g
-                                        :clip-path (format "url(#%s)" clip-id)))
-                     (clip-ds (apply #'append
-                                     (mapcar
-                                      (lambda (child)
-                                        (scad-sketch--tree-path-ds
-                                         session transform child))
-                                      (cdr children))))
-                     (clip-d  (scad-sketch--compound-d clip-ds)))
-                (when (and clip-d (not (string-empty-p clip-d)))
-                  (svg-node clip 'path
-                            :d clip-d
-                            :fill-rule "nonzero"))
-                (scad-sketch--render-tree
-                 g defs transform session (car children))
-                (when (and (not preview)
-                           clip-d
-                           (not (string-empty-p clip-d)))
-                  (scad-sketch--draw-compound
-                   svg clip-d "none" "#aaaaaa" 1.5 "5,3"))
-                g)))
+              (scad-sketch--render-tree
+               g defs transform session (car children))
 
-           ;; Fallback: recurse.
-           (_
-            (let ((g (svg-node svg 'g)))
-              (dolist (child children)
-                (scad-sketch--render-tree g defs transform session child))
-              g)))))
+              ;; Normal-mode helper outlines for subtractors, but not text
+              ;; bounding boxes.
+              (when (and sub-d (not (string-empty-p sub-d)))
+                (scad-sketch--draw-compound
+                 svg sub-d "none" "#aaaaaa" 1.5 "5,3"))
+              g)))
 
-      (_ nil))))
+         ('intersection
+          (when children
+            (let* ((mask-id (scad-sketch--next-svg-id "intersection-mask"))
+                   (mask    (svg-node defs 'mask
+                                      :id mask-id
+                                      :x 0
+                                      :y 0
+                                      :width scad-sketch-canvas-width
+                                      :height scad-sketch-canvas-height
+                                      :maskUnits "userSpaceOnUse"))
+                   (g       (svg-node svg 'g
+                                      :mask (format "url(#%s)" mask-id)))
+                   (rest-ds (apply #'append
+                                   (mapcar
+                                    (lambda (sub)
+                                      (scad-sketch--tree-helper-path-ds
+                                       session transform sub))
+                                    (cdr children))))
+                   (rest-d  (scad-sketch--compound-d rest-ds)))
+              ;; Intersection mask: draw the rest of the intersection as white.
+              ;; Text intersections are drawn as text into the mask.
+              (svg-node mask 'rect
+                        :x 0
+                        :y 0
+                        :width scad-sketch-canvas-width
+                        :height scad-sketch-canvas-height
+                        :fill "#000000")
+              (dolist (sub (cdr children))
+                (scad-sketch--draw-mask-tree
+                 mask defs transform session sub "#ffffff"))
+
+              (scad-sketch--render-tree
+               g defs transform session (car children))
+
+              (when (and rest-d (not (string-empty-p rest-d)))
+                (scad-sketch--draw-compound
+                 svg rest-d "none" "#aaaaaa" 1.5 "5,3"))
+              g)))
+
+         (_
+          (let ((g (svg-node svg 'g)))
+            (dolist (child children)
+              (scad-sketch--render-tree g defs transform session child))
+            g)))))
+
+    (_ nil)))
 
 ;;;; ── Group-level attention highlight ────────────────────────────────────────
 ;;
@@ -1439,7 +1584,11 @@ Circle handle indices:
 
 (defun scad-sketch--draw-one-text-shape (svg transform session shape
                                              &optional suppress-stroke)
-  "Draw text SHAPE editor overlay."
+  "Draw text SHAPE editor overlay.
+
+When SUPPRESS-STROKE is non-nil, do not draw the actual text overlay.  This is
+important in boolean sessions: semantic tree rendering decides whether text is
+positive geometry or subtractive geometry."
   (let* ((shape-id    (scad-sketch-shape-id shape))
          (md          (scad-sketch-shape-metadata shape))
          (str         (or (plist-get md :str) ""))
@@ -1461,6 +1610,7 @@ Circle handle indices:
                            (scad-sketch--same-ref-p attention origin-ref)))
          (active-shape (eq shape-id
                            (scad-sketch-session-active-shape-id session))))
+
     (unless suppress-stroke
       (pcase-let ((`(,min-x ,max-x ,min-y ,max-y)
                    (scad-sketch--text-rough-bounds shape)))
@@ -1479,46 +1629,57 @@ Circle handle indices:
                                              (shape-attn 3)
                                              (t 1))
                          :stroke-dasharray "4,4"
-                         :fill "none"))))
-    (apply #'svg-text svg str
-           (append
-            (list :x (nth 0 screen)
-                  :y (nth 1 screen)
-                  :font-size font-px
-                  :fill "#111111")
-            (when font
-              (list :font-family font))
-            (unless (< (abs angle) 0.000001)
-              (list :transform
-                    (format "rotate(%s %s %s)"
-                            (scad-sketch--fmt-num (- angle))
-                            (scad-sketch--fmt-num (nth 0 screen))
-                            (scad-sketch--fmt-num (nth 1 screen)))))))
-    (when (scad-sketch--hover-attention-p session origin-ref)
-      (scad-sketch--draw-attention-halo svg screen 11))
-    (svg-circle svg (nth 0 screen) (nth 1 screen)
-                (cond (origin-sel 8)
-                      (origin-attn 7)
-                      (shape-sel 8)
-                      (shape-attn 7)
-                      (active-shape 6)
-                      (t 5))
-                :stroke (cond (origin-sel "#d13f00")
-                              (origin-attn "#0057c2")
-                              (shape-sel "#d13f00")
-                              (shape-attn "#0057c2")
-                              (active-shape "#333333")
-                              (t "#777777"))
-                :stroke-width 2
-                :fill "#ffffff")
-    (scad-sketch--draw-label
-     svg
-     (format "%s" shape-id)
-     (+ (nth 0 screen) 8)
-     (- (nth 1 screen) 8)
-     (or origin-sel shape-sel)
-     (or origin-attn shape-attn)
-     active-shape)))
+                         :fill "none")))
+
+      ;; Actual text overlay is editor affordance only.  In boolean sessions,
+      ;; suppressed text must not draw on top of semantic output.
+      (apply #'svg-text svg str
+             (append
+              (list :x (nth 0 screen)
+                    :y (nth 1 screen)
+                    :font-size font-px
+                    :fill "#111111")
+              (when font
+                (list :font-family font))
+              (unless (< (abs angle) 0.000001)
+                (list :transform
+                      (format "rotate(%s %s %s)"
+                              (scad-sketch--fmt-num (- angle))
+                              (scad-sketch--fmt-num (nth 0 screen))
+                              (scad-sketch--fmt-num (nth 1 screen))))))))
+
+    ;; If the shape overlay is suppressed and this text is not actively being
+    ;; edited, omit its handle/label too.
+    (unless (and suppress-stroke
+                 (not origin-attn)
+                 (not shape-attn)
+                 (not origin-sel)
+                 (not shape-sel))
+      (when (scad-sketch--hover-attention-p session origin-ref)
+        (scad-sketch--draw-attention-halo svg screen 11))
+      (svg-circle svg (nth 0 screen) (nth 1 screen)
+                  (cond (origin-sel 8)
+                        (origin-attn 7)
+                        (shape-sel 8)
+                        (shape-attn 7)
+                        (active-shape 6)
+                        (t 5))
+                  :stroke (cond (origin-sel "#d13f00")
+                                (origin-attn "#0057c2")
+                                (shape-sel "#d13f00")
+                                (shape-attn "#0057c2")
+                                (active-shape "#333333")
+                                (t "#777777"))
+                  :stroke-width 2
+                  :fill "#ffffff")
+      (scad-sketch--draw-label
+       svg
+       (format "%s" shape-id)
+       (+ (nth 0 screen) 8)
+       (- (nth 1 screen) 8)
+       (or origin-sel shape-sel)
+       (or origin-attn shape-attn)
+       active-shape))))
 
 ;;;; ── Boolean bounding boxes ─────────────────────────────────────────────────
 (defun scad-sketch--shape-bounds (shape)
@@ -1618,34 +1779,37 @@ labels."
 In normal mode, draw semantic preview, mirror axes, selection/attention,
 per-shape overlays, and boolean boxes.
 
-In preview mode, draw only the final semantic tree output."
+In preview mode, draw only the clean final semantic tree output."
   (scad-sketch-session-sync-active-shape-from-points session)
   (let ((boolean-session (scad-sketch--root-is-boolean-p session))
         (preview         (scad-sketch--preview-p)))
 
     (if preview
-	(when (scad-sketch-session-tree session)
-	  (let ((defs (scad-sketch--ensure-defs svg)))
+        ;; Clean preview rendering.  No grid, labels, handles, points, marks,
+        ;; selection/attention styling, boolean boxes, mirror axes, or helper
+        ;; ghost geometry.
+        (when (scad-sketch-session-tree session)
+          (let ((defs (scad-sketch--ensure-defs svg)))
             (setq scad-sketch--svg-id-counter 0)
             (scad-sketch--draw-preview-tree
              svg defs transform session (scad-sketch-session-tree session))))
 
-      ;; Normal editor semantic preview.
+      ;; Layer 1 – Normal editor semantic preview.
       (when (scad-sketch-session-tree session)
         (let ((defs (scad-sketch--ensure-defs svg)))
           (setq scad-sketch--svg-id-counter 0)
           (scad-sketch--render-tree svg defs transform session
                                     (scad-sketch-session-tree session))))
 
-      ;; Mirror axes and axis handles.
+      ;; Layer 2 – Mirror axes and axis handles.
       (when (fboundp 'scad-sketch--draw-mirror-axes)
         (scad-sketch--draw-mirror-axes svg transform session))
 
-      ;; Selection highlight for boolean sessions.
+      ;; Layer 3 – Selection highlight for boolean sessions.
       (when boolean-session
         (scad-sketch--draw-group-highlight svg transform session))
 
-      ;; Hover-attention geometry halo.
+      ;; Layer 4 – Hover-attention geometry halo.
       (when (fboundp 'scad-sketch--hover-attention-ref)
         (let ((hover-attention (scad-sketch--hover-attention-ref session)))
           (unless (eq (and hover-attention
@@ -1654,31 +1818,35 @@ In preview mode, draw only the final semantic tree output."
             (scad-sketch--draw-ref-geometry-halo
              svg transform session hover-attention))))
 
-      ;; Per-shape source-side interactive overlays.
+      ;; Layer 5 – Per-shape source-side interactive overlays.
       (dolist (shape (scad-sketch-session-shapes session))
         (let* ((shape-id    (scad-sketch-shape-id shape))
                (point-attn  (let ((att (scad-sketch--attention-ref session)))
                               (and att
                                    (eq (scad-sketch--ref-kind att) 'point)
-                                   (eq (scad-sketch--ref-shape-id att) shape-id))))
+                                   (eq (scad-sketch--ref-shape-id att)
+                                       shape-id))))
                (suppress    (and boolean-session (not point-attn))))
           (pcase (scad-sketch-shape-kind shape)
-            ('polygon (scad-sketch--draw-one-polygon-shape
-                       svg transform session shape suppress))
-            ('circle  (scad-sketch--draw-one-circle-shape
-                       svg transform session shape suppress))
-            ('square  (scad-sketch--draw-one-square-shape
-                       svg transform session shape suppress))
-            ('text    (scad-sketch--draw-one-text-shape
-                       svg transform session shape suppress)))))
+            ('polygon
+             (scad-sketch--draw-one-polygon-shape
+              svg transform session shape suppress))
+            ('circle
+             (scad-sketch--draw-one-circle-shape
+              svg transform session shape suppress))
+            ('square
+             (scad-sketch--draw-one-square-shape
+              svg transform session shape suppress))
+            ('text
+             (scad-sketch--draw-one-text-shape
+              svg transform session shape suppress)))))
 
-      ;; Boolean bounding-box labels.
+      ;; Layer 6 – Boolean bounding-box labels.
       (when (scad-sketch-session-tree session)
         (scad-sketch--draw-boolean-boxes
          svg transform session (scad-sketch-session-tree session))))))
 
 ;;;; ── Marks and cursor overlay ───────────────────────────────────────────────
-
 (defun scad-sketch--draw-point-and-marks (svg transform session)
   "Draw mark dots, mark→cursor dashed lines, and the cursor crosshair."
   (let* ((marks  (scad-sketch-session-marks session))
@@ -1755,21 +1923,30 @@ In preview mode, draw only the final semantic tree output."
                                 scad-sketch-canvas-height))
          (bounds    (scad-sketch--bounds session))
          (transform (scad-sketch--transform bounds)))
+    ;; Background.
+    ;;
+    ;; Normal editor mode gets a white canvas plus grid.
+    ;; Preview mode gets a solid grid-colored background and no grid lines.
     (svg-rectangle svg
                    0 0
                    scad-sketch-canvas-width
                    scad-sketch-canvas-height
-                   :fill (if preview "#e8e8e8" "#ffffff"))
+                   :fill (if preview
+                             scad-sketch-preview-background-color
+                           "#ffffff"))
 
     (unless preview
       (scad-sketch--draw-grid svg bounds transform session))
 
+    ;; Main scene.
     (scad-sketch--draw-path svg transform session)
 
+    ;; Editor affordances.  Preview mode intentionally omits these.
     (unless preview
       (scad-sketch--draw-point-and-marks svg transform session)
       (scad-sketch--draw-hud svg session))
 
+    ;; Buffer replacement.
     (let ((inhibit-read-only t))
       (erase-buffer)
       (let ((beg (point)))
