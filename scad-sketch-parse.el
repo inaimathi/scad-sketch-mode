@@ -56,7 +56,6 @@
 (require 'cl-lib)
 
 ;;;; Token types
-
 (defconst scad-sketch-parse--token-re
   (rx (or
        ;; Numbers — must come before identifiers to catch leading sign
@@ -798,6 +797,11 @@ Returns list of [x y r] triples."
     (error nil)))
 
 ;;;; Unparsing (AST → SCAD source)
+(defconst scad-sketch-default-polyround-fn 16
+  "Default polyRound segment count used when emitting rounded points.
+
+This is used when a polygon has 3-component points with non-zero radii but no
+explicit parsed polyRound fn value.")
 
 (defconst scad-sketch-inline-threshold 4
   "Polygons with this many points or fewer are inlined in emitted source.
@@ -833,6 +837,13 @@ This is deliberately fixed so sketch output canonicalizes predictably.")
                         points)))
     (concat "[\n" (mapconcat #'identity lines ",\n") (if lines "\n" "") "]")))
 
+(defun scad-sketch-parse--points-have-radii-p (points)
+  "Return non-nil if any point in POINTS has a positive radius component."
+  (cl-some (lambda (p)
+             (and (nth 2 p)
+                  (> (float (nth 2 p)) 0.0)))
+           points))
+
 (defun scad-sketch-parse--fmt-inline-array (points &optional force-r)
   "Format POINTS as a compact single-line array literal.
 
@@ -840,12 +851,11 @@ When FORCE-R is non-nil, emit each point as [x, y, r] even when all radii are
 zero.  This matters for polyRound point arrays."
   (let* ((use-r (or force-r
                     (cl-some (lambda (p)
-                                (and (nth 2 p) (> (nth 2 p) 0)))
-                              points))))
+                               (and (nth 2 p) (> (nth 2 p) 0)))
+                             points))))
     (concat "[" (mapconcat (lambda (p)
                              (scad-sketch-parse--fmt-point p use-r))
                            points ", ") "]")))
-
 
 (defun scad-sketch-unparse (node &optional indent _extracted-names)
   "Convert AST NODE back to an OpenSCAD source string.
@@ -858,6 +868,10 @@ Polygon source style is preserved:
   - polyRound inline polygons stay polyRound inline
   - polyRound variable-ref polygons stay polyRound variable refs
 
+If polygon points contain any positive radius and no explicit polyRound fn was
+parsed, emit `polyRound(..., scad-sketch-default-polyround-fn)' because
+plain OpenSCAD `polygon' expects 2D points.
+
 Automatic extraction to `_sketch_N' assignments is no longer performed."
   (let ((ind  (make-string (* (or indent 0) 2) ?\s))
         (type (plist-get node :type)))
@@ -869,29 +883,33 @@ Automatic extraction to `_sketch_N' assignments is no longer performed."
               (scad-sketch-parse--fmt-array (plist-get node :points))))
 
      ((eq type 'polygon)
-      (let ((pts   (plist-get node :points))
-            (src   (plist-get node :source))
-            (pr-fn (plist-get node :polyround)))
+      (let* ((pts      (or (plist-get node :points) '()))
+             (src      (plist-get node :source))
+             (pr-fn    (plist-get node :polyround))
+             (rounded  (scad-sketch-parse--points-have-radii-p pts))
+             (eff-pr-fn (or pr-fn
+                             (and rounded
+                                  scad-sketch-default-polyround-fn))))
         (cond
-         ((and src pr-fn)
+         ((and src eff-pr-fn)
           (format "%spolygon(polyRound(%s, %s));\n"
                   ind
                   src
-                  (scad-sketch-parse--fmt-num pr-fn)))
+                  (scad-sketch-parse--fmt-num eff-pr-fn)))
 
          (src
           (format "%spolygon(%s);\n" ind src))
 
-         (pr-fn
+         (eff-pr-fn
           (format "%spolygon(polyRound(%s, %s));\n"
                   ind
-                  (scad-sketch-parse--fmt-inline-array (or pts '()) t)
-                  (scad-sketch-parse--fmt-num pr-fn)))
+                  (scad-sketch-parse--fmt-inline-array pts t)
+                  (scad-sketch-parse--fmt-num eff-pr-fn)))
 
          (t
           (format "%spolygon(%s);\n"
                   ind
-                  (scad-sketch-parse--fmt-inline-array (or pts '())))))))
+                  (scad-sketch-parse--fmt-inline-array pts nil))))))
 
      ((eq type 'circle)
       (format "%scircle(r=%s);\n"
@@ -921,10 +939,14 @@ Automatic extraction to `_sketch_N' assignments is no longer performed."
                   (if centered ", center=true" "")))))
 
      ((eq type 'text)
-      (format "%stext(%S, size=%s);\n"
-              ind
-              (plist-get node :str)
-              (scad-sketch-parse--fmt-num (plist-get node :size))))
+      (let ((font (plist-get node :font)))
+        (format "%stext(%S, size=%s%s);\n"
+                ind
+                (plist-get node :str)
+                (scad-sketch-parse--fmt-num (plist-get node :size))
+                (if font
+                    (format ", font=%S" font)
+                  ""))))
 
      ((memq type '(difference union intersection))
       (let ((op (symbol-name type)))

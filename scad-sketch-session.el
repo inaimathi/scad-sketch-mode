@@ -883,6 +883,25 @@ This is a model-level helper.  It does not select or focus the new shape."
 
 ;;;; Formatting / emission
 
+(defun scad-sketch-session--points-have-radii-p (points)
+  "Return non-nil if any point in POINTS has a positive radius component."
+  (cl-some (lambda (p)
+             (and (nth 2 p)
+                  (> (float (nth 2 p)) 0.0)))
+           points))
+
+(defun scad-sketch-session--effective-polyround-fn (shape)
+  "Return effective polyRound fn value for polygon SHAPE.
+
+Preserve explicit polyRound values.  If no explicit value exists but the shape
+has positive point radii, use `scad-sketch-default-polyround-fn'."
+  (let ((explicit (scad-sketch-shape-polyround shape)))
+    (or explicit
+        (and (eq (scad-sketch-shape-kind shape) 'polygon)
+             (scad-sketch-session--points-have-radii-p
+              (scad-sketch-shape-points shape))
+             scad-sketch-default-polyround-fn))))
+
 (defun scad-sketch-session-polygon-extracted-p (session shape)
   "Return non-nil if polygon SHAPE currently emits through a variable.
 
@@ -1527,7 +1546,11 @@ When SHAPE is forced inline, ignore any original variable reference."
 Polygon source style is controlled by shape metadata:
   - :points-var-name emits a local points assignment and calls polygon(NAME)
   - :force-inline-p ignores original source refs and emits inline
-  - otherwise original source refs are preserved when present"
+  - otherwise original source refs are preserved when present
+
+If a polygon has positive point radii but no explicit polyRound fn, emit it as
+polyRound(..., `scad-sketch-default-polyround-fn') because plain
+OpenSCAD `polygon' expects 2D points."
   (pcase (scad-sketch-shape-kind shape)
     ('circle
      (list :assignments ""
@@ -1543,16 +1566,14 @@ Polygon source style is controlled by shape metadata:
 
     ('polygon
      (let* ((shape-points (scad-sketch-shape-points shape))
-            (polyround    (scad-sketch-shape-polyround shape))
+            (polyround    (scad-sketch-session--effective-polyround-fn shape))
             (local-name   (scad-sketch-session--shape-points-var-name shape))
             (source       (or local-name
                               (scad-sketch-session--shape-source-name
                                session shape)))
             (force-r      (or polyround
-                              (cl-some (lambda (p)
-                                          (and (nth 2 p)
-                                               (> (nth 2 p) 0)))
-                                        shape-points)))
+                              (scad-sketch-session--points-have-radii-p
+                               shape-points)))
             (assignments  (if local-name
                               (scad-sketch-session--emit-points-assignment
                                local-name shape-points indent force-r)
