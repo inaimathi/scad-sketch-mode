@@ -833,21 +833,33 @@ This is deliberately fixed so sketch output canonicalizes predictably.")
                         points)))
     (concat "[\n" (mapconcat #'identity lines ",\n") (if lines "\n" "") "]")))
 
-(defun scad-sketch-parse--fmt-inline-array (points)
-  "Format POINTS as a compact single-line array literal."
-  (let* ((use-r (cl-some (lambda (p) (and (nth 2 p) (> (nth 2 p) 0))) points)))
-    (concat "[" (mapconcat (lambda (p) (scad-sketch-parse--fmt-point p use-r))
+(defun scad-sketch-parse--fmt-inline-array (points &optional force-r)
+  "Format POINTS as a compact single-line array literal.
+
+When FORCE-R is non-nil, emit each point as [x, y, r] even when all radii are
+zero.  This matters for polyRound point arrays."
+  (let* ((use-r (or force-r
+                    (cl-some (lambda (p)
+                                (and (nth 2 p) (> (nth 2 p) 0)))
+                              points))))
+    (concat "[" (mapconcat (lambda (p)
+                             (scad-sketch-parse--fmt-point p use-r))
                            points ", ") "]")))
 
 
-(defun scad-sketch-unparse (node &optional indent extracted-names)
+(defun scad-sketch-unparse (node &optional indent _extracted-names)
   "Convert AST NODE back to an OpenSCAD source string.
-INDENT is the current indentation level (default 0).
-EXTRACTED-NAMES is a hash-table mapping polygon nodes to their assigned names
-\(populated during the extraction pass).
-Returns the source string."
-  (let ((ind (make-string (* (or indent 0) 2) ?\s))
-        (ind1 (make-string (* (1+ (or indent 0)) 2) ?\s))
+
+INDENT is the current indentation level, defaulting to 0.
+
+Polygon source style is preserved:
+  - inline polygons stay inline
+  - variable-ref polygons stay variable refs
+  - polyRound inline polygons stay polyRound inline
+  - polyRound variable-ref polygons stay polyRound variable refs
+
+Automatic extraction to `_sketch_N' assignments is no longer performed."
+  (let ((ind  (make-string (* (or indent 0) 2) ?\s))
         (type (plist-get node :type)))
     (cond
      ((eq type 'array)
@@ -855,42 +867,43 @@ Returns the source string."
               ind
               (plist-get node :name)
               (scad-sketch-parse--fmt-array (plist-get node :points))))
+
      ((eq type 'polygon)
-      (let* ((pts     (plist-get node :points))
-             (src     (plist-get node :source))
-             (pr-fn   (plist-get node :polyround))
-             (name    (when extracted-names
-                        (gethash node extracted-names)))
-             (n-pts   (length (or pts '())))
-             (inline-p (or src (<= n-pts scad-sketch-inline-threshold))))
+      (let ((pts   (plist-get node :points))
+            (src   (plist-get node :source))
+            (pr-fn (plist-get node :polyround)))
         (cond
+         ((and src pr-fn)
+          (format "%spolygon(polyRound(%s, %s));\n"
+                  ind
+                  src
+                  (scad-sketch-parse--fmt-num pr-fn)))
+
          (src
-          ;; Was a variable reference — keep it, or use polyRound form.
-          (if pr-fn
-              (format "%spolygon(polyRound(%s, %s));\n"
-                      ind src (scad-sketch-parse--fmt-num pr-fn))
-            (format "%spolygon(%s);\n" ind src)))
-         (name
-          ;; Extracted to a named assignment (caller handles the assignment line).
-          (if pr-fn
-              (format "%spolygon(polyRound(%s, %s));\n"
-                      ind name (scad-sketch-parse--fmt-num pr-fn))
-            (format "%spolygon(%s);\n" ind name)))
-         (inline-p
-          (format "%spolygon(%s);\n"
-                  ind (scad-sketch-parse--fmt-inline-array (or pts '()))))
+          (format "%spolygon(%s);\n" ind src))
+
+         (pr-fn
+          (format "%spolygon(polyRound(%s, %s));\n"
+                  ind
+                  (scad-sketch-parse--fmt-inline-array (or pts '()) t)
+                  (scad-sketch-parse--fmt-num pr-fn)))
+
          (t
           (format "%spolygon(%s);\n"
-                  ind (scad-sketch-parse--fmt-array (or pts '())))))))
+                  ind
+                  (scad-sketch-parse--fmt-inline-array (or pts '())))))))
+
      ((eq type 'circle)
-      (format "%scircle(r=%s);\n" ind
+      (format "%scircle(r=%s);\n"
+              ind
               (scad-sketch-parse--fmt-num (plist-get node :r))))
+
      ((eq type 'square)
-      (let* ((x (plist-get node :x))
-             (y (plist-get node :y))
-             (w (plist-get node :w))
-             (h (plist-get node :h))
-             (angle (plist-get node :angle))
+      (let* ((x        (plist-get node :x))
+             (y        (plist-get node :y))
+             (w        (plist-get node :w))
+             (h        (plist-get node :h))
+             (angle    (plist-get node :angle))
              (centered (and (< (abs (+ x (/ w 2.0))) 0.0001)
                             (< (abs (+ y (/ h 2.0))) 0.0001)))
              (rotated  (and angle (> (abs angle) 0.0001))))
@@ -906,45 +919,64 @@ Returns the source string."
                   (scad-sketch-parse--fmt-num w)
                   (scad-sketch-parse--fmt-num h)
                   (if centered ", center=true" "")))))
+
      ((eq type 'text)
       (format "%stext(%S, size=%s);\n"
               ind
               (plist-get node :str)
               (scad-sketch-parse--fmt-num (plist-get node :size))))
+
      ((memq type '(difference union intersection))
       (let ((op (symbol-name type)))
         (concat (format "%s%s() {\n" ind op)
                 (mapconcat (lambda (c)
-                             (scad-sketch-unparse c (1+ (or indent 0)) extracted-names))
-                           (plist-get node :children) "")
+                             (scad-sketch-unparse
+                              c
+                              (1+ (or indent 0))
+                              nil))
+                           (plist-get node :children)
+                           "")
                 (format "%s}\n" ind))))
+
      ((eq type 'translate)
       (let ((child (plist-get node :child)))
         (concat (format "%stranslate([%s, %s])\n"
                         ind
                         (scad-sketch-parse--fmt-num (plist-get node :tx))
                         (scad-sketch-parse--fmt-num (plist-get node :ty)))
-                (scad-sketch-unparse child (1+ (or indent 0)) extracted-names))))
+                (scad-sketch-unparse child (1+ (or indent 0)) nil))))
+
      ((eq type 'rotate)
-      (concat (format "%srotate(%s)\n" ind
+      (concat (format "%srotate(%s)\n"
+                      ind
                       (scad-sketch-parse--fmt-num (plist-get node :angle)))
-              (scad-sketch-unparse (plist-get node :child)
-                                   (1+ (or indent 0)) extracted-names)))
+              (scad-sketch-unparse
+               (plist-get node :child)
+               (1+ (or indent 0))
+               nil)))
+
      ((eq type 'scale)
       (concat (format "%sscale([%s, %s])\n"
                       ind
                       (scad-sketch-parse--fmt-num (plist-get node :sx))
                       (scad-sketch-parse--fmt-num (plist-get node :sy)))
-              (scad-sketch-unparse (plist-get node :child)
-                                   (1+ (or indent 0)) extracted-names)))
+              (scad-sketch-unparse
+               (plist-get node :child)
+               (1+ (or indent 0))
+               nil)))
+
      ((eq type 'mirror)
       (concat (format "%smirror([%s, %s])\n"
                       ind
                       (scad-sketch-parse--fmt-num (plist-get node :mx))
                       (scad-sketch-parse--fmt-num (plist-get node :my)))
-              (scad-sketch-unparse (plist-get node :child)
-                                   (1+ (or indent 0)) extracted-names)))
-     (t (format "%s/* unknown node type %S */\n" ind type)))))
+              (scad-sketch-unparse
+               (plist-get node :child)
+               (1+ (or indent 0))
+               nil)))
+
+     (t
+      (format "%s/* unknown node type %S */\n" ind type)))))
 
 (defun scad-sketch-parse--collect-array-names (nodes)
   "Return a hash table of array names already used in NODES."
