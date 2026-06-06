@@ -130,6 +130,7 @@
     (define-key map (kbd "w")           #'scad-sketch-write-back)
     (define-key map (kbd "q")           #'scad-sketch-quit)
     (define-key map (kbd "?")           #'describe-mode)
+    (define-key map (kbd "S-SPC") #'scad-sketch-preview-until-next-input)
     map)
   "Keymap for `scad-sketch-editor-mode'.")
 
