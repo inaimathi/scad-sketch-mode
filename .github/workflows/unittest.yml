@@ -1,0 +1,31 @@
+name: Unit tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  test:
+    name: Run Emacs ERT suite
+    runs-on: ubuntu-latest
+
+    env:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Emacs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y emacs-nox
+
+      - name: Run unit tests
+        run: |
+          bash unittest.sh

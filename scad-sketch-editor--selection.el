@@ -109,6 +109,32 @@
            (copy-sequence (scad-sketch-session-point session)))))
       (_ (copy-sequence (scad-sketch-session-point session))))))
 
+(defun scad-sketch--tree-hovered-p (session tree)
+  "Return non-nil if SESSION cursor hovers any visible leaf in TREE.
+
+This is intentionally approximate.  It is used to make boolean groups
+attentionable, not to compute exact boolean geometry."
+  (pcase (and tree (plist-get tree :kind))
+    ('shape
+     (let ((shape (scad-sketch-session-shape-by-id
+                   session (plist-get tree :shape-id))))
+       (and shape (scad-sketch--shape-hovered-p session shape))))
+
+    ('boolean
+     (cl-some (lambda (child)
+                (scad-sketch--tree-hovered-p session child))
+              (plist-get tree :children)))
+
+    ('mirror
+     (scad-sketch--tree-hovered-p session (plist-get tree :child)))
+
+    ('sequence
+     (cl-some (lambda (child)
+                (scad-sketch--tree-hovered-p session child))
+              (plist-get tree :children)))
+
+    (_ nil)))
+
 (defun scad-sketch--shape-hovered-p (session shape)
   "Return non-nil if SESSION cursor is on/near SHAPE."
   (let ((p (scad-sketch-session-point session))
@@ -241,14 +267,81 @@ Text handles:
          (height size))
     (list x (+ x width) y (+ y height))))
 
+(defun scad-sketch--boolean-hover-candidates (session)
+  "Return boolean group refs hovered by SESSION cursor.
+
+For each hovered group, return two attention targets:
+  - :boolean-members, meaning all child objects
+  - :boolean, meaning the group wrapper itself
+
+Deepest groups are returned first."
+  (let (refs)
+    (dolist (group (reverse (scad-sketch-session--tree-groups
+                             (scad-sketch-session-tree session))))
+      (when (scad-sketch--tree-hovered-p session group)
+        (let ((group-id (plist-get group :group-id)))
+          ;; Push in reverse of desired final order because we nreverse.
+          (push (scad-sketch--boolean-ref group-id) refs)
+          (push (scad-sketch--boolean-members-ref group-id) refs))))
+    (nreverse refs)))
+
+(defun scad-sketch--boolean-ref-group (session ref)
+  "Return boolean group node described by REF, or nil."
+  (let ((group-id (scad-sketch--ref-group-id ref)))
+    (and group-id
+         (scad-sketch-session--tree-find-group
+          (scad-sketch-session-tree session)
+          group-id))))
+
+(defun scad-sketch--group-child-shape-ids (session ref)
+  "Return all child shape ids for boolean REF."
+  (let ((group (scad-sketch--boolean-ref-group session ref)))
+    (unless group
+      (user-error "No such boolean group: %s"
+                  (scad-sketch--ref-group-id ref)))
+    (scad-sketch-session--tree-shape-ids group)))
+
+(defun scad-sketch--remove-shapes-and-subpoints (selection shape-ids)
+  "Return SELECTION with SHAPE-IDS and their point refs removed."
+  (cl-remove-if
+   (lambda (ref)
+     (let ((shape-id (scad-sketch--ref-shape-id ref)))
+       (and shape-id (memq shape-id shape-ids))))
+   selection))
+
+(defun scad-sketch--all-child-shapes-selected-p (session shape-ids)
+  "Return non-nil if every SHAPE-ID is selected as a whole shape."
+  (cl-every (lambda (shape-id)
+              (scad-sketch--shape-selected-p session shape-id))
+            shape-ids))
+
+(defun scad-sketch--toggle-group-children-selection (session ref)
+  "Toggle selection of child shapes for boolean group REF.
+
+The group itself is never stored in selection.  Selection expands to direct
+whole-shape refs for the group's child leaves."
+  (let* ((shape-ids (scad-sketch--group-child-shape-ids session ref))
+         (selection (scad-sketch-session-selection session)))
+    (if (scad-sketch--all-child-shapes-selected-p session shape-ids)
+        (setf (scad-sketch-session-selection session)
+              (scad-sketch--remove-shapes-and-subpoints selection shape-ids))
+      (setf (scad-sketch-session-selection session)
+            (append
+             (mapcar #'scad-sketch--shape-ref shape-ids)
+             (scad-sketch--remove-shapes-and-subpoints
+              selection shape-ids))))))
+
 (defun scad-sketch--hover-candidates (session)
   "Return hovered refs under SESSION's current point.
 
-Point refs are listed before shape refs so exact vertex/handle hovers take
-attention priority over containing shapes."
+Point/handle refs are listed before shape/group refs so exact handles take
+attention priority over containing geometry.  Boolean groups are attentionable
+but not selectable."
   (let ((p          (scad-sketch-session-point session))
         (r          (scad-sketch--hover-radius session))
         candidates)
+
+    ;; Shape and primitive handles.
     (dolist (shape (scad-sketch-session-shapes session))
       (let ((shape-id (scad-sketch-shape-id shape)))
         (pcase (scad-sketch-shape-kind shape)
@@ -265,11 +358,32 @@ attention priority over containing shapes."
                  (push (scad-sketch--point-ref idx shape-id) candidates))))))
         (when (scad-sketch--shape-hovered-p session shape)
           (push (scad-sketch--shape-ref shape-id) candidates))))
+
+    ;; Mirror axis handles and axis line.
+    (dolist (mirror (scad-sketch-session--tree-mirrors
+                     (scad-sketch-session-tree session)))
+      (let ((mirror-id (plist-get mirror :mirror-id)))
+        (dotimes (idx 2)
+          (let ((xy (scad-sketch--mirror-handle-xy session mirror idx)))
+            (when (and xy (<= (scad-sketch--distance p xy) r))
+              (push (scad-sketch--mirror-point-ref idx mirror-id)
+                    candidates))))
+        (pcase-let ((`(,a ,b) (scad-sketch--mirror-axis-segment mirror)))
+          (when (<= (scad-sketch--distance-to-segment p a b) r)
+            (push (scad-sketch--mirror-ref mirror-id) candidates)))))
+
+    ;; Boolean groups are attentionable, not selectable.
+    (dolist (ref (scad-sketch--boolean-hover-candidates session))
+      (push ref candidates))
+
     (nreverse candidates)))
 
 ;;; Selectable refs (TAB cycle)
 (defun scad-sketch--selectable-refs (session)
-  "Return all selectable refs for SESSION in global cycle order."
+  "Return all focusable refs for SESSION in global cycle order.
+
+Despite the historical name, this includes attention/focus targets that are not
+direct selection targets, such as boolean groups."
   (let (refs)
     (dolist (shape (scad-sketch-session-shapes session))
       (let ((shape-id (scad-sketch-shape-id shape)))
@@ -281,14 +395,63 @@ attention priority over containing shapes."
                     do (push (scad-sketch--point-ref idx shape-id) refs)))
           ((or 'circle 'square 'text)
            (dotimes (idx (scad-sketch--primitive-handle-count shape))
-             (push (scad-sketch--point-ref idx shape-id) refs)))))
-      (nreverse refs))))
+             (push (scad-sketch--point-ref idx shape-id) refs))))))
+
+    ;; Boolean groups: attentionable.  The wrapper and members are separate.
+    (dolist (group (scad-sketch-session--tree-groups
+                    (scad-sketch-session-tree session)))
+      (let ((group-id (plist-get group :group-id)))
+        (push (scad-sketch--boolean-ref group-id) refs)
+        (push (scad-sketch--boolean-members-ref group-id) refs)))
+
+    ;; Mirror axes and handles.
+    (dolist (mirror (scad-sketch-session--tree-mirrors
+                     (scad-sketch-session-tree session)))
+      (let ((mirror-id (plist-get mirror :mirror-id)))
+        (push (scad-sketch--mirror-ref mirror-id) refs)
+        (push (scad-sketch--mirror-point-ref 0 mirror-id) refs)
+        (push (scad-sketch--mirror-point-ref 1 mirror-id) refs)))
+
+    (nreverse refs)))
+
+(defun scad-sketch--tree-center (session tree)
+  "Return approximate center of TREE in model coordinates."
+  (let (pts)
+    (cl-labels
+        ((walk
+          (node)
+          (pcase (and node (plist-get node :kind))
+            ('shape
+             (let ((shape-id (plist-get node :shape-id)))
+               (push (scad-sketch--shape-center session shape-id) pts)))
+            ('boolean
+             (dolist (child (plist-get node :children))
+               (walk child)))
+            ('mirror
+             (walk (plist-get node :child)))
+            ('sequence
+             (dolist (child (plist-get node :children))
+               (walk child))))))
+
+      (walk tree))
+
+    (if pts
+        (let ((sx 0.0)
+              (sy 0.0)
+              (n  0))
+          (dolist (p pts)
+            (setq sx (+ sx (nth 0 p)))
+            (setq sy (+ sy (nth 1 p)))
+            (setq n  (1+ n)))
+          (list (/ sx n) (/ sy n)))
+      (copy-sequence (scad-sketch-session-point session)))))
 
 (defun scad-sketch--ref-anchor (session ref)
   "Return a model-space anchor point for REF."
   (pcase (scad-sketch--ref-kind ref)
     ('shape
      (scad-sketch--shape-center session (scad-sketch--ref-shape-id ref)))
+
     ('point
      (let* ((shape (scad-sketch-session-shape-by-id
                     session (scad-sketch--ref-shape-id ref)))
@@ -304,7 +467,79 @@ attention priority over containing shapes."
               (copy-sequence (scad-sketch-session-point session))))
          (_
           (copy-sequence (scad-sketch-session-point session))))))
-    (_ (copy-sequence (scad-sketch-session-point session)))))
+
+    ((or 'boolean 'boolean-members)
+     (let ((group (scad-sketch-session--tree-find-group
+                   (scad-sketch-session-tree session)
+                   (scad-sketch--ref-group-id ref))))
+       (if group
+           (scad-sketch--tree-center session group)
+         (copy-sequence (scad-sketch-session-point session)))))
+
+    ('mirror
+     '(0.0 0.0))
+
+    ('mirror-point
+     (let* ((mirror-id (scad-sketch--ref-mirror-id ref))
+            (mirror    (scad-sketch-session--tree-find-mirror
+                        (scad-sketch-session-tree session)
+                        mirror-id)))
+       (or (and mirror
+                (scad-sketch--mirror-handle-xy
+                 session mirror (scad-sketch--ref-index ref)))
+           (copy-sequence (scad-sketch-session-point session)))))
+
+    (_
+     (copy-sequence (scad-sketch-session-point session)))))
+
+;;; Mirror operations
+(defun scad-sketch--mirror-normal (mirror)
+  "Return normalized mirror normal vector for MIRROR."
+  (let* ((mx (float (or (plist-get mirror :mx) 1.0)))
+         (my (float (or (plist-get mirror :my) 0.0)))
+         (len (sqrt (+ (* mx mx) (* my my)))))
+    (if (< len 0.000001)
+        '(1.0 0.0)
+      (list (/ mx len) (/ my len)))))
+
+(defun scad-sketch--mirror-handle-distance (session)
+  "Return model-space distance from origin for mirror axis handles."
+  (max 10.0 (* 5.0 (float (scad-sketch-session-grid session)))))
+
+(defun scad-sketch--mirror-handle-xy (session mirror idx)
+  "Return model-space handle point IDX for MIRROR.
+
+Handle 0 is on the positive normal side.  Handle 1 is on the negative normal
+side.  Moving either handle changes the mirror normal vector."
+  (let* ((n (scad-sketch--mirror-normal mirror))
+         (d (scad-sketch--mirror-handle-distance session))
+         (x (* d (nth 0 n)))
+         (y (* d (nth 1 n))))
+    (pcase idx
+      (0 (list x y))
+      (1 (list (- x) (- y)))
+      (_ nil))))
+
+(defun scad-sketch--mirror-axis-segment (mirror &optional extent)
+  "Return two model points spanning MIRROR's axis line."
+  (let* ((n (scad-sketch--mirror-normal mirror))
+         ;; Axis direction is perpendicular to the mirror normal.
+         (ax (- (nth 1 n)))
+         (ay (nth 0 n))
+         (e  (or extent 10000.0)))
+    (list (list (* (- e) ax) (* (- e) ay))
+          (list (* e ax) (* e ay)))))
+
+(defun scad-sketch--mirror-ref-selected-p (session mirror-id)
+  "Return non-nil if MIRROR-ID axis is explicitly selected."
+  (scad-sketch--selection-contains-ref-p
+   session (scad-sketch--mirror-ref mirror-id)))
+
+(defun scad-sketch--mirror-point-selected-p (session mirror-id idx)
+  "Return non-nil if mirror handle IDX in MIRROR-ID is selected."
+  (or (scad-sketch--mirror-ref-selected-p session mirror-id)
+      (scad-sketch--selection-contains-ref-p
+       session (scad-sketch--mirror-point-ref idx mirror-id))))
 
 ;;; Selection membership predicates
 
@@ -330,6 +565,11 @@ A selected shape makes all of its points effectively selected."
        session (scad-sketch--point-ref idx shape-id))))
 
 ;;; Toggle helpers
+(defun scad-sketch--remove-mirror-and-subpoints (selection mirror-id)
+  "Return SELECTION with MIRROR-ID and its handle refs removed."
+  (cl-remove-if (lambda (ref)
+                  (eq (scad-sketch--ref-mirror-id ref) mirror-id))
+                selection))
 
 (defun scad-sketch--remove-shape-and-subpoints (selection shape-id)
   "Return SELECTION with SHAPE-ID and all of its point refs removed."
@@ -364,15 +604,16 @@ A selected shape makes all of its points effectively selected."
 (defun scad-sketch--toggle-ref-selection (session ref)
   "Toggle REF in SESSION selection.
 
-Invariants:
-  - A shape ref and its subpoint refs cannot coexist.
-  - Toggling a shape selects the whole shape and removes subpoints.
-  - Toggling a point while its shape is selected converts the shape
-    selection into all point refs except that point."
+Boolean group refs are attention targets.  Selecting either the group wrapper
+or its members expands to direct whole-shape child selection."
   (let* ((kind      (scad-sketch--ref-kind ref))
          (shape-id  (scad-sketch--ref-shape-id ref))
+         (mirror-id (scad-sketch--ref-mirror-id ref))
          (selection (scad-sketch-session-selection session)))
     (pcase kind
+      ((or 'boolean 'boolean-members)
+       (scad-sketch--toggle-group-children-selection session ref))
+
       ('shape
        (if (scad-sketch--shape-selected-p session shape-id)
            (setf (scad-sketch-session-selection session)
@@ -381,6 +622,7 @@ Invariants:
          (setf (scad-sketch-session-selection session)
                (cons ref (scad-sketch--remove-shape-and-subpoints
                           selection shape-id)))))
+
       ('point
        (let ((idx (scad-sketch--ref-index ref)))
          (cond
@@ -395,7 +637,32 @@ Invariants:
                  (cl-remove-if (lambda (s) (scad-sketch--same-ref-p s ref))
                                selection)))
           (t
-           (push ref (scad-sketch-session-selection session)))))))))
+           (setf (scad-sketch-session-selection session)
+                 (cons ref selection))))))
+
+      ('mirror
+       (if (scad-sketch--selection-contains-ref-p session ref)
+           (setf (scad-sketch-session-selection session)
+                 (cl-remove-if (lambda (s) (scad-sketch--same-ref-p s ref))
+                               selection))
+         (setf (scad-sketch-session-selection session)
+               (cons ref (scad-sketch--remove-mirror-and-subpoints
+                          selection mirror-id)))))
+
+      ('mirror-point
+       (cond
+        ((scad-sketch--mirror-ref-selected-p session mirror-id)
+         (setf (scad-sketch-session-selection session)
+               (cons ref
+                     (scad-sketch--remove-mirror-and-subpoints
+                      selection mirror-id))))
+        ((scad-sketch--selection-contains-ref-p session ref)
+         (setf (scad-sketch-session-selection session)
+               (cl-remove-if (lambda (s) (scad-sketch--same-ref-p s ref))
+                             selection)))
+        (t
+         (setf (scad-sketch-session-selection session)
+               (cons ref selection))))))))
 
 ;;; Attention
 (defun scad-sketch--attention-ref (session)
@@ -437,6 +704,84 @@ while hover is represented by `hover-index' over `scad-sketch--hover-candidates'
                     (scad-sketch--ref-shape-id ref)))
                 (scad-sketch-session-selection session))))
 
+(defun scad-sketch--selected-shape-ids-strict (session)
+  "Return explicitly selected whole-shape ids in SESSION.
+
+Point refs, primitive handles, mirror refs, and mirror handles are ignored.
+Signals unless at least one whole shape is selected."
+  (let ((shape-ids (scad-sketch--selected-shape-ids session)))
+    (unless shape-ids
+      (user-error "Select one or more whole shapes first"))
+    shape-ids))
+
+(defun scad-sketch--tree-selected-shape-ids-in-order (tree selected-ids)
+  "Return SELECTED-IDS that occur in TREE, in tree traversal order."
+  (pcase (and tree (plist-get tree :kind))
+    ('shape
+     (let ((shape-id (plist-get tree :shape-id)))
+       (if (memq shape-id selected-ids)
+           (list shape-id)
+         nil)))
+
+    ('boolean
+     (apply #'append
+            (mapcar (lambda (child)
+                      (scad-sketch--tree-selected-shape-ids-in-order
+                       child selected-ids))
+                    (plist-get tree :children))))
+
+    ('mirror
+     (scad-sketch--tree-selected-shape-ids-in-order
+      (plist-get tree :child)
+      selected-ids))
+
+    (_ nil)))
+
+(defun scad-sketch--tree-selected-shape-ids-in-order (tree selected-ids)
+  "Return SELECTED-IDS that occur in TREE, in tree traversal order."
+  (pcase (and tree (plist-get tree :kind))
+    ('shape
+     (let ((shape-id (plist-get tree :shape-id)))
+       (if (memq shape-id selected-ids)
+           (list shape-id)
+         nil)))
+
+    ('boolean
+     (apply #'append
+            (mapcar (lambda (child)
+                      (scad-sketch--tree-selected-shape-ids-in-order
+                       child selected-ids))
+                    (plist-get tree :children))))
+
+    ('mirror
+     (scad-sketch--tree-selected-shape-ids-in-order
+      (plist-get tree :child)
+      selected-ids))
+
+    (_ nil)))
+
+(defun scad-sketch--selected-shape-ids-in-tree-order
+    (session &optional min-count op-name)
+  "Return selected whole-shape ids in SESSION, ordered by tree traversal.
+
+MIN-COUNT, when non-nil, is the minimum number of selected shapes required.
+OP-NAME is used in the user-facing error message."
+  (let* ((selected-ids (scad-sketch--selected-shape-ids-strict session))
+         (ordered-ids
+          (scad-sketch--tree-selected-shape-ids-in-order
+           (scad-sketch-session-tree session)
+           selected-ids))
+         (min-count (or min-count 1))
+         (op-name   (or op-name "Operation")))
+    (unless ordered-ids
+      (user-error "Selected shapes were not found in tree"))
+    (when (< (length ordered-ids) min-count)
+      (user-error "%s needs at least %d selected shape%s"
+                  op-name
+                  min-count
+                  (if (= min-count 1) "" "s")))
+    ordered-ids))
+
 (defun scad-sketch--selected-point-locs (session &optional fallback-to-active)
   "Return selected point/handle locations as (SHAPE-ID . INDEX) conses.
 
@@ -470,6 +815,21 @@ remain shape selections and are moved as whole shapes by editing commands."
         (list (cons (scad-sketch-session-active-shape-id session)
                     (scad-sketch-session-selected-index session)))
       locs)))
+
+(defun scad-sketch--selected-mirror-locs (session)
+  "Return selected mirror handle locations as (MIRROR-ID . INDEX)."
+  (let (locs)
+    (dolist (ref (scad-sketch-session-selection session))
+      (pcase (scad-sketch--ref-kind ref)
+        ('mirror
+         (let ((mirror-id (scad-sketch--ref-mirror-id ref)))
+           (push (cons mirror-id 0) locs)
+           (push (cons mirror-id 1) locs)))
+        ('mirror-point
+         (push (cons (scad-sketch--ref-mirror-id ref)
+                     (scad-sketch--ref-index ref))
+               locs))))
+    (delete-dups (nreverse locs))))
 
 ;;; Summaries
 

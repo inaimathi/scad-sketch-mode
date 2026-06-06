@@ -25,6 +25,36 @@
 (require 'scad-sketch-editor--rendering)
 
 ;;; Keymap
+(defvar scad-sketch-editor-insert-map
+  (let ((map (make-sparse-keymap)))
+    ;; Existing polygon/array point editing.
+    (define-key map (kbd "a") #'scad-sketch-append-point)
+    (define-key map (kbd "i") #'scad-sketch-insert-point-after-selected)
+
+    ;; Drawing from marks + point.
+    (define-key map (kbd "l") #'scad-sketch-line-from-mark)
+    (define-key map (kbd "r") #'scad-sketch-rectangle-from-mark)
+    (define-key map (kbd "p") #'scad-sketch-draw-polygon-from-marks)
+    (define-key map (kbd "b") #'scad-sketch-draw-square-from-marks)
+    (define-key map (kbd "s") #'scad-sketch-draw-square-from-marks)
+    (define-key map (kbd "c") #'scad-sketch-draw-circle-from-mark)
+    (define-key map (kbd "o") #'scad-sketch-draw-circle-from-mark)
+    (define-key map (kbd "t") #'scad-sketch-draw-text-at-point)
+    map)
+  "Prefix map for scad-sketch insertion/drawing commands.")
+
+(defvar scad-sketch-editor-group-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "u") #'scad-sketch-wrap-selection-as-union)
+    (define-key map (kbd "d") #'scad-sketch-wrap-selection-as-difference)
+    (define-key map (kbd "i") #'scad-sketch-wrap-selection-as-intersection)
+    (define-key map (kbd "m") #'scad-sketch-wrap-selection-as-mirror)
+    (define-key map (kbd "v") #'scad-sketch-wrap-selection-as-mirror)
+    (define-key map (kbd "b") #'scad-sketch-break-apart-group)
+    (define-key map (kbd "x") #'scad-sketch-break-apart-group)
+    map)
+  "Prefix map for scad-sketch grouping/boolean commands.")
+
 (defvar scad-sketch-editor-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
@@ -43,7 +73,7 @@
     (define-key map (kbd "C-<up>")      #'scad-sketch-move-point-coarse-up)
     (define-key map (kbd "C-<down>")    #'scad-sketch-move-point-coarse-down)
 
-    ;; ── Selected vertex / primitive handle movement ──────────────────
+    ;; ── Selected geometry movement ──────────────────────────────────
     (define-key map (kbd "S-<left>")    #'scad-sketch-move-selected-left)
     (define-key map (kbd "S-<right>")   #'scad-sketch-move-selected-right)
     (define-key map (kbd "S-<up>")      #'scad-sketch-move-selected-up)
@@ -57,7 +87,7 @@
     (define-key map (kbd "C-S-<up>")    #'scad-sketch-move-selected-coarse-up)
     (define-key map (kbd "C-S-<down>")  #'scad-sketch-move-selected-coarse-down)
 
-    ;; ── Marks / transient clears ─────────────────────────────────────
+    ;; ── Marks and transient clears ──────────────────────────────────
     (define-key map (kbd "m")           #'scad-sketch-set-mark)
     (define-key map (kbd "M")           #'scad-sketch-push-mark)
     (define-key map (kbd "`")           #'scad-sketch-pop-mark)
@@ -66,16 +96,17 @@
     (define-key map (kbd "s")           #'scad-sketch-clear-selection)
     (define-key map (kbd "<escape>")    #'scad-sketch-clear-transient-state)
 
-    ;; ── Vertex / shape editing ────────────────────────────────────────
-    (define-key map (kbd "p")           #'scad-sketch-append-point)
-    (define-key map (kbd "i")           #'scad-sketch-insert-point-after-selected)
+    ;; ── Prefix maps ─────────────────────────────────────────────────
+    (define-key map (kbd "i")           scad-sketch-editor-insert-map)
+    (define-key map (kbd "b")           scad-sketch-editor-group-map)
+
+    ;; ── Shape/parameter editing ─────────────────────────────────────
     (define-key map (kbd "k")           #'scad-sketch-delete-selected)
-    (define-key map (kbd "l")           #'scad-sketch-line-from-mark)
-    (define-key map (kbd "r")           #'scad-sketch-rectangle-from-mark)
     (define-key map (kbd "c")           #'scad-sketch-toggle-closed)
     (define-key map (kbd "R")           #'scad-sketch-set-radius)
+    (define-key map (kbd "A")           #'scad-sketch-set-mirror-axis)
 
-    ;; ── Hover / focus / selection ─────────────────────────────────────
+    ;; ── Hover / focus / selection ───────────────────────────────────
     (define-key map (kbd "TAB")         #'scad-sketch-next-hovered)
     (define-key map (kbd "<backtab>")   #'scad-sketch-previous-hovered)
     (define-key map (kbd ".")           #'scad-sketch-next-hovered)
@@ -85,7 +116,7 @@
     (define-key map (kbd "M-<backtab>") #'scad-sketch-previous-selectable)
     (define-key map (kbd "SPC")         #'scad-sketch-toggle-attention-selection)
 
-    ;; ── Coordinate / constraint commands ─────────────────────────────
+    ;; ── Coordinate / constraint commands ────────────────────────────
     (define-key map (kbd "x")           #'scad-sketch-set-x)
     (define-key map (kbd "y")           #'scad-sketch-set-y)
     (define-key map (kbd "X")           #'scad-sketch-set-delta-x)
@@ -94,11 +125,12 @@
     (define-key map (kbd "a")           #'scad-sketch-set-angle-from-mark)
     (define-key map (kbd "g")           #'scad-sketch-set-grid)
 
-    ;; ── Session ───────────────────────────────────────────────────────
+    ;; ── Session/help ────────────────────────────────────────────────
     (define-key map (kbd "u")           #'scad-sketch-undo)
     (define-key map (kbd "w")           #'scad-sketch-write-back)
     (define-key map (kbd "q")           #'scad-sketch-quit)
-    (define-key map (kbd "?")           #'scad-sketch-help)
+    (define-key map (kbd "?")           #'describe-mode)
+    (define-key map (kbd "S-SPC") #'scad-sketch-preview-until-next-input)
     map)
   "Keymap for `scad-sketch-editor-mode'.")
 
@@ -107,54 +139,77 @@
 (define-derived-mode scad-sketch-editor-mode special-mode "SCAD-Sketch"
   "Major mode for the scad-sketch visual editor.
 
-The buffer shows an SVG canvas followed by a live OpenSCAD array preview.
+The buffer shows an SVG canvas followed by a live OpenSCAD preview.
+The preview may represent an array, a single 2D primitive, a polygon,
+a transformed shape, a boolean tree, a mirror tree, or a newly inserted
+generic block.
 
-The canvas displays:
-  - a grid (step set with `g')
-  - the polygon path with arcs where polyRound radii are set
-  - vertex dots labelled SHAPE:INDEX; selected vertex highlighted in orange
-  - dashed radius circles on rounded vertices (orange = capped by edge length)
-  - the cursor crosshair in blue, marks in green
-  - a status bar: name, grid size, cursor coords, dirty flag
+The editor is intended as a small FreeCAD-sketch-like interface for
+OpenSCAD source.  It edits a supported 2D subset directly and writes the
+result back to the source buffer.
 
-Movement:
-  <arrow>             move cursor one grid step; snaps to grid
-  C-<arrow>           move cursor one coarse step; snaps to grid
-  M-<arrow>           move cursor one fine step; intentionally off-grid
-  S-<arrow>           move selected vertex one grid step
-  M-S-<arrow>         move selected vertex one fine step (off-grid)
-  C-S-<arrow>         move selected vertex one coarse step
+Visual model:
+  - The blue cursor crosshair is the editor point.
+  - Green markers are construction marks.
+  - Orange objects are explicitly selected.
+  - A blue halo marks the currently hovered attention target.
+  - Polygon vertices and primitive handles are point-like refs.
+  - Circle, square, text, mirror-axis, and polygon handles can be hovered,
+    selected, and edited.
+  - Boolean and mirror previews are rendered from the session tree.
+  - Mirror output is shown as a dashed secondary outline; the source-side
+    geometry remains directly editable.
 
-Vertex editing:
-  TAB / S-TAB         select next / previous vertex (cursor jumps to it)
-  p                   append cursor as a new vertex at end of array
-  i                   insert cursor after selected vertex; if marks are set,
-                        inserts each mark (oldest first) then cursor
-  k                   delete the selected vertex
+Core concepts:
+  selection
+    Explicit multi-object set toggled by selection commands.
 
-Marks:
-  m                   replace all marks with cursor position
-  M                   push cursor position onto mark stack
-  `                   pop most recent mark and jump cursor there
-  \'                   jump cursor to most recent mark (non-destructive)
-  C                   clear all marks
+  hover
+    Stack of refs under or near the editor point.  Hover cycling chooses
+    which one receives attention without moving point.
 
-Geometry:
-  x / y               set cursor X or Y coordinate
-  X / Y               set cursor X or Y relative to most recent mark (delta)
-  d                   set distance from mark, preserving angle
-  a                   set angle from mark in degrees, preserving distance
-  R                   set polyRound radius on selected vertex
-  c                   toggle closed / open polygon
-  l                   append marks (oldest first) then cursor as vertices
-  r                   append rectangle from most recent mark to cursor
-  g                   change grid step
+  focus
+    Global fallback ref used when nothing is hovered.  Global focus cycling
+    moves point to the focused ref.
 
-Session:
-  w                   write array back to source buffer
-  u                   undo
-  q                   quit (offers to write back if dirty)
-  ?                   key summary in the echo area
+  attention
+    The effective current ref: hovered ref if any exists, otherwise focus.
+
+Editing model:
+  - Plain cursor movement is clean UI state.
+  - Shape, point, primitive-handle, mirror-axis, and tree mutations are dirty
+    source edits and are undoable.
+  - Moving selected geometry also moves point by the same delta.
+  - Drawing commands create inline shape calls.
+  - Existing inline polygons remain inline.
+  - Existing variable-reference polygons continue to reference their source
+    arrays when safe.
+  - Direct array sessions remain array sessions; generic blank sessions emit
+    shape/tree source instead of an array assignment.
+
+Major command groups:
+  point and mark operations
+    Move point, set/push/pop/jump marks, clear transient state.
+
+  hover/focus/selection operations
+    Cycle hovered refs, cycle global focus, toggle selection, clear selection.
+
+  insertion prefix
+    Add polygon points, draw polygons, boxes, circles, text, and legacy
+    mark-based paths.
+
+  group prefix
+    Wrap selected whole shapes as union, difference, intersection, or mirror;
+    break apart boolean/mirror groups.
+
+  parameter editing
+    Set coordinates, grid, radius, mirror axis, text content, text size,
+    text font, and primitive sizes.
+
+  session operations
+    Undo, write back, quit, and native Emacs help.
+
+Use `describe-mode' or `describe-bindings' for the generated key list.
 
 \\{scad-sketch-editor-mode-map}"
   (setq truncate-lines t)
@@ -188,23 +243,10 @@ Session:
       (set-window-configuration wconf))))
 
 ;;; Help
-
 (defun scad-sketch-help ()
-  "Display a key binding summary in the echo area.
-For full documentation use \\[describe-mode]."
+  "Show native Emacs mode help for `scad-sketch-editor-mode'."
   (interactive)
-  (scad-sketch--assert-session)
-  (message
-   (concat
-    "arrows=move cursor(clean)  C-arrows=coarse  M-arrows=fine | "
-    "TAB/S-TAB=focus shape/point  ./,=cycle hovered  "
-    "SPC=toggle selection  s=clear selection | "
-    "S-arrows=move selected geometry(dirty) | "
-    "p=append  i=insert  k=delete | "
-    "m=set-mark  M=push  `=pop  '=jump  C=clear marks | "
-    "R=radius  c=closed  l=line  r=rect | "
-    "x/y=coord  X/Y=delta  d=dist  a=angle  g=grid | "
-    "w=write  u=undo  q=quit  C-h m=full help")))
+  (call-interactively #'describe-mode))
 
 (provide 'scad-sketch-editor-mode)
 ;;; scad-sketch-editor-mode.el ends here

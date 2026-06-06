@@ -1134,19 +1134,19 @@ The range check is inclusive, so prefix whitespace to push :beg above 0."
 ;;;; 15. scad-sketch-unparse-top-level
 ;;;; =========================================================================
 
-(ert-deftest ssp-unparse-top-extracts-large-polygon ()
-  "A polygon with >4 points is extracted to a named array assignment."
+(ert-deftest ssp-unparse-top-large-inline-polygon-stays-inline ()
+  "A polygon with >4 points stays inline; no extracted assignment is generated."
   (let* ((poly (list :type 'polygon
                      :points '((0.0 0.0 0.0)(40.0 0.0 0.0)(50.0 20.0 0.0)
                                (40.0 40.0 0.0)(0.0 40.0 0.0))
                      :source nil :polyround nil :beg 0 :end 0))
          (s    (scad-sketch-unparse-top-level (list poly))))
-    ;; The output must contain a named assignment and a polygon(name) reference.
-    (should (string-match "_sketch_1 = " s))
-    (should (string-match "polygon(_sketch_1)" s))))
+    (should-not (string-match "_sketch" s))
+    (should (string-match "polygon(\\[" s))
+    (should (string-match "\\[50, 20\\]" s))))
 
-(ert-deftest ssp-unparse-top-inline-small-polygon ()
-  "A polygon with ≤4 points stays inline; no extracted assignment."
+(ert-deftest ssp-unparse-top-small-inline-polygon-stays-inline ()
+  "A polygon with ≤4 points stays inline; no extracted assignment is generated."
   (let* ((poly (list :type 'polygon
                      :points '((0.0 0.0 0.0)(10.0 0.0 0.0)(5.0 8.0 0.0))
                      :source nil :polyround nil :beg 0 :end 0))
@@ -1154,8 +1154,8 @@ The range check is inclusive, so prefix whitespace to push :beg above 0."
     (should-not (string-match "_sketch" s))
     (should (string-match "polygon(\\[" s))))
 
-(ert-deftest ssp-unparse-top-multiple-large-polygons-get-distinct-names ()
-  "Two large polygons get different extracted names."
+(ert-deftest ssp-unparse-top-multiple-large-polygons-stay-inline ()
+  "Multiple large inline polygons stay inline and do not get generated names."
   (let* ((mk-poly (lambda (x)
                     (list :type 'polygon
                           :points (list (list x 0.0 0.0)(list (+ x 10) 0.0 0.0)
@@ -1165,11 +1165,14 @@ The range check is inclusive, so prefix whitespace to push :beg above 0."
          (p1 (funcall mk-poly 0.0))
          (p2 (funcall mk-poly 100.0))
          (s  (scad-sketch-unparse-top-level (list p1 p2))))
-    (should (string-match "_sketch_1" s))
-    (should (string-match "_sketch_2" s))))
+    (should-not (string-match "_sketch" s))
+    (let* ((p1 (string-match "polygon(\\[" s))
+           (p2 (and p1 (string-match "polygon(\\[" s (match-end 0)))))
+      (should p1)
+      (should p2))))
 
-(ert-deftest ssp-unparse-top-avoids-existing-extracted-name ()
-  "Generated _sketch_N names do not collide with existing array assignments."
+(ert-deftest ssp-unparse-top-existing-sketch-name-does-not-matter ()
+  "Existing _sketch_N arrays do not trigger generated names for inline polygons."
   (let* ((arr  (list :type 'array :name "_sketch_1" :beg 0 :end 0
                      :points '((0.0 0.0 0.0))))
          (poly (list :type 'polygon
@@ -1178,8 +1181,19 @@ The range check is inclusive, so prefix whitespace to push :beg above 0."
                      :source nil :polyround nil :beg 0 :end 0))
          (s    (scad-sketch-unparse-top-level (list arr poly))))
     (should (string-match "_sketch_1 = " s))
-    (should (string-match "_sketch_2 = " s))
-    (should (string-match "polygon(_sketch_2)" s))))
+    (should-not (string-match "_sketch_2" s))
+    (should (string-match "polygon(\\[" s))))
+
+(ert-deftest ssp-unparse-top-polyround-inline-stays-inline ()
+  "Inline polyRound polygons stay inline and keep their polyRound call."
+  (let* ((poly (list :type 'polygon
+                     :points '((0.0 0.0 3.0)(80.0 0.0 3.0)
+                               (80.0 50.0 3.0)(0.0 50.0 3.0))
+                     :source nil :polyround 32 :beg 0 :end 0))
+         (s    (scad-sketch-unparse-top-level (list poly))))
+    (should-not (string-match "_sketch" s))
+    (should (string-match "polygon(polyRound(\\[" s))
+    (should (string-match ", 32" s))))
 
 (ert-deftest ssp-unparse-top-variable-ref-polygon-kept ()
   "A variable-ref polygon is never extracted; it just emits polygon(name)."
