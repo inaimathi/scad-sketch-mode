@@ -608,30 +608,36 @@ circle(r=5);")))
     (should (= (length nodes) 1))))
 
 (ert-deftest ssp-skip-linear-extrude ()
-  "linear_extrude() { ... } is skipped without crashing."
+  "linear_extrude() itself is skipped, but a supported unbraced child is harvested."
   (let* ((nodes (ssp-test--parse
                  "linear_extrude(height=10) circle(r=30);\ncircle(r=5);")))
-    ;; Only the standalone circle at the end survives.
-    (should (= (length nodes) 1))
-    (should (eq (plist-get (car nodes) :type) 'circle))))
+    (should (= (length nodes) 2))
+    (should (eq (plist-get (nth 0 nodes) :type) 'circle))
+    (should (eq (plist-get (nth 1 nodes) :type) 'circle))
+    (should (= (plist-get (nth 0 nodes) :r) 30.0))
+    (should (= (plist-get (nth 1 nodes) :r) 5.0))))
 
 (ert-deftest ssp-skip-linear-extrude-braced ()
-  "A braced linear_extrude block is skipped whole, not harvested as 2D."
+  "A braced linear_extrude wrapper is skipped, but supported children are harvested."
   (let* ((nodes (ssp-test--parse
                  "linear_extrude(height=10) { circle(r=30); }
 circle(r=5);")))
-    (should (= (length nodes) 1))
-    (should (eq (plist-get (car nodes) :type) 'circle))
-    (should (ssp-test--approx= (plist-get (car nodes) :r) 5.0))))
+    (should (= (length nodes) 2))
+    (should (eq (plist-get (nth 0 nodes) :type) 'circle))
+    (should (eq (plist-get (nth 1 nodes) :type) 'circle))
+    (should (ssp-test--approx= (plist-get (nth 0 nodes) :r) 30.0))
+    (should (ssp-test--approx= (plist-get (nth 1 nodes) :r) 5.0))))
 
 (ert-deftest ssp-skip-3d-translate-wrapper ()
-  "A 3D translate wrapper is skipped as unsupported 3D syntax."
+  "A 3D translate wrapper is skipped, but its supported child is harvested."
   (let* ((nodes (ssp-test--parse
                  "translate([1,2,0]) circle(r=30);
 circle(r=5);")))
-    (should (= (length nodes) 1))
-    (should (eq (plist-get (car nodes) :type) 'circle))
-    (should (ssp-test--approx= (plist-get (car nodes) :r) 5.0))))
+    (should (= (length nodes) 2))
+    (should (eq (plist-get (nth 0 nodes) :type) 'circle))
+    (should (eq (plist-get (nth 1 nodes) :type) 'circle))
+    (should (ssp-test--approx= (plist-get (nth 0 nodes) :r) 30.0))
+    (should (ssp-test--approx= (plist-get (nth 1 nodes) :r) 5.0))))
 
 (ert-deftest ssp-skip-does-not-corrupt-subsequent-nodes ()
   "Nodes following a skipped form are still parsed correctly."
@@ -642,6 +648,115 @@ circle(r=5);")))
     (should arr)
     (should circ)
     (should (string= (plist-get arr :name) "triangle"))))
+
+(ert-deftest ssp-unsupported-wrapper-harvests-circle-child ()
+  "An unsupported unbraced wrapper exposes its circle child as editable."
+  (let* ((src   "linear_extrude(5) circle(d=10);")
+         (nodes (ssp-test--parse src))
+         (circ  (car nodes)))
+    (should (= (length nodes) 1))
+    (should (eq (plist-get circ :type) 'circle))
+    (should (= (plist-get circ :r) 5.0))
+    (should (= (plist-get circ :beg)
+               (string-match "circle" src)))))
+
+(ert-deftest ssp-unsupported-wrapper-harvests-polygon-child-inner-point ()
+  "node-at inside polygon points under linear_extrude returns the polygon child."
+  (let* ((src (concat "linear_extrude(5)\n"
+                      "polygon(polyRound([\n"
+                      "  [0, 0, 3],\n"
+                      "  [80, 0, 3],\n"
+                      "  [80, 50, 3],\n"
+                      "  [0, 50, 3]\n"
+                      "], 32));\n"))
+         (nodes (ssp-test--parse src))
+         (pos   (string-match "\\[80, 0, 3\\]" src))
+         (node  (scad-sketch-parse-node-at nodes pos))
+         (path  (scad-sketch-parse--path-to nodes pos)))
+    (should pos)
+    (should node)
+    (should (eq (plist-get node :type) 'polygon))
+    (should (= (plist-get node :polyround) 32))
+    ;; The unsupported wrapper is intentionally not in the path.
+    (should (= (length path) 1))
+    (should (eq (plist-get (car path) :type) 'polygon))))
+
+(ert-deftest ssp-nested-unsupported-wrappers-harvest-square-child ()
+  "Nested unsupported wrappers expose their supported square child."
+  (let* ((src   "rotate([0, 10, 45]) linear_extrude(5) square(25);")
+         (nodes (ssp-test--parse src))
+         (sq    (car nodes)))
+    (should (= (length nodes) 1))
+    (should (eq (plist-get sq :type) 'square))
+    (should (= (plist-get sq :w) 25.0))
+    (should (= (plist-get sq :h) 25.0))
+    (should (= (plist-get sq :beg)
+               (string-match "square" src)))))
+
+(ert-deftest ssp-mixed-unsupported-block-harvests-descendant-circle-only ()
+  "Mixed unsupported blocks are not editable as groups, but child shapes are."
+  (let* ((src (concat "union() {\n"
+                      "  linear_extrude(5) circle(10);\n"
+                      "  translate([0, 10, 20]) cube(15);\n"
+                      "}\n"))
+         (nodes (ssp-test--parse src))
+         (circle-pos (string-match "circle" src))
+         (union-pos  (string-match "union" src))
+         (circle-node (scad-sketch-parse-node-at nodes circle-pos))
+         (union-node  (scad-sketch-parse-node-at nodes union-pos)))
+    (should (= (length nodes) 1))
+    (should circle-node)
+    (should (eq (plist-get circle-node :type) 'circle))
+    ;; The mixed/unsupported union wrapper itself is not exposed as editable.
+    (should-not union-node)))
+
+(ert-deftest sss-linear-extrude-circle-at-child-writeback-keeps-wrapper ()
+  "Editing a circle child under linear_extrude rewrites only the circle call."
+  (sss-test--with-source-at
+      "linear_extrude(5) circle(d=10);\n"
+      "circle"
+    (sss-test--set-circle-radius session 7.0)
+    (let ((out (sss-test--write-back-string session)))
+      (sss-test--assert-contains "linear_extrude(5)" out)
+      (sss-test--assert-contains "circle(r=7);" out)
+      (sss-test--assert-not-contains "circle(d=10)" out))))
+
+(ert-deftest sss-nested-unsupported-wrapper-square-writeback-keeps-wrapper ()
+  "Editing a square child under nested unsupported wrappers keeps the wrappers."
+  (sss-test--with-source-at
+      "rotate([0, 10, 45]) linear_extrude(5) square(25);\n"
+      "square"
+    (let ((out (sss-test--write-back-string session)))
+      (sss-test--assert-contains "rotate([0, 10, 45])" out)
+      (sss-test--assert-contains "linear_extrude(5)" out)
+      ;; square(25) canonicalizes to square([25, 25]) on write-back.
+      (sss-test--assert-contains "square([25, 25]);" out))))
+
+(ert-deftest sss-mixed-unsupported-block-point-on-circle-edits-circle ()
+  "Point on a supported child inside a mixed unsupported block opens that child."
+  (sss-test--with-source-at
+      (concat "union() {\n"
+              "  linear_extrude(5) circle(10);\n"
+              "  translate([0, 10, 20]) cube(15);\n"
+              "}\n")
+      "circle"
+    (let ((preview (scad-sketch-session-preview session)))
+      (sss-test--assert-contains "circle(r=10);" preview)
+      (sss-test--assert-not-contains "union()" preview))))
+
+(ert-deftest sss-mixed-unsupported-block-point-on-union-is-not-target ()
+  "Point on a mixed unsupported union wrapper does not open the wrapper."
+  (with-temp-buffer
+    (insert (concat "union() {\n"
+                    "  linear_extrude(5) circle(10);\n"
+                    "  translate([0, 10, 20]) cube(15);\n"
+                    "}\n"))
+    (goto-char (point-min))
+    (search-forward "union")
+    (goto-char (match-beginning 0))
+    (should-error
+     (scad-sketch-session-at-point)
+     :type 'scad-sketch-no-edit-target)))
 
 
 ;;;; =========================================================================
@@ -1010,6 +1125,16 @@ The range check is inclusive, so prefix whitespace to push :beg above 0."
                   :beg 0 :end 0)))
     (should (string= (scad-sketch-unparse n) "square([80, 40]);\n"))))
 
+(ert-deftest ssp-square-scalar-size ()
+  "square(N) parses as a square with width and height N."
+  (let* ((nodes (ssp-test--parse "square(25);"))
+         (sq    (car nodes)))
+    (should (eq (plist-get sq :type) 'square))
+    (should (= (plist-get sq :w) 25.0))
+    (should (= (plist-get sq :h) 25.0))
+    (should (= (plist-get sq :x) 0.0))
+    (should (= (plist-get sq :y) 0.0))))
+
 (ert-deftest ssp-unparse-square-centered ()
   "Centered square unparses with center=true."
   (let* ((n (list :type 'square :w 60.0 :h 30.0 :x -30.0 :y -15.0 :angle 0.0
@@ -1227,11 +1352,13 @@ The range check is inclusive, so prefix whitespace to push :beg above 0."
 ;;;; =========================================================================
 ;;;; 16. Integration: parse test.scad end-to-end
 ;;;; =========================================================================
-
 (ert-deftest ssp-integration-node-count ()
-  "Parsing test.scad yields exactly 32 top-level nodes."
+  "Parsing test.scad yields exactly 33 top-level nodes.
+
+The extra node comes from harvesting the supported child circle under the
+unsupported linear_extrude wrapper."
   (ssp-test--with-scad-file
-   (should (= (length nodes) 32))))
+   (should (= (length nodes) 33))))
 
 (ert-deftest ssp-integration-array-assignments ()
   "test.scad contains the expected array assignments."
@@ -1450,12 +1577,12 @@ or as children of other transforms are not in the flat top-level list."
      (should (string= (plist-get found :name) "triangle")))))
 
 (ert-deftest ssp-integration-walk-total-count ()
-  "Walking all top-level nodes from test.scad visits 58 nodes total."
+  "Walking all top-level nodes from test.scad visits 59 nodes total."
   (ssp-test--with-scad-file
    (let ((count 0))
      (dolist (n nodes)
        (scad-sketch-parse--walk n (lambda (_) (setq count (1+ count)))))
-     (should (= count 58)))))
+     (should (= count 59)))))
 
 (ert-deftest ssp-integration-lookup-triangle ()
   "lookup-variable finds triangle's 3 points when called with a large before-pos."

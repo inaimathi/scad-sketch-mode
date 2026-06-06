@@ -76,6 +76,40 @@
        (group-n 6 (+ (any " \t\r\n")))))
   "Regexp matching one SCAD token.  Groups: 1=num 2=str 3=path 4=id 5=punct 6=ws.")
 
+(defconst scad-sketch-parse--known-shape-keywords
+  '("polygon" "circle" "square" "text"
+    "difference" "union" "intersection"
+    "translate" "rotate" "scale" "mirror")
+  "Shape/composition/transform keywords supported by scad-sketch.")
+
+(defun scad-sketch-parse--known-shape-start-p (ps)
+  "Return non-nil if PS is positioned at a known scad-sketch shape keyword."
+  (and (eq (scad-sketch-parse--peek-type ps) 'id)
+       (member (scad-sketch-parse--peek-val ps)
+               scad-sketch-parse--known-shape-keywords)))
+
+(defun scad-sketch-parse--call-like-start-p (ps)
+  "Return non-nil if PS is positioned at an identifier followed by `('."
+  (and (eq (scad-sketch-parse--peek-type ps) 'id)
+       (equal (scad-sketch-parse--nth-val ps 1) "(")))
+
+(defun scad-sketch-parse--emit-harvested-nodes (nodes)
+  "Emit harvested NODES through the dynamic collector, or return one node.
+
+`scad-sketch-parse--top-level-form' normally returns at most one node.  Recovery
+harvesting can find multiple supported descendants inside an unsupported wrapper
+or mixed unsupported block.  During normal full-source parsing, use
+`scad-sketch-parse--collector' to add all of them to the parse result and return
+nil.  Outside that context, return the first node as a best-effort fallback."
+  (cond
+   ((and nodes scad-sketch-parse--collector)
+    (dolist (node nodes)
+      (funcall scad-sketch-parse--collector node))
+    nil)
+   ((consp nodes)
+    (car nodes))
+   (t nil)))
+
 (defun scad-sketch-parse--strip-comments (s)
   "Return S with // line comments and /* */ block comments removed."
   (with-temp-buffer
@@ -360,6 +394,22 @@ arguments such as `$fn'.  Leaves point just before the closing paren."
       (scad-sketch-parse--consume ps "]")
       (cons (float x) (float y)))))
 
+(defun scad-sketch-parse--square-dims (ps)
+  "Parse square size argument and return (W . H).
+
+Supports both OpenSCAD forms:
+
+  square(25)
+  square([25, 40])"
+  (cond
+   ((eq (scad-sketch-parse--peek-type ps) 'num)
+    (let ((n (float (scad-sketch-parse--num ps))))
+      (cons n n)))
+   ((equal (scad-sketch-parse--peek-val ps) "[")
+    (scad-sketch-parse--2d-vec ps))
+   (t
+    (user-error "scad-sketch parser: square() requires N or [W, H]"))))
+
 (defun scad-sketch-parse--shape (ps)
   "Parse one shape node."
   (let ((beg (scad-sketch-parse--cur-start ps))
@@ -400,7 +450,7 @@ arguments such as `$fn'.  Leaves point just before the closing paren."
      ((string= v "square")
       (scad-sketch-parse--consume ps "square")
       (scad-sketch-parse--consume ps "(")
-      (let ((dims (scad-sketch-parse--2d-vec ps)))
+      (let ((dims (scad-sketch-parse--square-dims ps)))
         (let ((w (car dims))
               (h (cdr dims))
               (center nil))
@@ -558,6 +608,94 @@ outermost-first order.")
   (when (equal (scad-sketch-parse--peek-val ps) "{")
     (scad-sketch-parse--skip-balanced ps "{" "}")))
 
+(defun scad-sketch-parse--harvest-brace-block (ps)
+  "Harvest supported descendant shapes from the brace block at PS.
+
+The wrapper owning this block is not represented.  Only supported descendants
+found inside are returned."
+  (let (nodes)
+    (scad-sketch-parse--consume ps "{")
+    (while (and (scad-sketch-parse--peek ps)
+                (not (equal (scad-sketch-parse--peek-val ps) "}")))
+      (setq nodes
+            (append nodes
+                    (scad-sketch-parse--harvest-supported-descendants ps))))
+    (when (equal (scad-sketch-parse--peek-val ps) "}")
+      (scad-sketch-parse--consume ps "}"))
+    (scad-sketch-parse--try-consume ps ";")
+    nodes))
+
+(defun scad-sketch-parse--harvest-wrapper-descendants (ps)
+  "Harvest supported descendants from an unsupported call-like wrapper.
+
+Examples:
+
+  linear_extrude(5) circle(d=10);
+  rotate([0, 10, 45]) linear_extrude(5) square(25);
+  union() { linear_extrude(5) circle(10); cube(15); }
+
+The unsupported wrapper itself is skipped and not represented in the AST.  Any
+supported child shape discovered under it is returned with its own :beg/:end, so
+write-back replaces only the child shape region."
+  (if (scad-sketch-parse--call-like-start-p ps)
+      (progn
+        ;; Consume wrapper name and argument list.
+        (scad-sketch-parse--consume ps nil 'id)
+        (scad-sketch-parse--skip-balanced ps "(" ")")
+        (cond
+         ;; Braced wrapper/block: harvest supported descendants inside.
+         ((equal (scad-sketch-parse--peek-val ps) "{")
+          (scad-sketch-parse--harvest-brace-block ps))
+
+         ;; Statement wrapper with no child.
+         ((equal (scad-sketch-parse--peek-val ps) ";")
+          (scad-sketch-parse--consume ps ";")
+          nil)
+
+         ;; End of containing brace.  Do not consume it.
+         ((or (null (scad-sketch-parse--peek ps))
+              (equal (scad-sketch-parse--peek-val ps) "}"))
+          nil)
+
+         ;; Unbraced child/continuation.
+         (t
+          (scad-sketch-parse--harvest-supported-descendants ps))))
+    (scad-sketch-parse--skip-unknown-form ps)
+    nil))
+
+(defun scad-sketch-parse--harvest-supported-descendants (ps)
+  "Harvest supported shapes from PS, skipping unsupported wrappers.
+
+If PS starts at a supported shape, try to parse it normally.  If that parse
+fails because the form is actually a 3D/unsupported variant of a known keyword
+such as `rotate([0, 10, 45])', treat it as an unsupported wrapper and harvest
+its supported child descendants instead."
+  (let ((start-pos (scad-sketch-parse--pos ps)))
+    (cond
+     ;; Known shape/composition/transform.  Parse it if it is actually in the
+     ;; supported 2D subset; otherwise treat it as a wrapper and harvest below.
+     ((scad-sketch-parse--known-shape-start-p ps)
+      (condition-case nil
+          (list (scad-sketch-parse--stamp-scope
+                 (scad-sketch-parse--shape ps)))
+        (user-error
+         (scad-sketch-parse--set-pos ps start-pos)
+         (scad-sketch-parse--harvest-wrapper-descendants ps))))
+
+     ;; Unknown call-like wrapper, e.g. linear_extrude(...), color(...),
+     ;; projection(...), cube(...), etc.
+     ((scad-sketch-parse--call-like-start-p ps)
+      (scad-sketch-parse--harvest-wrapper-descendants ps))
+
+     ;; A raw brace block can occur after unsupported control-like syntax.
+     ((equal (scad-sketch-parse--peek-val ps) "{")
+      (scad-sketch-parse--harvest-brace-block ps))
+
+     ;; Anything else is not useful to scad-sketch.
+     (t
+      (scad-sketch-parse--skip-unknown-form ps)
+      nil))))
+
 (defun scad-sketch-parse--skip-scoped-form (ps scope-name &optional collector)
   "Skip a module/function form, harvesting its body under SCOPE-NAME."
   (let ((boundary (scad-sketch-parse--skip-to-brace-or-semi ps)))
@@ -600,10 +738,23 @@ wrappers and other unknown constructs should normally be skipped whole."
 
 (defun scad-sketch-parse--top-level-form (ps)
   "Parse one top-level form: array assignment, known 2D shape, or skip unknown.
-Returns a node plist or nil (for skipped forms like include/use/module)."
-  (let ((beg (scad-sketch-parse--cur-start ps))
-        (v   (scad-sketch-parse--peek-val ps))
-        (typ (scad-sketch-parse--peek-type ps)))
+
+Returns a node plist or nil.
+
+Unsupported wrappers are not represented as editable nodes, but supported 2D
+descendants beneath them are harvested as independent edit targets.  This makes
+forms like these work:
+
+  linear_extrude(5) circle(d=10);
+  rotate([0, 10, 45]) linear_extrude(5) square(25);
+
+Mixed unsupported blocks are treated similarly: the unsupported wrapper/block
+is not itself editable, but supported descendants can still be selected by
+placing point directly on them."
+  (let ((beg       (scad-sketch-parse--cur-start ps))
+        (start-pos (scad-sketch-parse--pos ps))
+        (v         (scad-sketch-parse--peek-val ps))
+        (typ       (scad-sketch-parse--peek-type ps)))
     (cond
      ;; name = [ ... ] ;  — array assignment (look-ahead: id = [)
      ((and (eq typ 'id)
@@ -620,32 +771,36 @@ Returns a node plist or nil (for skipped forms like include/use/module)."
           (scad-sketch-parse--stamp-scope
            (list :type 'array :beg beg :end (scad-sketch-parse--prev-end ps)
                  :name name :points points)))))
+
      ;; include/use <...> may omit the semicolon in typical OpenSCAD style.
      ((and (eq typ 'id) (member v '("include" "use")))
       (scad-sketch-parse--skip-include-or-use ps)
       nil)
-     ;; Module/function bodies are the only unknown brace forms we descend into.
+
+     ;; Module/function bodies are descended into under scope, preserving old
+     ;; module-body harvesting behavior.
      ((and (eq typ 'id) (member v '("module" "function")))
       (let ((scope-name (scad-sketch-parse--scope-name-for-form ps beg)))
-        (scad-sketch-parse--skip-scoped-form ps scope-name scad-sketch-parse--collector))
+        (scad-sketch-parse--skip-scoped-form
+         ps scope-name scad-sketch-parse--collector))
       nil)
-     ;; Known 2D shape or composition keyword.
-     ((and (eq typ 'id)
-           (member v '("polygon" "circle" "square" "text"
-                        "difference" "union" "intersection"
-                        "translate" "rotate" "scale" "mirror")))
+
+     ;; Known 2D shape or composition keyword.  If it fails because this is an
+     ;; unsupported 3D variant, harvest supported descendants instead.
+     ((scad-sketch-parse--known-shape-start-p ps)
       (condition-case nil
           (scad-sketch-parse--stamp-scope (scad-sketch-parse--shape ps))
         (user-error
-         ;; If a nominally 2D transform has unsupported arguments, skip that
-         ;; wrapper rather than interpreting it as a 2D edit operation.
-         (scad-sketch-parse--skip-unknown-form ps)
-         nil)))
-     ;; Everything else: 3D primitives, scalar assignments, unsupported control
-     ;; flow, etc.  Skip whole; do not harvest children from 3D wrappers.
+         (scad-sketch-parse--set-pos ps start-pos)
+         (scad-sketch-parse--emit-harvested-nodes
+          (scad-sketch-parse--harvest-supported-descendants ps)))))
+
+     ;; Everything else: unsupported wrappers, 3D primitives, scalar
+     ;; assignments, unsupported control flow, etc.  Skip the wrapper but harvest
+     ;; supported descendants when they exist.
      (t
-      (scad-sketch-parse--skip-unknown-form ps)
-      nil))))
+      (scad-sketch-parse--emit-harvested-nodes
+       (scad-sketch-parse--harvest-supported-descendants ps))))))
 
 ;;;; Public API
 
