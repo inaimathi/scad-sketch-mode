@@ -11,7 +11,7 @@ on:
 jobs:
   test:
     name: Run Emacs ERT suite
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     env:
       LC_ALL: C.UTF-8
@@ -21,11 +21,55 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Show checkout state
+        run: |
+          set -euxo pipefail
+          git status --short
+          git log --oneline -1
+          git rev-parse HEAD
+          git ls-files
+
+      - name: Show system runtime
+        run: |
+          set -euxo pipefail
+          uname -a
+          cat /etc/os-release
+          locale
+          env | sort
+
       - name: Install Emacs
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y emacs-nox
+          apt-cache policy emacs-nox emacs
+
+      - name: Show Emacs runtime
+        run: |
+          set -euxo pipefail
+          which emacs
+          emacs --version
+          emacs --batch -Q --eval '
+            (princ
+             (format
+              "emacs-version=%S\nemacs-major-version=%S\nemacs-minor-version=%S\nsystem-type=%S\nsystem-configuration=%S\ninvocation-directory=%S\nuser-emacs-directory=%S\nload-path=%S\nfeatures-svg=%S\n"
+              emacs-version
+              emacs-major-version
+              emacs-minor-version
+              system-type
+              system-configuration
+              invocation-directory
+              user-emacs-directory
+              load-path
+              (featurep (quote svg)))))'
+
+      - name: Show test runner
+        run: |
+          set -euxo pipefail
+          sed -n '1,220p' unittest.sh
+          find . -maxdepth 3 -type f | sort
 
       - name: Run unit tests
         run: |
+          set -euxo pipefail
           bash unittest.sh
