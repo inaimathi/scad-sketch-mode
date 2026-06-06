@@ -231,7 +231,7 @@ geometry."
             (dx    (- (nth 0 p) (nth 0 m)))
             (dy    (- (nth 1 p) (nth 1 m)))
             (dist  (sqrt (+ (* dx dx) (* dy dy))))
-            (angle (* pi (/ (float degrees) 180.0))))
+            (angle (* float-pi (/ (float degrees) 180.0))))
        (setf (scad-sketch-session-point s)
              (list (+ (nth 0 m) (* dist (cos angle)))
                    (+ (nth 1 m) (* dist (sin angle)))))

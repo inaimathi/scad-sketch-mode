@@ -140,7 +140,7 @@ Matrix representation is (A B C D E F), meaning:
 
 (defun scad-sketch-session--mat-rotate (degrees)
   "Return a rotation matrix for DEGREES."
-  (let* ((r (* pi (/ (float degrees) 180.0)))
+  (let* ((r (* float-pi (/ (float degrees) 180.0)))
          (co (cos r))
          (si (sin r)))
     (list co si (- si) co 0.0 0.0)))

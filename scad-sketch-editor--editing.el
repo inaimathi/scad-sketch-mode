@@ -163,7 +163,7 @@ Input is two numbers, for example:
          (w     (float (or (plist-get md :w) 0.0)))
          (h     (float (or (plist-get md :h) 0.0)))
          (angle (float (or (plist-get md :angle) 0.0)))
-         (a     (* pi (/ angle 180.0)))
+         (a     (* float-pi (/ angle 180.0)))
          (ux    (cos a))
          (uy    (sin a))
          (vx    (- (sin a)))

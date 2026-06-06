@@ -1,0 +1,9 @@
+== Installing lint dependencies ==
+
+== Byte-compiling all source files ==
+
+== checkdoc on all source files ==
+
+== package-lint package entrypoint only ==
+
+Lint checks passed.

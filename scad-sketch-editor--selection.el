@@ -201,7 +201,7 @@ Corners are ordered:
          (y     (float (or (plist-get md :y) 0.0)))
          (w     (float (or (plist-get md :w) 0.0)))
          (h     (float (or (plist-get md :h) 0.0)))
-         (a     (* pi (/ (float (or (plist-get md :angle) 0.0)) 180.0)))
+         (a     (* float-pi (/ (float (or (plist-get md :angle) 0.0)) 180.0)))
          (ux    (cos a))
          (uy    (sin a))
          (vx    (- (sin a)))
@@ -713,29 +713,6 @@ Signals unless at least one whole shape is selected."
     (unless shape-ids
       (user-error "Select one or more whole shapes first"))
     shape-ids))
-
-(defun scad-sketch--tree-selected-shape-ids-in-order (tree selected-ids)
-  "Return SELECTED-IDS that occur in TREE, in tree traversal order."
-  (pcase (and tree (plist-get tree :kind))
-    ('shape
-     (let ((shape-id (plist-get tree :shape-id)))
-       (if (memq shape-id selected-ids)
-           (list shape-id)
-         nil)))
-
-    ('boolean
-     (apply #'append
-            (mapcar (lambda (child)
-                      (scad-sketch--tree-selected-shape-ids-in-order
-                       child selected-ids))
-                    (plist-get tree :children))))
-
-    ('mirror
-     (scad-sketch--tree-selected-shape-ids-in-order
-      (plist-get tree :child)
-      selected-ids))
-
-    (_ nil)))
 
 (defun scad-sketch--tree-selected-shape-ids-in-order (tree selected-ids)
   "Return SELECTED-IDS that occur in TREE, in tree traversal order."

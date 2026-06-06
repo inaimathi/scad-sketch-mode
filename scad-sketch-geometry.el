@@ -79,7 +79,7 @@ mark first, then POINT.  Signals if MARKS is nil."
   (let* ((dx    (- (nth 0 point) (nth 0 mark)))
          (dy    (- (nth 1 point) (nth 1 mark)))
          (dist  (sqrt (+ (* dx dx) (* dy dy))))
-         (angle (* pi (/ (float degrees) 180.0))))
+         (angle (* float-pi (/ (float degrees) 180.0))))
     (list (+ (nth 0 mark) (* dist (cos angle)))
           (+ (nth 1 mark) (* dist (sin angle))))))
 
@@ -93,7 +93,7 @@ mark first, then POINT.  Signals if MARKS is nil."
 
 (defun scad-sketch-geometry-rotate-point (point degrees)
   "Rotate model POINT around the origin by DEGREES, preserving radius."
-  (let* ((angle (* pi (/ (float degrees) 180.0)))
+  (let* ((angle (* float-pi (/ (float degrees) 180.0)))
          (x (float (nth 0 point)))
          (y (float (nth 1 point))))
     (list (- (* x (cos angle)) (* y (sin angle)))
