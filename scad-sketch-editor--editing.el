@@ -1313,39 +1313,67 @@ This does not move the cursor and does not update global focus."
      (setf (scad-sketch-session-selection s) nil))))
 
 (defun scad-sketch-clear-transient-state ()
-  "Clear transient editor state: marks, selection, and hover cycling.
+  "Clear transient editor state.
 
-This does not mutate source geometry and does not clear global focus."
+Clears marks, selection, and hover cycling state.  If marks are present, this
+is undoable so accidental `Esc' can be recovered with `u'.  This does not dirty
+source geometry."
   (interactive)
-  (scad-sketch--clean-change
-   (lambda (s)
-     (setf (scad-sketch-session-marks s) nil)
-     (setf (scad-sketch-session-named-marks s) nil)
-     (setf (scad-sketch-session-selection s) nil)
-     (setf (scad-sketch-session-hover-index s) 0))))
+  (let ((session (scad-sketch--assert-session)))
+    (if (scad-sketch-session-marks session)
+        (scad-sketch--undoable-clean-change
+         (lambda (s)
+           (setf (scad-sketch-session-marks s) nil)
+           (setf (scad-sketch-session-selection s) nil)
+           (setf (scad-sketch-session-hover-index s) 0)))
+      (scad-sketch--clean-change
+       (lambda (s)
+         (setf (scad-sketch-session-selection s) nil)
+         (setf (scad-sketch-session-hover-index s) 0))))))
 
 ;;; Undo restore command
 (defun scad-sketch-undo ()
-  "Undo the last sketch edit."
+  "Undo the most recent editor mutation."
   (interactive)
-  (let* ((session (scad-sketch--assert-session))
-         (entry   (pop (scad-sketch-session-undo-stack session))))
-    (unless entry (user-error "No sketch undo available"))
-    (setf (scad-sketch-session-points          session) (plist-get entry :points))
-    (setf (scad-sketch-session-point           session) (plist-get entry :point))
-    (setf (scad-sketch-session-marks           session) (plist-get entry :marks))
-    (setf (scad-sketch-session-named-marks     session) (plist-get entry :named-marks))
-    (setf (scad-sketch-session-selected-index  session) (plist-get entry :selected-index))
-    (setf (scad-sketch-session-closed          session) (plist-get entry :closed))
-    (setf (scad-sketch-session-shapes          session) (plist-get entry :shapes))
-    (setf (scad-sketch-session-active-shape-id session) (plist-get entry :active-shape-id))
-    (setf (scad-sketch-session-tree            session) (plist-get entry :tree))
-    (setf (scad-sketch-session-targets         session) (plist-get entry :targets))
-    (setf (scad-sketch-session-root-target-id  session) (plist-get entry :root-target-id))
-    (setf (scad-sketch-session-selection       session) (plist-get entry :selection))
-    (setf (scad-sketch-session-focus-ref       session) (plist-get entry :focus-ref))
-    (setf (scad-sketch-session-dirty           session) t)
-    (scad-sketch--render)))
+  (let ((session (scad-sketch--assert-session)))
+    (unless (scad-sketch-session-undo-stack session)
+      (user-error "No undo history"))
+    (let ((snap (pop (scad-sketch-session-undo-stack session))))
+      (setf (scad-sketch-session-points session)
+            (copy-tree (plist-get snap :points)))
+      (setf (scad-sketch-session-point session)
+            (copy-tree (plist-get snap :point)))
+      (setf (scad-sketch-session-marks session)
+            (copy-tree (plist-get snap :marks)))
+      (setf (scad-sketch-session-named-marks session)
+            (copy-tree (plist-get snap :named-marks)))
+      (setf (scad-sketch-session-selected-index session)
+            (plist-get snap :selected-index))
+      (setf (scad-sketch-session-closed session)
+            (plist-get snap :closed))
+      (setf (scad-sketch-session-shapes session)
+            (copy-tree (plist-get snap :shapes)))
+      (setf (scad-sketch-session-active-shape-id session)
+            (plist-get snap :active-shape-id))
+      (setf (scad-sketch-session-targets session)
+            (copy-tree (plist-get snap :targets)))
+      (setf (scad-sketch-session-root-target-id session)
+            (plist-get snap :root-target-id))
+      (setf (scad-sketch-session-selection session)
+            (copy-tree (plist-get snap :selection)))
+      (setf (scad-sketch-session-focus-ref session)
+            (copy-tree (plist-get snap :focus-ref)))
+      (when (plist-member snap :tree)
+        (setf (scad-sketch-session-tree session)
+              (copy-tree (plist-get snap :tree))))
+      ;; Older snapshots may not have :dirty.  Treat those as dirty because
+      ;; they were created before clean undo snapshots existed.
+      (setf (scad-sketch-session-dirty session)
+            (if (plist-member snap :dirty)
+                (plist-get snap :dirty)
+              t))
+      (scad-sketch--normalize-attention session)
+      (scad-sketch--render))))
 
 (provide 'scad-sketch-editor--editing)
 ;;; scad-sketch-editor--editing.el ends here

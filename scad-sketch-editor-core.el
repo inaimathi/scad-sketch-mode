@@ -47,11 +47,12 @@
               :closed          (scad-sketch-session-closed session)
               :shapes          (copy-tree (scad-sketch-session-shapes session))
               :active-shape-id (scad-sketch-session-active-shape-id session)
-              :tree            (copy-tree (scad-sketch-session-tree session))
               :targets         (copy-tree (scad-sketch-session-targets session))
               :root-target-id  (scad-sketch-session-root-target-id session)
               :selection       (copy-tree (scad-sketch-session-selection session))
-              :focus-ref       (copy-tree (scad-sketch-session-focus-ref session)))
+              :focus-ref       (copy-tree (scad-sketch-session-focus-ref session))
+              :tree            (copy-tree (scad-sketch-session-tree session))
+              :dirty           (scad-sketch-session-dirty session))
         (scad-sketch-session-undo-stack session)))
 
 (defun scad-sketch--mark-dirty (session)
@@ -79,6 +80,20 @@ selection changes are clean; edits to source geometry are dirty."
 (defun scad-sketch--edit (fn)
   "Apply FN as a source-geometry mutation (dirty, undo-able)."
   (scad-sketch--change fn t))
+
+(defun scad-sketch--undoable-clean-change (fn)
+  "Apply FN as a clean but undoable UI/session change.
+
+This is for editor-state changes that are not source-geometry mutations but
+should still be recoverable with `u', such as adding, popping, or clearing
+marks.  The session dirty flag is preserved exactly."
+  (let* ((session   (scad-sketch--assert-session))
+         (was-dirty (scad-sketch-session-dirty session)))
+    (scad-sketch--push-undo session)
+    (funcall fn session)
+    (scad-sketch--normalize-attention session)
+    (setf (scad-sketch-session-dirty session) was-dirty)
+    (scad-sketch--render)))
 
 (defun scad-sketch--clean-change (fn)
   "Apply FN as a clean UI/session change (no undo, no dirty flag)."

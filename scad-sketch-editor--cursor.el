@@ -98,29 +98,35 @@ This is a clean operation: moving the editor cursor does not dirty source."
   (scad-sketch--move-point 0 (- (scad-sketch--coarse (scad-sketch--assert-session))) t))
 
 ;;; Mark commands
-
 (defun scad-sketch-set-mark ()
-  "Replace all marks with the current cursor position."
+  "Replace all marks with the current cursor position.
+
+This is undoable but does not dirty source geometry."
   (interactive)
-  (scad-sketch--clean-change
+  (scad-sketch--undoable-clean-change
    (lambda (s)
      (setf (scad-sketch-session-marks s)
            (list (copy-sequence (scad-sketch-session-point s)))))))
 
 (defun scad-sketch-push-mark ()
-  "Push the current cursor position onto the mark stack."
+  "Push the current cursor position onto the mark stack.
+
+This is undoable but does not dirty source geometry."
   (interactive)
-  (scad-sketch--clean-change
+  (scad-sketch--undoable-clean-change
    (lambda (s)
      (push (copy-sequence (scad-sketch-session-point s))
            (scad-sketch-session-marks s)))))
 
 (defun scad-sketch-pop-mark ()
-  "Pop the most recent mark and jump cursor to it."
+  "Pop the most recent mark and jump cursor to it.
+
+This is undoable but does not dirty source geometry."
   (interactive)
   (let ((session (scad-sketch--assert-session)))
-    (unless (scad-sketch-session-marks session) (user-error "No marks set")))
-  (scad-sketch--clean-change
+    (unless (scad-sketch-session-marks session)
+      (user-error "No marks set")))
+  (scad-sketch--undoable-clean-change
    (lambda (s)
      (setf (scad-sketch-session-point s)
            (copy-sequence (pop (scad-sketch-session-marks s))))
@@ -138,10 +144,19 @@ This is a clean operation: moving the editor cursor does not dirty source."
      (setf (scad-sketch-session-hover-index s) 0))))
 
 (defun scad-sketch-clear-marks ()
-  "Clear all marks."
+  "Clear all marks.
+
+This is undoable when marks are actually present, but does not dirty source
+geometry."
   (interactive)
-  (scad-sketch--clean-change
-   (lambda (s) (setf (scad-sketch-session-marks s) nil))))
+  (let ((session (scad-sketch--assert-session)))
+    (if (scad-sketch-session-marks session)
+        (scad-sketch--undoable-clean-change
+         (lambda (s)
+           (setf (scad-sketch-session-marks s) nil)))
+      ;; No-op clears should not clutter the undo stack.
+      (scad-sketch--clean-change
+       (lambda (_s) nil)))))
 
 ;;; Coordinate commands
 

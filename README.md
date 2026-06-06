@@ -1140,7 +1140,16 @@ The best user experience is one where generated SCAD remains readable enough tha
 
 ## Changelog
 
-### Current development state
+### 2026 06 06
+
+* Added e editor keybinding to toggle polygon point emission between inline points and a local points variable. Inline polygons can now be rewritten as pts = ...; polygon(pts);, and variable-backed polygons can be forced back inline without rewriting the original source array.
+* Updated the point-extraction toggle so forcing a variable-backed polygon inline also deletes the now-obsolete source array assignment on write-back.
+* Centralized the default `polyRound` segment count as `scad-sketch-default-polyround-fn` in the parser module and reused it from session emission.
+* Improved target discovery under unsupported wrappers: supported 2D descendants inside forms like `linear_extrude(5) circle(...)` or `rotate([0, 10, 45]) linear_extrude(5) square(...)` can now be edited directly while unsupported wrappers remain outside the write-back region.
+* Added parser support for scalar `square(N)`, canonicalized on write-back as `square([N, N])`.
+* Updated undo snapshots to preserve the session dirty flag, so undoable mark changes remain clean while undoing source edits can restore the correct clean/dirty state.
+
+### Previous Changes
 
 * Split editor implementation into focused subsystem files: core, cursor, refs, selection, editing, rendering, and mode assembly.
 * Added parser/session support for primitive `circle`, `square`, and `text` nodes.
