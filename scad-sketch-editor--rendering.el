@@ -81,6 +81,9 @@
 Preview mode is a transient editor-buffer rendering state.  It is not part of
 the sketch session and does not affect write-back or undo.")
 
+(defconst scad-sketch-preview-background-color "#e8e8e8"
+  "Solid background color used in clean preview mode.")
+
 ;;;; ── Numeric formatting ─────────────────────────────────────────────────────
 
 (defun scad-sketch--fmt-num (n)
@@ -533,6 +536,98 @@ Optional STROKE-DASH sets stroke-dasharray on both passes."
   (let ((mods (ignore-errors (event-modifiers event))))
     (and mods (memq 'up mods))))
 
+(defun scad-sketch--draw-preview-shape (svg transform session shape-id fill)
+  "Draw SHAPE-ID as clean preview geometry using FILL."
+  (let* ((shape (scad-sketch-session-shape-by-id session shape-id))
+         (kind  (and shape (scad-sketch-shape-kind shape)))
+         (d     (and shape
+                     (scad-sketch--shape-path-d shape transform))))
+    (when shape
+      (cond
+       ((eq kind 'text)
+        (scad-sketch--draw-preview-text-shape svg transform shape fill))
+
+       (d
+        (svg-node svg 'path
+                  :d d
+                  :fill fill
+                  :fill-rule "nonzero"
+                  :stroke "none"))))))
+
+(defun scad-sketch--draw-preview-tree (svg defs transform session tree
+                                           &optional fill)
+  "Draw TREE as a simple clean preview.
+
+This renderer intentionally avoids editor overlays, labels, outlines, and final
+silhouette filters.  It uses painter-style preview rendering:
+  - union/sequence draw children in white
+  - difference draws the positive child in white, then subtractors in background
+  - mirror draws source and mirrored child in white
+  - intersection uses a minimal clipPath"
+  (let ((fill (or fill "#ffffff")))
+    (pcase (and tree (plist-get tree :kind))
+      ('shape
+       (scad-sketch--draw-preview-shape
+        svg transform session (plist-get tree :shape-id) fill))
+
+      ('sequence
+       (dolist (child (plist-get tree :children))
+         (scad-sketch--draw-preview-tree svg defs transform session child fill)))
+
+      ('mirror
+       (let* ((mx    (float (or (plist-get tree :mx) 1.0)))
+              (my    (float (or (plist-get tree :my) 0.0)))
+              (child (plist-get tree :child))
+              (mxf   (scad-sketch--mirror-transform mx my transform)))
+         ;; Preview shows source-side and mirrored result as solid geometry.
+         (scad-sketch--draw-preview-tree svg defs transform session child fill)
+         (scad-sketch--draw-preview-tree svg defs mxf       session child fill)))
+
+      ('boolean
+       (let ((op       (plist-get tree :op))
+             (children (plist-get tree :children)))
+         (pcase op
+           ('union
+            (dolist (child children)
+              (scad-sketch--draw-preview-tree
+               svg defs transform session child fill)))
+
+           ('difference
+            (when children
+              (scad-sketch--draw-preview-tree
+               svg defs transform session (car children) fill)
+              ;; Painter-style subtraction: cover subtractors with background.
+              ;; This is not a real boolean outline, but it is simple and gives
+              ;; the expected clean preview for common cutout workflows.
+              (dolist (sub (cdr children))
+                (scad-sketch--draw-preview-tree
+                 svg defs transform session sub
+                 scad-sketch-preview-background-color))))
+
+           ('intersection
+            ;; This is the one case where painter-style rendering is not enough:
+            ;; to omit non-overlapping parts, we need a simple clipPath.
+            (when children
+              (let* ((clip-id (scad-sketch--next-svg-id "preview-intersection"))
+                     (clip    (svg-node defs 'clipPath :id clip-id))
+                     (g       (svg-node svg 'g
+                                        :clip-path (format "url(#%s)" clip-id))))
+                (dolist (clip-child (cdr children))
+                  (dolist (d (scad-sketch--tree-path-ds
+                              session transform clip-child))
+                    (svg-node clip 'path
+                              :d d
+                              :fill "#000000"
+                              :fill-rule "nonzero")))
+                (scad-sketch--draw-preview-tree
+                 g defs transform session (car children) fill))))
+
+           (_
+            (dolist (child children)
+              (scad-sketch--draw-preview-tree
+               svg defs transform session child fill)))))))))
+
+
 (defun scad-sketch-preview-until-next-input ()
   "Temporarily render the sketch as a clean preview.
 
@@ -552,8 +647,8 @@ and is replayed."
     (setq-local scad-sketch--preview-mode nil)
     (scad-sketch--render)))
 
-(defun scad-sketch--draw-preview-text-shape (svg transform shape)
-  "Draw text SHAPE as actual preview text, without editor labels/handles."
+(defun scad-sketch--draw-preview-text-shape (svg transform shape &optional fill)
+  "Draw text SHAPE as actual preview content."
   (let* ((md      (scad-sketch-shape-metadata shape))
          (str     (or (plist-get md :str) ""))
          (x       (float (or (plist-get md :x) 0.0)))
@@ -568,7 +663,7 @@ and is replayed."
             (list :x (nth 0 screen)
                   :y (nth 1 screen)
                   :font-size font-px
-                  :fill "#111111")
+                  :fill (or fill "#111111"))
             (when font
               (list :font-family font))
             (unless (< (abs angle) 0.000001)
@@ -1523,31 +1618,34 @@ labels."
 In normal mode, draw semantic preview, mirror axes, selection/attention,
 per-shape overlays, and boolean boxes.
 
-In preview mode, draw only the semantic tree output."
+In preview mode, draw only the final semantic tree output."
   (scad-sketch-session-sync-active-shape-from-points session)
   (let ((boolean-session (scad-sketch--root-is-boolean-p session))
         (preview         (scad-sketch--preview-p)))
 
-    ;; Layer 1 – Semantic preview.
-    (when (scad-sketch-session-tree session)
-      (let ((defs (scad-sketch--ensure-defs svg)))
-        (setq scad-sketch--svg-id-counter 0)
-        (scad-sketch--render-tree svg defs transform session
-                                  (scad-sketch-session-tree session))))
+    (if preview
+	(when (scad-sketch-session-tree session)
+	  (let ((defs (scad-sketch--ensure-defs svg)))
+            (setq scad-sketch--svg-id-counter 0)
+            (scad-sketch--draw-preview-tree
+             svg defs transform session (scad-sketch-session-tree session))))
 
-    ;; Preview mode stops here.  No handles, labels, axes, points, marks,
-    ;; boolean group boxes, selection, attention, or HUD-related overlays.
-    (unless preview
+      ;; Normal editor semantic preview.
+      (when (scad-sketch-session-tree session)
+        (let ((defs (scad-sketch--ensure-defs svg)))
+          (setq scad-sketch--svg-id-counter 0)
+          (scad-sketch--render-tree svg defs transform session
+                                    (scad-sketch-session-tree session))))
 
-      ;; Layer 2 – Mirror axes and axis handles.
+      ;; Mirror axes and axis handles.
       (when (fboundp 'scad-sketch--draw-mirror-axes)
         (scad-sketch--draw-mirror-axes svg transform session))
 
-      ;; Layer 3 – Selection highlight for boolean sessions.
+      ;; Selection highlight for boolean sessions.
       (when boolean-session
         (scad-sketch--draw-group-highlight svg transform session))
 
-      ;; Layer 4 – Hover-attention geometry halo.
+      ;; Hover-attention geometry halo.
       (when (fboundp 'scad-sketch--hover-attention-ref)
         (let ((hover-attention (scad-sketch--hover-attention-ref session)))
           (unless (eq (and hover-attention
@@ -1556,7 +1654,7 @@ In preview mode, draw only the semantic tree output."
             (scad-sketch--draw-ref-geometry-halo
              svg transform session hover-attention))))
 
-      ;; Layer 5 – Per-shape source-side interactive overlays.
+      ;; Per-shape source-side interactive overlays.
       (dolist (shape (scad-sketch-session-shapes session))
         (let* ((shape-id    (scad-sketch-shape-id shape))
                (point-attn  (let ((att (scad-sketch--attention-ref session)))
@@ -1574,7 +1672,7 @@ In preview mode, draw only the semantic tree output."
             ('text    (scad-sketch--draw-one-text-shape
                        svg transform session shape suppress)))))
 
-      ;; Layer 6 – Boolean bounding-box labels.
+      ;; Boolean bounding-box labels.
       (when (scad-sketch-session-tree session)
         (scad-sketch--draw-boolean-boxes
          svg transform session (scad-sketch-session-tree session))))))
