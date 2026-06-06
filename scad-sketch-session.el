@@ -261,17 +261,26 @@ geometry.  Rendering/write-back can show/use the mirrored result."
       (_ nil))))
 
 (defun scad-sketch-session--tree-shape-ids (tree)
-  "Return all shape ids in TREE."
-  (pcase (plist-get tree :kind)
+  "Return all shape ids contained in TREE, in traversal order."
+  (pcase (and tree (plist-get tree :kind))
     ('shape
-     (list (plist-get tree :shape-id)))
+     (let ((shape-id (plist-get tree :shape-id)))
+       (if shape-id (list shape-id) nil)))
+
     ('boolean
      (apply #'append
             (mapcar #'scad-sketch-session--tree-shape-ids
                     (plist-get tree :children))))
+
     ('mirror
      (scad-sketch-session--tree-shape-ids
       (plist-get tree :child)))
+
+    ('sequence
+     (apply #'append
+            (mapcar #'scad-sketch-session--tree-shape-ids
+                    (plist-get tree :children))))
+
     (_ nil)))
 
 (defun scad-sketch-session--tree-groups (tree)
