@@ -1,9 +1,17 @@
 ;;; scad-sketch.el --- Keyboard sketch editor entry point for OpenSCAD -*- lexical-binding: t; -*-
 
-;; Author: inaimathi, Claude Sonnet
+;; Copyright (C) 2026 inaimathi
+;;
+;; Author: inaimathi <leo.zovic@gmail.com>
+;; Maintainer: inaimathi <leo.zovic@gmail.com>
 ;; Version: 0.5.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: cad, openscad, svg, tools
+;; URL: https://github.com/inaimathi/scad-sketch-mode
+;; License: MIT
+;; SPDX-License-Identifier: MIT
+;; Assisted-by: Claude Sonnet 4.6
+;; Assisted-by: ChatGPT GPT-5.5 Thinking
 
 ;;; Commentary:
 
