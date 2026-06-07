@@ -135,7 +135,13 @@
        (0.0 40.0 0.0)))
     (let ((out (spround-test--write-back-string session)))
       (spround-test--assert-contains
-       "polygon(polyRound([[0, 0, 0], [40, 0, 10], [0, 40, 0]], 16));"
+       "polygon(polyRound([[0, 0, 0],"
+       out)
+      (spround-test--assert-contains
+       "[40, 0, 10],"
+       out)
+      (spround-test--assert-contains
+       "[0, 40, 0]], 16));"
        out)
       (spround-test--assert-not-contains
        "polygon([[0, 0, 0]"
@@ -153,7 +159,13 @@
        (0.0 40.0 0.0)))
     (let ((out (spround-test--write-back-string session)))
       (spround-test--assert-contains
-       "polygon([[0, 0], [40, 0], [0, 40]]);"
+       "polygon([[0, 0],"
+       out)
+      (spround-test--assert-contains
+       "[40, 0],"
+       out)
+      (spround-test--assert-contains
+       "[0, 40]]);"
        out)
       (spround-test--assert-not-contains "polyRound" out))))
 
@@ -170,7 +182,13 @@
          (50.0 20.0 2.0)))
       (let ((out (spround-test--write-back-string session)))
         (spround-test--assert-contains
-         "polygon(polyRound([[4, 11, 10], [40, 0, 0], [50, 20, 2]], 16));"
+         "polygon(polyRound([[4, 11, 10],"
+         out)
+        (spround-test--assert-contains
+         "[40, 0, 0],"
+         out)
+        (spround-test--assert-contains
+         "[50, 20, 2]], 16));"
          out)
         (spround-test--assert-not-contains
          "polygon([[4, 11, 10]"

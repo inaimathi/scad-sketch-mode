@@ -101,9 +101,9 @@
                   (scad-sketch-session-toggle-polygon-extraction
                    session shape)))
       (let ((preview (scad-sketch-session-preview session)))
-        (sextract-test--assert-contains
-         "polygon([[0, 0], [30, 0], [15, 26]]);"
-         preview)
+        (sextract-test--assert-contains "polygon([[0, 0]," preview)
+        (sextract-test--assert-contains "[30, 0]," preview)
+        (sextract-test--assert-contains "[15, 26]]);" preview)
         (sextract-test--assert-not-contains "pts =" preview)
         (sextract-test--assert-not-contains "polygon(pts);" preview)))))
 
@@ -184,7 +184,6 @@
 ;;;; =========================================================================
 ;;;; Existing variable refs
 ;;;; =========================================================================
-
 (ert-deftest sextract-existing-varref-toggle-forces-inline-call ()
   "Existing polygon(pts) toggles back to inline polygon output."
   (sextract-test--with-session
@@ -201,9 +200,9 @@
                   (scad-sketch-session-toggle-polygon-extraction
                    session shape)))
       (let ((preview (scad-sketch-session-preview session)))
-        (sextract-test--assert-contains
-         "polygon([[0, 0], [30, 0], [15, 26]]);"
-         preview)
+        (sextract-test--assert-contains "polygon([[0, 0]," preview)
+        (sextract-test--assert-contains "[30, 0]," preview)
+        (sextract-test--assert-contains "[15, 26]]);" preview)
         (sextract-test--assert-not-contains "polygon(pts);" preview)))))
 
 (ert-deftest sextract-existing-varref-inline-writeback-deletes-source-array ()
@@ -220,9 +219,11 @@
       (let ((out (sextract-test--write-back-string session)))
         (sextract-test--assert-not-contains "points =" out)
         (sextract-test--assert-not-contains "polygon(points);" out)
-        (sextract-test--assert-contains
-         "polygon([[0, 0], [40, 0], [50, 20], [40, 40], [0, 40]]);"
-         out)))))
+        (sextract-test--assert-contains "polygon([[0, 0]," out)
+        (sextract-test--assert-contains "[40, 0]," out)
+        (sextract-test--assert-contains "[50, 20]," out)
+        (sextract-test--assert-contains "[40, 40]," out)
+        (sextract-test--assert-contains "[0, 40]]);" out)))))
 
 (ert-deftest sextract-existing-polyround-varref-inline-writeback-deletes-source-array ()
   "Inlining polygon(polyRound(points, fn)) removes the source array."

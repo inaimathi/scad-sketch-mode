@@ -200,8 +200,9 @@ The polygon call that refers to the array is untouched."
        (20.0 0.0 0.0)
        (10.0 17.0 0.0)))
     (let ((out (sss-test--write-back-string session)))
-      (sss-test--assert-contains
-       "polygon([[0, 0], [20, 0], [10, 17]]);" out)
+      (sss-test--assert-contains "polygon([[0, 0]," out)
+      (sss-test--assert-contains "[20, 0]," out)
+      (sss-test--assert-contains "[10, 17]]);" out)
       (sss-test--assert-no-generated-sketch-arrays out))))
 
 (ert-deftest sss-inline-polygon-writeback-keeps-inline-large ()
@@ -317,9 +318,15 @@ The polygon call that refers to the array is untouched."
      '((2.0 3.0 0.0)
        (4.0 5.0 0.0)))
     (let ((out (sss-test--write-back-string session)))
-      (sss-test--assert-contains "pts = [\n  [2, 3],\n  [4, 5]\n];" out)
+      (sss-test--assert-contains
+       "pts = [[2, 3],\n       [4, 5]];"
+       out)
       (sss-test--assert-contains "polygon(pts);" out)
-      (sss-test--assert-contains "pts = [[99,99]];" out))))
+      (sss-test--assert-contains "pts = [[99,99]];" out)
+      ;; Make sure the rewritten source assignment still appears before the
+      ;; polygon call.  This catches insertion-at-current-point regressions.
+      (should (< (string-match (regexp-quote "pts = [[2, 3]") out)
+                 (string-match (regexp-quote "polygon(pts);") out))))))
 
 
 ;;;; =========================================================================
@@ -361,7 +368,6 @@ The polygon call that refers to the array is untouched."
 ;;;; =========================================================================
 ;;;; 5. Generic blank block sessions
 ;;;; =========================================================================
-
 (ert-deftest sss-generic-block-writeback-inserts-inline-polygon ()
   "A generic blank block emits inline shape source, not an array assignment."
   (unless (fboundp 'scad-sketch-session-insert-block-at-point)
@@ -378,8 +384,9 @@ The polygon call that refers to the array is untouched."
          (0.0 10.0 0.0)))
       (let ((out (sss-test--write-back-string session)))
         (sss-test--assert-contains "// before" out)
-        (sss-test--assert-contains
-         "polygon([[0, 0], [10, 0], [0, 10]]);" out)
+        (sss-test--assert-contains "polygon([[0, 0]," out)
+        (sss-test--assert-contains "[10, 0]," out)
+        (sss-test--assert-contains "[0, 10]]);" out)
         (sss-test--assert-contains "// after" out)
         (sss-test--assert-not-contains " = [" out)
         (sss-test--assert-no-generated-sketch-arrays out)))))

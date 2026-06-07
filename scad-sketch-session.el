@@ -30,6 +30,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'scad-sketch-parse)
+(require 'scad-sketch-session--emit)
 
 (defgroup scad-sketch nil
   "Keyboard sketch editor for OpenSCAD array literals."
@@ -956,101 +957,6 @@ When SHAPE currently emits inline, extract points into NAME, defaulting to
   "Return non-nil if POINTS contains any non-zero radius."
   (cl-some (lambda (p) (and (nth 2 p) (> (nth 2 p) 0))) points))
 
-(defun scad-sketch-session--fmt-num (n)
-  "Format N compactly for OpenSCAD."
-  (let ((x (float n)))
-    (if (< (abs (- x (round x))) 0.000001)
-        (number-to-string (round x))
-      (let ((s (format "%.4f" x)))
-        (setq s (replace-regexp-in-string "0+\\'" "" s))
-        (setq s (replace-regexp-in-string "\\.\\'" "" s))
-        (if (or (string= s "-0") (string= s "")) "0" s)))))
-
-(defun scad-sketch-session--fmt-point (point use-radii)
-  "Format one model POINT.  When USE-RADII is non-nil emit [x, y, r]."
-  (if use-radii
-      (format "[%s, %s, %s]"
-              (scad-sketch-session--fmt-num (nth 0 point))
-              (scad-sketch-session--fmt-num (nth 1 point))
-              (scad-sketch-session--fmt-num (or (nth 2 point) 0)))
-    (format "[%s, %s]"
-            (scad-sketch-session--fmt-num (nth 0 point))
-            (scad-sketch-session--fmt-num (nth 1 point)))))
-
-(defun scad-sketch-session--fmt-inline-array (points &optional force-radii)
-  "Format POINTS as a single-line SCAD array."
-  (let ((use-radii (or force-radii
-                       (scad-sketch-session--any-radius-p points))))
-    (concat "["
-            (mapconcat (lambda (p)
-                         (scad-sketch-session--fmt-point p use-radii))
-                       points
-                       ", ")
-            "]")))
-
-(defun scad-sketch-session--fmt-array (points indent &optional force-radii)
-  "Format POINTS as a multi-line SCAD array at INDENT."
-  (let* ((use-radii (or force-radii
-                        (scad-sketch-session--any-radius-p points)))
-         (child-indent (concat indent "  "))
-         (lines
-          (mapcar (lambda (p)
-                    (concat child-indent
-                            (scad-sketch-session--fmt-point p use-radii)))
-                  points)))
-    (concat "[\n"
-            (mapconcat #'identity lines ",\n")
-            (if lines "\n" "")
-            indent
-            "]")))
-
-(defun scad-sketch-session--emit-array-assignment
-    (name points indent &optional force-radii)
-  "Emit NAME = POINTS; at INDENT."
-  (format "%s%s = %s;\n"
-          indent
-          name
-          (scad-sketch-session--fmt-array points indent force-radii)))
-
-(defun scad-sketch-session--emit-points-assignment
-    (name points indent &optional force-r)
-  "Emit NAME = POINTS assignment at INDENT.
-
-When FORCE-R is non-nil, emit points as [x, y, r] triples."
-  (format "%s%s = %s;\n"
-          indent
-          name
-          (scad-sketch-session--fmt-inline-array points force-r)))
-
-(defun scad-sketch-session--emit-polygon-call
-    (points indent polyround &optional source-name _extracted-name)
-  "Emit a polygon call at INDENT.
-
-If SOURCE-NAME is non-nil, preserve the variable-reference style and emit
-polygon(SOURCE-NAME) or polygon(polyRound(SOURCE-NAME, FN)).
-
-Otherwise emit points inline, always.  Do not extract large inline polygons."
-  (cond
-   ((and source-name polyround)
-    (format "%spolygon(polyRound(%s, %s));\n"
-            indent
-            source-name
-            (scad-sketch-session--fmt-num polyround)))
-
-   (source-name
-    (format "%spolygon(%s);\n" indent source-name))
-
-   (polyround
-    (format "%spolygon(polyRound(%s, %s));\n"
-            indent
-            (scad-sketch-session--fmt-inline-array points t)
-            (scad-sketch-session--fmt-num polyround)))
-
-   (t
-    (format "%spolygon(%s);\n"
-            indent
-            (scad-sketch-session--fmt-inline-array points nil)))))
-
 ;;;; Session construction
 (defun scad-sketch-session--shape-initial-point (shape)
   "Return the initial cursor point for SHAPE."
@@ -1430,207 +1336,6 @@ When SHAPE is forced inline, ignore any original variable reference."
       (or (plist-get md :source-name)
           (and target (scad-sketch-target-name target))))))
 
-(defun scad-sketch-session--emit-square-shape (shape indent)
-  "Emit square SHAPE at INDENT."
-  (let* ((md    (scad-sketch-shape-metadata shape))
-         (x     (float (or (plist-get md :x) 0.0)))
-         (y     (float (or (plist-get md :y) 0.0)))
-         (w     (float (or (plist-get md :w) 0.0)))
-         (h     (float (or (plist-get md :h) 0.0)))
-         (angle (float (or (plist-get md :angle) 0.0)))
-         (zero-pos (and (< (abs x) 0.000001)
-                        (< (abs y) 0.000001)))
-         (zero-ang (< (abs angle) 0.000001))
-         (call (format "square([%s, %s]);"
-                       (scad-sketch-session--fmt-num w)
-                       (scad-sketch-session--fmt-num h))))
-    (cond
-     ((and zero-pos zero-ang)
-      (format "%s%s\n" indent call))
-     (zero-pos
-      (format "%srotate(%s)\n%s  %s\n"
-              indent
-              (scad-sketch-session--fmt-num angle)
-              indent
-              call))
-     (zero-ang
-      (format "%stranslate([%s, %s])\n%s  %s\n"
-              indent
-              (scad-sketch-session--fmt-num x)
-              (scad-sketch-session--fmt-num y)
-              indent
-              call))
-     (t
-      (format "%stranslate([%s, %s])\n%s  rotate(%s)\n%s    %s\n"
-              indent
-              (scad-sketch-session--fmt-num x)
-              (scad-sketch-session--fmt-num y)
-              indent
-              (scad-sketch-session--fmt-num angle)
-              indent
-              call)))))
-
-(defun scad-sketch-session--emit-circle-shape (shape indent)
-  "Emit circle SHAPE at INDENT."
-  (let* ((md (scad-sketch-shape-metadata shape))
-         (cx (plist-get md :cx))
-         (cy (plist-get md :cy))
-         (r  (plist-get md :r)))
-    (if (and (< (abs cx) 0.000001)
-             (< (abs cy) 0.000001))
-        (format "%scircle(r=%s);\n"
-                indent
-                (scad-sketch-session--fmt-num r))
-      (format "%stranslate([%s, %s])\n%s  circle(r=%s);\n"
-              indent
-              (scad-sketch-session--fmt-num cx)
-              (scad-sketch-session--fmt-num cy)
-              indent
-              (scad-sketch-session--fmt-num r)))))
-
-(defun scad-sketch-session--emit-text-shape (shape indent)
-  "Emit text SHAPE at INDENT."
-  (let* ((md    (scad-sketch-shape-metadata shape))
-         (str   (or (plist-get md :str) ""))
-         (x     (float (or (plist-get md :x) 0.0)))
-         (y     (float (or (plist-get md :y) 0.0)))
-         (size  (float (or (plist-get md :size) 10.0)))
-         (angle (float (or (plist-get md :angle) 0.0)))
-         (font  (plist-get md :font))
-         (zero-pos (and (< (abs x) 0.000001)
-                        (< (abs y) 0.000001)))
-         (zero-ang (< (abs angle) 0.000001))
-         (call (format "text(%S, size=%s%s);"
-                       str
-                       (scad-sketch-session--fmt-num size)
-                       (if (and font (not (string-empty-p font)))
-                           (format ", font=%S" font)
-                         ""))))
-    (cond
-     ((and zero-pos zero-ang)
-      (format "%s%s\n" indent call))
-     (zero-pos
-      (format "%srotate(%s)\n%s  %s\n"
-              indent
-              (scad-sketch-session--fmt-num angle)
-              indent
-              call))
-     (zero-ang
-      (format "%stranslate([%s, %s])\n%s  %s\n"
-              indent
-              (scad-sketch-session--fmt-num x)
-              (scad-sketch-session--fmt-num y)
-              indent
-              call))
-     (t
-      (format "%stranslate([%s, %s])\n%s  rotate(%s)\n%s    %s\n"
-              indent
-              (scad-sketch-session--fmt-num x)
-              (scad-sketch-session--fmt-num y)
-              indent
-              (scad-sketch-session--fmt-num angle)
-              indent
-              call)))))
-
-(defun scad-sketch-session--emit-polygon-shape-call (session shape indent)
-  "Emit polygon SHAPE call at INDENT."
-  (let* ((points    (scad-sketch-shape-points shape))
-         (polyround (scad-sketch-shape-polyround shape))
-         (source    (scad-sketch-session--shape-source-name session shape)))
-    (scad-sketch-session--emit-polygon-call
-     points indent polyround source)))
-
-(defun scad-sketch-session--emit-shape-with-assignments (session shape indent)
-  "Return (:assignments STR :call STR) for SHAPE in SESSION.
-
-Polygon source style is controlled by shape metadata:
-  - :points-var-name emits a local points assignment and calls polygon(NAME)
-  - :force-inline-p ignores original source refs and emits inline
-  - otherwise original source refs are preserved when present
-
-If a polygon has positive point radii but no explicit polyRound fn, emit it as
-polyRound(..., `scad-sketch-default-polyround-fn') because plain
-OpenSCAD `polygon' expects 2D points."
-  (pcase (scad-sketch-shape-kind shape)
-    ('circle
-     (list :assignments ""
-           :call (scad-sketch-session--emit-circle-shape shape indent)))
-
-    ('square
-     (list :assignments ""
-           :call (scad-sketch-session--emit-square-shape shape indent)))
-
-    ('text
-     (list :assignments ""
-           :call (scad-sketch-session--emit-text-shape shape indent)))
-
-    ('polygon
-     (let* ((shape-points (scad-sketch-shape-points shape))
-            (polyround    (scad-sketch-session--effective-polyround-fn shape))
-            (local-name   (scad-sketch-session--shape-points-var-name shape))
-            (source       (or local-name
-                              (scad-sketch-session--shape-source-name
-                               session shape)))
-            (force-r      (or polyround
-                              (scad-sketch-session--points-have-radii-p
-                               shape-points)))
-            (assignments  (if local-name
-                              (scad-sketch-session--emit-points-assignment
-                               local-name shape-points indent force-r)
-                            "")))
-       (list :assignments assignments
-             :call (scad-sketch-session--emit-polygon-call
-                    shape-points indent polyround source))))
-
-    (_
-     (list :assignments "" :call ""))))
-
-(defun scad-sketch-session--emit-tree (session tree indent)
-  "Emit TREE for SESSION at INDENT."
-  (pcase (and tree (plist-get tree :kind))
-    ('shape
-     (let* ((shape-id (plist-get tree :shape-id))
-            (shape    (scad-sketch-session-shape-by-id session shape-id))
-            (emitted  (and shape
-                            (scad-sketch-session--emit-shape-with-assignments
-                             session shape indent))))
-       (if emitted
-           (concat (plist-get emitted :assignments)
-                   (plist-get emitted :call))
-         "")))
-
-    ('sequence
-     (mapconcat (lambda (child)
-                  (scad-sketch-session--emit-tree session child indent))
-                (plist-get tree :children)
-                ""))
-
-    ('boolean
-     (let ((op       (plist-get tree :op))
-           (children (plist-get tree :children))
-           (body     ""))
-       (dolist (child children)
-         (setq body
-               (concat body
-                       (scad-sketch-session--emit-tree
-                        session child (concat indent "  ")))))
-       (format "%s%s() {\n%s%s}\n"
-               indent op body indent)))
-
-    ('mirror
-     (let* ((mx    (float (or (plist-get tree :mx) 1.0)))
-            (my    (float (or (plist-get tree :my) 0.0)))
-            (child (plist-get tree :child))
-            (body  (scad-sketch-session--emit-tree
-                    session child (concat indent "  "))))
-       (format "%smirror([%s, %s])\n%s"
-               indent
-               (scad-sketch-session--fmt-num mx)
-               (scad-sketch-session--fmt-num my)
-               body)))
-
-    (_ "")))
-
 (defun scad-sketch-session--target-indent (target)
   "Return indentation string for TARGET's beginning marker."
   (let ((marker (scad-sketch-target-beg-marker target)))
@@ -1643,52 +1348,105 @@ OpenSCAD `polygon' expects 2D points."
           "")))))
 
 (defun scad-sketch-session--source-target-replacement (session target)
-  "Return replacement text for source TARGET in SESSION."
-  (let* ((indent (scad-sketch-session--target-indent target))
-         (shape
-          (cl-find-if
-           (lambda (shape)
-             (eq (scad-sketch-shape-source-target-id shape)
-                 (scad-sketch-target-id target)))
-           (scad-sketch-session-shapes session)))
-         (points
-          (cond (shape
-                 (scad-sketch-shape-points shape))
-                ((eq (scad-sketch-target-kind target) 'array)
-                 (plist-get (scad-sketch-target-node target) :points))
-                (t nil))))
-    (scad-sketch-session--emit-array-assignment
-     (scad-sketch-target-name target)
-     points
-     indent
-     (scad-sketch-target-polyround target))))
+  "Return replacement source for source TARGET in SESSION."
+  (let* ((target-id (scad-sketch-target-id target))
+         (shape     (cl-find-if
+                     (lambda (sh)
+                       (eq (scad-sketch-shape-source-target-id sh)
+                           target-id))
+                     (scad-sketch-session-shapes session)))
+         (points    (if shape
+                        (scad-sketch-shape-points shape)
+                      (scad-sketch-session-points session)))
+         (polyround (and shape
+                         (scad-sketch-session--effective-polyround-fn shape)))
+         (force-r   (or polyround
+                        (scad-sketch-session--points-have-radii-p points)))
+         (indent    (scad-sketch-session--target-indent target)))
+    (scad-sketch-session--normalize-replacement
+     (scad-sketch-session--emit-points-assignment
+      (scad-sketch-target-name target)
+      points
+      indent
+      force-r))))
 
-(defun scad-sketch-session--root-target-replacement (session root-target)
-  "Return replacement text for ROOT-TARGET in SESSION."
-  (let ((indent (scad-sketch-session--target-indent root-target)))
-    (scad-sketch-session--emit-tree
-     session (scad-sketch-session-tree session) indent)))
+(defun scad-sketch-session--root-target-replacement (session target)
+  "Return replacement source for root TARGET in SESSION."
+  (scad-sketch-session-sync-active-shape-from-points session)
+  (let ((indent (scad-sketch-session--target-indent target)))
+    (scad-sketch-session--normalize-replacement
+     (cond
+      ((scad-sketch-session-tree session)
+       (scad-sketch-session--emit-tree
+        session
+        (scad-sketch-session-tree session)
+        indent))
+
+      ((scad-sketch-session-active-shape session)
+       (scad-sketch-session--emit-shape-source
+        session
+        (scad-sketch-session-active-shape session)
+        indent))
+
+      (t "")))))
 
 (defun scad-sketch-session-preview (session)
-  "Return the source preview for SESSION."
+  "Return canonical OpenSCAD source for SESSION.
+
+Preview source is emitted without trailing newlines."
   (scad-sketch-session-sync-active-shape-from-points session)
-  (let ((root (scad-sketch-session-root-target session)))
-    (if root
-        (scad-sketch-session--root-target-replacement session root)
-      (let ((source-target (car (scad-sketch-session-source-targets session))))
-        (if source-target
-            (scad-sketch-session--source-target-replacement
-             session source-target)
-          "")))))
+  (scad-sketch-session--normalize-replacement
+   (if (scad-sketch-session-tree session)
+       (scad-sketch-session--emit-tree session
+                                      (scad-sketch-session-tree session)
+                                      "")
+     (let ((shape (scad-sketch-session-active-shape session)))
+       (if shape
+           (scad-sketch-session--emit-shape-source session shape "")
+         "")))))
+
+(defun scad-sketch-session--strip-existing-prefix-indent (target replacement)
+  "Strip duplicated first-line indentation from REPLACEMENT for TARGET.
+
+Many target markers begin at the form name, after existing source indentation.
+Emission includes indentation so continuation lines align correctly, but inserting
+that full replacement at the form marker would duplicate indentation on the first
+line only.
+
+If TARGET begins after whitespace on its line, and REPLACEMENT starts with that
+same whitespace, remove that prefix from the first line of REPLACEMENT.  Leave
+continuation lines unchanged."
+  (let* ((beg-marker (scad-sketch-target-beg-marker target))
+         (beg        (marker-position beg-marker))
+         (prefix
+          (with-current-buffer (marker-buffer beg-marker)
+            (save-excursion
+              (goto-char beg)
+              (let ((line-beg (line-beginning-position)))
+                (buffer-substring-no-properties line-beg beg))))))
+    (if (and (> (length prefix) 0)
+             (string-match-p "\\`[ \t]+\\'" prefix)
+             (string-prefix-p prefix replacement))
+        (substring replacement (length prefix))
+      replacement)))
 
 (defun scad-sketch-session--write-target-replacement (target replacement)
-  "Replace TARGET with REPLACEMENT in its source buffer."
-  (when replacement
-    (goto-char (scad-sketch-target-beg-marker target))
-    (delete-region (scad-sketch-target-beg-marker target)
-                   (scad-sketch-target-end-marker target))
-    (insert replacement)
-    (set-marker (scad-sketch-target-end-marker target) (point))))
+  "Replace TARGET source region with REPLACEMENT.
+
+REPLACEMENT is normalized to avoid inserting accidental trailing blank lines.
+If TARGET starts after existing indentation, avoid duplicating that indentation
+on the first replacement line while preserving indentation on continuation
+lines."
+  (let* ((beg-marker (scad-sketch-target-beg-marker target))
+         (end-marker (scad-sketch-target-end-marker target))
+         (beg        (marker-position beg-marker))
+         (end        (marker-position end-marker))
+         (src        (scad-sketch-session--normalize-replacement replacement))
+         (src        (scad-sketch-session--strip-existing-prefix-indent
+                      target src)))
+    (goto-char beg)
+    (delete-region beg end)
+    (insert src)))
 
 (defun scad-sketch-session-write-back (session)
   "Write SESSION edits back to its source buffer.
