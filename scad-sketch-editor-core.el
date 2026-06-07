@@ -96,10 +96,12 @@ Prefer `scad-sketch--edit'; this alias is retained for compatibility."
                         (scad-sketch-session-name session)))))
     (with-current-buffer buf
       (scad-sketch-editor-mode)          ; defined in scad-sketch-editor-mode.el
-      (setq-local scad-sketch--session      session)
-      (setq-local scad-sketch--window-config wconf)
-      (scad-sketch--render))
-    (pop-to-buffer buf)))
+      (setq-local scad-sketch--session session)
+      (setq-local scad-sketch--window-config wconf))
+    (pop-to-buffer buf)
+    ;; Render after display so canvas sizing can use the actual editor window.
+    (with-current-buffer buf
+      (scad-sketch--render))))
 
 (provide 'scad-sketch-editor-core)
 ;;; scad-sketch-editor-core.el ends here

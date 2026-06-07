@@ -179,5 +179,69 @@
         (should (plist-member entry :undo-fn))
         (should-not (plist-member entry :shapes))))))
 
+(ert-deftest sgeom-center-selection-on-point-is-undoable ()
+  "Centering selected geometry on point moves the selection and can be undone."
+  (sgeom-test--with-editor-session
+      "polygon([[0,0], [10,0], [10,10], [0,10]]);\n"
+      "polygon"
+    (let* ((shape    (sgeom-test--active-shape session))
+           (shape-id (scad-sketch-shape-id shape))
+           (before   (sgeom-test--active-points session)))
+      (sgeom-test--select-ref session (scad-sketch--shape-ref shape-id))
+      (sgeom-test--set-point session '(100.0 100.0))
+
+      (scad-sketch-center-selection-on-point)
+
+      (let* ((refs   (list (scad-sketch--shape-ref shape-id)))
+             (bounds (scad-sketch--refs-bounds-for-centering session refs)))
+        (should (equal (scad-sketch--bounds-center bounds)
+                       '(100.0 100.0))))
+
+      ;; Centering on point should not carry point along.
+      (should (equal (scad-sketch-session-point session)
+                     '(100.0 100.0)))
+      (should (scad-sketch-session-dirty session))
+      (should-not (equal before (sgeom-test--active-points session)))
+
+      (scad-sketch-undo)
+
+      (should (equal before (sgeom-test--active-points session)))
+      (should (equal (scad-sketch-session-point session)
+                     '(100.0 100.0)))
+      (should-not (scad-sketch-session-dirty session)))))
+
+(ert-deftest sgeom-center-selection-on-canvas-is-undoable ()
+  "Centering selected geometry on canvas center moves the selection undoably."
+  (sgeom-test--with-editor-session
+      "polygon([[0,0], [10,0], [10,10], [0,10]]);\n"
+      "polygon"
+    (let* ((shape    (sgeom-test--active-shape session))
+           (shape-id (scad-sketch-shape-id shape))
+           (before   (sgeom-test--active-points session)))
+      (sgeom-test--select-ref session (scad-sketch--shape-ref shape-id))
+      (sgeom-test--set-point session '(7.0 8.0))
+
+      (cl-letf (((symbol-function 'scad-sketch--bounds)
+                 (lambda (_session) '(0.0 100.0 0.0 100.0))))
+        (scad-sketch-center-selection-on-canvas))
+
+      (let* ((refs   (list (scad-sketch--shape-ref shape-id)))
+             (bounds (scad-sketch--refs-bounds-for-centering session refs)))
+        (should (equal (scad-sketch--bounds-center bounds)
+                       '(50.0 50.0))))
+
+      ;; Centering on canvas should not carry point along.
+      (should (equal (scad-sketch-session-point session)
+                     '(7.0 8.0)))
+      (should (scad-sketch-session-dirty session))
+      (should-not (equal before (sgeom-test--active-points session)))
+
+      (scad-sketch-undo)
+
+      (should (equal before (sgeom-test--active-points session)))
+      (should (equal (scad-sketch-session-point session)
+                     '(7.0 8.0)))
+      (should-not (scad-sketch-session-dirty session)))))
+
 (provide 'scad-sketch-geometry-undo-test)
 ;;; scad-sketch-geometry-undo-test.el ends here

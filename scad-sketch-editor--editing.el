@@ -148,6 +148,207 @@ Input is two numbers, for example:
           mirror (nth 0 pair) (nth 1 pair)))))))
 
 ;;; Selected geometry movement
+(defun scad-sketch--bounds-center (bounds)
+  "Return center point of BOUNDS.
+
+BOUNDS is (MIN-X MAX-X MIN-Y MAX-Y)."
+  (list (/ (+ (nth 0 bounds) (nth 1 bounds)) 2.0)
+        (/ (+ (nth 2 bounds) (nth 3 bounds)) 2.0)))
+
+(defun scad-sketch--points-bounds-for-centering (points)
+  "Return bounds for POINTS as (MIN-X MAX-X MIN-Y MAX-Y)."
+  (when points
+    (let ((xs (mapcar #'car points))
+          (ys (mapcar #'cadr points)))
+      (list (apply #'min xs)
+            (apply #'max xs)
+            (apply #'min ys)
+            (apply #'max ys)))))
+
+(defun scad-sketch--bounds-union-for-centering (bounds-list)
+  "Return union of BOUNDS-LIST.
+
+Each bounds item is (MIN-X MAX-X MIN-Y MAX-Y)."
+  (let ((bounds-list (delq nil bounds-list)))
+    (when bounds-list
+      (list (apply #'min (mapcar (lambda (b) (nth 0 b)) bounds-list))
+            (apply #'max (mapcar (lambda (b) (nth 1 b)) bounds-list))
+            (apply #'min (mapcar (lambda (b) (nth 2 b)) bounds-list))
+            (apply #'max (mapcar (lambda (b) (nth 3 b)) bounds-list))))))
+
+(defun scad-sketch--square-corners-for-centering (shape)
+  "Return approximate corner points for square SHAPE."
+  (let* ((md    (scad-sketch-shape-metadata shape))
+         (x     (float (or (plist-get md :x) 0.0)))
+         (y     (float (or (plist-get md :y) 0.0)))
+         (w     (float (or (plist-get md :w) 1.0)))
+         (h     (float (or (plist-get md :h) 1.0)))
+         (angle (float (or (plist-get md :angle) 0.0)))
+         (rad   (* float-pi (/ angle 180.0)))
+         (co    (cos rad))
+         (si    (sin rad)))
+    (mapcar
+     (lambda (pt)
+       (let ((dx (- (nth 0 pt) x))
+             (dy (- (nth 1 pt) y)))
+         (list (+ x (- (* dx co) (* dy si)))
+               (+ y (+ (* dx si) (* dy co))))))
+     (list (list x y)
+           (list (+ x w) y)
+           (list (+ x w) (+ y h))
+           (list x (+ y h))))))
+
+(defun scad-sketch--shape-bounds-for-centering (shape)
+  "Return approximate bounds for SHAPE as (MIN-X MAX-X MIN-Y MAX-Y)."
+  (pcase (scad-sketch-shape-kind shape)
+    ('polygon
+     (scad-sketch--points-bounds-for-centering
+      (mapcar #'scad-sketch--point-xy
+              (scad-sketch-shape-points shape))))
+
+    ('circle
+     (let* ((md (scad-sketch-shape-metadata shape))
+            (cx (float (or (plist-get md :cx) 0.0)))
+            (cy (float (or (plist-get md :cy) 0.0)))
+            (r  (float (or (plist-get md :r) 1.0))))
+       (list (- cx r) (+ cx r) (- cy r) (+ cy r))))
+
+    ('square
+     (scad-sketch--points-bounds-for-centering
+      (scad-sketch--square-corners-for-centering shape)))
+
+    ('text
+     ;; Approximate text bounds.  This is only for move-to-center utilities; the
+     ;; renderer still owns actual visual text rendering.
+     (let* ((md   (scad-sketch-shape-metadata shape))
+            (str  (or (plist-get md :str) ""))
+            (x    (float (or (plist-get md :x) 0.0)))
+            (y    (float (or (plist-get md :y) 0.0)))
+            (size (float (or (plist-get md :size) 10.0)))
+            (w    (* size 0.6 (max 1 (length str))))
+            (h    size))
+       (list x (+ x w) y (+ y h))))
+
+    (_ nil)))
+
+(defun scad-sketch--ref-bounds-for-centering (session ref)
+  "Return approximate bounds for REF in SESSION."
+  (pcase (scad-sketch--ref-kind ref)
+    ('shape
+     (let ((shape (scad-sketch-session-shape-by-id
+                   session
+                   (scad-sketch--ref-shape-id ref))))
+       (and shape
+            (scad-sketch--shape-bounds-for-centering shape))))
+
+    ('point
+     (let* ((shape-id (scad-sketch--ref-shape-id ref))
+            (idx      (scad-sketch--ref-index ref))
+            (shape    (and shape-id
+                            (scad-sketch-session-shape-by-id
+                             session shape-id))))
+       (when shape
+         (let ((xy
+                (if (eq (scad-sketch-shape-kind shape) 'polygon)
+                    (scad-sketch--point-xy
+                     (nth idx (scad-sketch-shape-points shape)))
+                  (when (and (fboundp 'scad-sketch--primitive-handle-count)
+                             (fboundp 'scad-sketch--primitive-handle-xy)
+                             idx
+                             (>= idx 0)
+                             (< idx (scad-sketch--primitive-handle-count shape)))
+                    (scad-sketch--primitive-handle-xy shape idx)))))
+           (when xy
+             (list (nth 0 xy) (nth 0 xy)
+                   (nth 1 xy) (nth 1 xy)))))))
+
+    (_ nil)))
+
+(defun scad-sketch--refs-bounds-for-centering (session refs)
+  "Return approximate union bounds for REFS in SESSION."
+  (scad-sketch--bounds-union-for-centering
+   (mapcar (lambda (ref)
+             (scad-sketch--ref-bounds-for-centering session ref))
+           refs)))
+
+(defun scad-sketch--all-shapes-bounds-for-centering (session)
+  "Return approximate bounds for all shapes in SESSION."
+  (scad-sketch--bounds-union-for-centering
+   (mapcar #'scad-sketch--shape-bounds-for-centering
+           (scad-sketch-session-shapes session))))
+
+(defun scad-sketch--canvas-center-for-moving (session)
+  "Return the model-space center of the current canvas for SESSION.
+
+When rendering has provided `scad-sketch--bounds', use that so mirror preview
+bounds and render-time bounds policy are respected.  Otherwise fall back to the
+editable shape bounds."
+  (let ((bounds
+         (if (fboundp 'scad-sketch--bounds)
+             (scad-sketch--bounds session)
+           (scad-sketch--all-shapes-bounds-for-centering session))))
+    (unless bounds
+      (user-error "No canvas bounds available"))
+    (scad-sketch--bounds-center bounds)))
+
+(defun scad-sketch--zero-delta-p (dx dy)
+  "Return non-nil if DX DY is effectively zero."
+  (and (< (abs (float dx)) 0.000001)
+       (< (abs (float dy)) 0.000001)))
+
+(defun scad-sketch--move-selected-refs-by
+    (refs dx dy &optional snap move-cursor description)
+  "Move selected REFS by DX DY.
+
+When SNAP is non-nil, snap movement targets to the current grid.  When
+MOVE-CURSOR is non-nil, carry editor point along with the moved geometry.
+
+This uses operation undo entries.  Undo restores the changed shapes and the
+previous cursor state."
+  (let ((session (scad-sketch--assert-session)))
+    (scad-sketch-session-sync-active-shape-from-points session)
+    (let* ((records    (and refs
+                            (scad-sketch--move-undo-records-for-refs
+                             session refs)))
+           (old-point  (copy-tree (scad-sketch-session-point session)))
+           (old-hover  (scad-sketch-session-hover-index session))
+           (old-active (scad-sketch-session-active-shape-id session)))
+      (unless records
+        (user-error "No selected point or shape"))
+
+      (if (scad-sketch--zero-delta-p dx dy)
+          (message "Selection is already centered")
+        (scad-sketch--edit-with-undo-action
+         (lambda (s)
+           (dolist (record records)
+             (scad-sketch-undo-restore-state-record s record))
+           (setf (scad-sketch-session-point s) (copy-tree old-point))
+           (setf (scad-sketch-session-hover-index s) old-hover)
+           (setf (scad-sketch-session-active-shape-id s) old-active)
+           (when old-active
+             (scad-sketch-session-set-active-shape s old-active)))
+
+         (lambda (s)
+           (dolist (ref refs)
+             (scad-sketch--move-ref-geometry s ref dx dy snap))
+
+           (when move-cursor
+             (let* ((new (scad-sketch--move-xy
+                          (scad-sketch-session-point s)
+                          dx dy))
+                    (new (if snap
+                             (scad-sketch--snap-xy new (scad-sketch--grid s))
+                           new)))
+               (setf (scad-sketch-session-point s) new)))
+
+           (setf (scad-sketch-session-hover-index s) 0)
+
+           (let ((active-id (scad-sketch-session-active-shape-id s)))
+             (when active-id
+               (scad-sketch-session-set-active-shape s active-id))))
+
+         (or description "move selected geometry"))))))
+
 (defun scad-sketch--current-edit-shape (session)
   "Return the shape currently receiving edit attention in SESSION."
   (let* ((ref (scad-sketch--attention-ref session))
@@ -373,51 +574,47 @@ Primitive point refs move the corresponding primitive handle."
 (defun scad-sketch--move-selected (dx dy &optional snap)
   "Move selected vertices/shapes by DX, DY.  Snap to grid when SNAP is non-nil.
 
-Falls back to the active shape when no explicit selection exists.
+Falls back to the active shape when no explicit selection exists.  Arrow-key
+movement carries editor point along with the moved geometry."
+  (let* ((session (scad-sketch--assert-session))
+         (refs    (scad-sketch--move-selected-refs session)))
+    (scad-sketch--move-selected-refs-by
+     refs dx dy snap t "move selected geometry")))
 
-Movement uses an operation undo entry.  Undo restores the parent shapes changed
-by the move and the editor cursor state."
-  (let ((session (scad-sketch--assert-session)))
-    (scad-sketch-session-sync-active-shape-from-points session)
-    (let* ((refs       (scad-sketch--move-selected-refs session))
-           (records    (and refs
-                            (scad-sketch--move-undo-records-for-refs
-                             session refs)))
-           (old-point  (copy-tree (scad-sketch-session-point session)))
-           (old-hover  (scad-sketch-session-hover-index session))
-           (old-active (scad-sketch-session-active-shape-id session)))
-      (unless records
-        (user-error "No selected point or shape"))
+(defun scad-sketch-center-selection-on-point ()
+  "Move selected geometry so its bounds center lands on editor point.
 
-      (scad-sketch--edit-with-undo-action
-       (lambda (s)
-         (dolist (record records)
-           (scad-sketch-undo-restore-state-record s record))
-         (setf (scad-sketch-session-point s) (copy-tree old-point))
-         (setf (scad-sketch-session-hover-index s) old-hover)
-         (setf (scad-sketch-session-active-shape-id s) old-active)
-         (when old-active
-           (scad-sketch-session-set-active-shape s old-active)))
+This does not move editor point.  The operation is undoable."
+  (interactive)
+  (let* ((session (scad-sketch--assert-session))
+         (refs    (scad-sketch--move-selected-refs session))
+         (bounds  (scad-sketch--refs-bounds-for-centering session refs)))
+    (unless bounds
+      (user-error "No selected point or shape"))
+    (let* ((center (scad-sketch--bounds-center bounds))
+           (target (scad-sketch-session-point session))
+           (dx     (- (nth 0 target) (nth 0 center)))
+           (dy     (- (nth 1 target) (nth 1 center))))
+      (scad-sketch--move-selected-refs-by
+       refs dx dy nil nil "center selection on point"))))
 
-       (lambda (s)
-         (dolist (ref refs)
-           (scad-sketch--move-ref-geometry s ref dx dy snap))
+(defun scad-sketch-center-selection-on-canvas ()
+  "Move selected geometry so its bounds center lands on the current canvas.
 
-         ;; Existing interaction: selected geometry movement carries point along.
-         (let* ((new (scad-sketch--move-xy
-                      (scad-sketch-session-point s)
-                      dx dy))
-                (new (if snap
-                         (scad-sketch--snap-xy new (scad-sketch--grid s))
-                       new)))
-           (setf (scad-sketch-session-point s) new)
-           (setf (scad-sketch-session-hover-index s) 0))
-
-         (let ((active-id (scad-sketch-session-active-shape-id s)))
-           (when active-id
-             (scad-sketch-session-set-active-shape s active-id))))
-
-       "move selected geometry"))))
+The canvas center is computed in model space from the current render bounds.
+This does not move editor point.  The operation is undoable."
+  (interactive)
+  (let* ((session (scad-sketch--assert-session))
+         (refs    (scad-sketch--move-selected-refs session))
+         (bounds  (scad-sketch--refs-bounds-for-centering session refs)))
+    (unless bounds
+      (user-error "No selected point or shape"))
+    (let* ((center (scad-sketch--bounds-center bounds))
+           (target (scad-sketch--canvas-center-for-moving session))
+           (dx     (- (nth 0 target) (nth 0 center)))
+           (dy     (- (nth 1 target) (nth 1 center))))
+      (scad-sketch--move-selected-refs-by
+       refs dx dy nil nil "center selection on canvas"))))
 
 ;;; Selected-vertex movement interactive commands
 

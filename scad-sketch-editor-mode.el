@@ -56,6 +56,13 @@
     map)
   "Prefix map for scad-sketch grouping/boolean commands.")
 
+(defvar scad-sketch-editor-move-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "c") #'scad-sketch-center-selection-on-canvas)
+    (define-key map (kbd "m") #'scad-sketch-center-selection-on-point)
+    map)
+  "Prefix map for general move utilities in `scad-sketch-editor-mode'.")
+
 (defvar scad-sketch-editor-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
@@ -100,6 +107,7 @@
     ;; ── Prefix maps ─────────────────────────────────────────────────
     (define-key map (kbd "i")           scad-sketch-editor-insert-map)
     (define-key map (kbd "b")           scad-sketch-editor-group-map)
+    (define-key map (kbd "v")           scad-sketch-editor-move-map)
 
     ;; ── Shape/parameter editing ─────────────────────────────────────
     (define-key map (kbd "k")           #'scad-sketch-delete-selected)

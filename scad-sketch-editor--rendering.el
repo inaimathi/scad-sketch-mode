@@ -62,14 +62,31 @@
 (require 'scad-sketch-editor-core)
 
 ;;;; ── Canvas constants ────────────────────────────────────────────────────────
+(defcustom scad-sketch-canvas-window-padding 12
+  "Pixels to subtract from window body size when sizing the sketch canvas.
+
+This small safety margin avoids accidental scrollbars caused by fringe,
+rounding, or display-engine edge cases."
+  :type 'integer
+  :group 'scad-sketch)
 
 (defcustom scad-sketch-canvas-width 900
-  "Sketch editor canvas width in pixels."
-  :type 'integer :group 'scad-sketch)
+  "Fallback sketch editor canvas width in pixels.
+
+When the editor buffer is displayed in a window, `scad-sketch--render'
+dynamically binds this to the current window body width.  This value is used
+when no suitable display window exists, such as in batch tests."
+  :type 'integer
+  :group 'scad-sketch)
 
 (defcustom scad-sketch-canvas-height 650
-  "Sketch editor canvas height in pixels."
-  :type 'integer :group 'scad-sketch)
+  "Fallback sketch editor canvas height in pixels.
+
+When the editor buffer is displayed in a window, `scad-sketch--render'
+dynamically binds this to the current window body height.  This value is used
+when no suitable display window exists, such as in batch tests."
+  :type 'integer
+  :group 'scad-sketch)
 
 (defcustom scad-sketch-margin 48
   "Canvas margin in pixels."
@@ -83,6 +100,54 @@ the sketch session and does not affect write-back or undo.")
 
 (defconst scad-sketch-preview-background-color "#e8e8e8"
   "Solid background color used in clean preview mode.")
+
+;;;; -- Window calculation
+
+(defun scad-sketch--canvas-window ()
+  "Return the window whose size should drive canvas rendering.
+
+Prefer a live window displaying the current editor buffer.  Fall back to the
+selected window for startup paths and batch-safe behavior."
+  (or (get-buffer-window (current-buffer) t)
+      (selected-window)))
+
+(defun scad-sketch--window-body-pixels (&optional window)
+  "Return (WIDTH HEIGHT) body size in pixels for WINDOW.
+
+Falls back through character-cell dimensions when pixel dimensions are not
+available."
+  (let* ((window (or window (scad-sketch--canvas-window)))
+         (frame  (and window (window-live-p window)
+                      (window-frame window))))
+    (if (and window (window-live-p window))
+        (list
+         (or (ignore-errors (window-body-width window t))
+             (* (window-body-width window)
+                (frame-char-width frame)))
+         (or (ignore-errors (window-body-height window t))
+             (* (window-body-height window)
+                (frame-char-height frame))))
+      (list scad-sketch-canvas-width
+            scad-sketch-canvas-height))))
+
+(defun scad-sketch--canvas-size-from-pixels (width height)
+  "Return canvas size (WIDTH HEIGHT) fitted into available pixels.
+
+WIDTH and HEIGHT are window-body pixel dimensions.  If either is missing or
+non-positive, use the fallback canvas customizations."
+  (let* ((pad (max 0 scad-sketch-canvas-window-padding))
+         (w   (if (and width (> width 0))
+                  (max 1 (- width pad))
+                scad-sketch-canvas-width))
+         (h   (if (and height (> height 0))
+                  (max 1 (- height pad))
+                scad-sketch-canvas-height)))
+    (list w h)))
+
+(defun scad-sketch--canvas-size ()
+  "Return the canvas size for the current render pass."
+  (pcase-let ((`(,w ,h) (scad-sketch--window-body-pixels)))
+    (scad-sketch--canvas-size-from-pixels w h)))
 
 ;;;; ── Numeric formatting ─────────────────────────────────────────────────────
 
@@ -1986,45 +2051,54 @@ In preview mode, draw only the clean final semantic tree output."
 
 ;;;; ── Top-level render entry point ───────────────────────────────────────────
 (defun scad-sketch--render ()
-  "Re-render the editor buffer from current session state."
-  (let* ((session   (scad-sketch--assert-session))
-         (preview   (scad-sketch--preview-p))
-         (svg       (svg-create scad-sketch-canvas-width
-                                scad-sketch-canvas-height))
-         (bounds    (scad-sketch--bounds session))
-         (transform (scad-sketch--transform bounds)))
-    ;; Background.
-    ;;
-    ;; Normal editor mode gets a white canvas plus grid.
-    ;; Preview mode gets a solid grid-colored background and no grid lines.
-    (svg-rectangle svg
-                   0 0
-                   scad-sketch-canvas-width
-                   scad-sketch-canvas-height
-                   :fill (if preview
-                             scad-sketch-preview-background-color
-                           "#ffffff"))
+  "Re-render the editor buffer from current session state.
 
-    (unless preview
-      (scad-sketch--draw-grid svg bounds transform session))
+The SVG canvas is sized to the current editor window when possible.  If the
+buffer is not displayed, fall back to `scad-sketch-canvas-width' and
+`scad-sketch-canvas-height'."
+  (let ((session (scad-sketch--assert-session)))
+    (pcase-let ((`(,canvas-width ,canvas-height)
+                 (scad-sketch--canvas-size)))
+      ;; These defcustoms are special variables, so this `let' dynamically
+      ;; rebinds them for the full render pass.  Existing helper functions that
+      ;; use `scad-sketch-canvas-width' / `scad-sketch-canvas-height' therefore
+      ;; automatically see the fitted canvas size.
+      (let ((scad-sketch-canvas-width  canvas-width)
+            (scad-sketch-canvas-height canvas-height))
+        (let* ((preview   (and (fboundp 'scad-sketch--preview-p)
+                               (scad-sketch--preview-p)))
+               (bg        (if preview
+                              (if (boundp 'scad-sketch-preview-background-color)
+                                  scad-sketch-preview-background-color
+                                "#e8e8e8")
+                            "#ffffff"))
+               (svg       (svg-create scad-sketch-canvas-width
+                                      scad-sketch-canvas-height))
+               (bounds    (scad-sketch--bounds session))
+               (transform (scad-sketch--transform bounds)))
+          (svg-rectangle svg
+                         0 0
+                         scad-sketch-canvas-width
+                         scad-sketch-canvas-height
+                         :fill bg)
 
-    ;; Main scene.
-    (scad-sketch--draw-path svg transform session)
+          (unless preview
+            (scad-sketch--draw-grid svg bounds transform session))
 
-    ;; Editor affordances.  Preview mode intentionally omits these.
-    (unless preview
-      (scad-sketch--draw-point-and-marks svg transform session)
-      (scad-sketch--draw-hud svg session))
+          (scad-sketch--draw-path svg transform session)
 
-    ;; Buffer replacement.
-    (let ((inhibit-read-only t))
-      (erase-buffer)
-      (let ((beg (point)))
-        (insert-image (svg-image svg :ascent 'center))
-        (remove-text-properties beg (point) '(keymap nil)))
-      (insert "\n\n")
-      (insert (scad-sketch--emit-content session))
-      (goto-char (point-min)))))
+          (unless preview
+            (scad-sketch--draw-point-and-marks svg transform session)
+            (scad-sketch--draw-hud svg session))
+
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (let ((beg (point)))
+              (insert-image (svg-image svg :ascent 'center))
+              (remove-text-properties beg (point) '(keymap nil)))
+            (insert "\n\n")
+            (insert (scad-sketch--emit-content session))
+            (goto-char (point-min))))))))
 
 (defun scad-sketch--emit-content (session)
   "Return the live source preview string for SESSION."

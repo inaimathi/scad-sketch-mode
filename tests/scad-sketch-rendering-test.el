@@ -325,6 +325,34 @@ allows whitespace around the content."
          "<rect[^>]+fill=\"#ffffff\"[^>]+stroke=\"#0057c2\""
          svg)))))
 
+(ert-deftest srend-canvas-size-from-pixels-uses-window-body-size ()
+  "Canvas sizing uses available window body pixels minus padding."
+  (let ((scad-sketch-canvas-window-padding 12)
+        (scad-sketch-canvas-width 900)
+        (scad-sketch-canvas-height 650))
+    (should (equal (scad-sketch--canvas-size-from-pixels 500 300)
+                   '(488 288)))))
+
+(ert-deftest srend-canvas-size-from-pixels-falls-back-for-invalid-size ()
+  "Canvas sizing falls back to configured values when no valid window size exists."
+  (let ((scad-sketch-canvas-window-padding 12)
+        (scad-sketch-canvas-width 900)
+        (scad-sketch-canvas-height 650))
+    (should (equal (scad-sketch--canvas-size-from-pixels nil nil)
+                   '(900 650)))
+    (should (equal (scad-sketch--canvas-size-from-pixels 0 -1)
+                   '(900 650)))))
+
+(ert-deftest srend-transform-respects-dynamically-bound-canvas-size ()
+  "The coordinate transform should use dynamically bound canvas dimensions."
+  (let ((scad-sketch-canvas-width 400)
+        (scad-sketch-canvas-height 300)
+        (scad-sketch-margin 50))
+    (let* ((tf (scad-sketch--transform '(0 100 0 100)))
+           (p0 (funcall tf '(0 0)))
+           (p1 (funcall tf '(100 100))))
+      (should (equal p0 '(50 250)))
+      (should (equal p1 '(250 50))))))
 
 (provide 'scad-sketch-rendering-test)
 ;;; scad-sketch-rendering-test.el ends here

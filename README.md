@@ -1140,6 +1140,21 @@ The best user experience is one where generated SCAD remains readable enough tha
 
 ## Changelog
 
+### 2026 06 07
+
+* Split undo infrastructure into `scad-sketch-editor--undo.el`, with explicit support for both full session snapshot entries and operation undo entries.
+* Routed selected-geometry movement through operation undo entries, so moving vertices, shapes, and primitive handles can undo the changed objects and cursor state without relying on whole-session snapshots.
+* Split session source emission into `scad-sketch-session--emit.el`, centralizing number/point formatting, shape/tree emission, target indentation, and replacement normalization.
+* Changed emitted point arrays to Lisp-style indentation, for example `pts = [[0, 0], ...];`, instead of bracket-on-its-own-line array formatting.
+* Normalized write-back replacements to avoid inserting accidental trailing newlines or blank lines around edited regions.
+* Fixed write-back indentation when replacing forms that begin after existing line whitespace; emitted continuation alignment is preserved without duplicating indentation on the first line.
+* Made the SVG canvas size window-aware: the editor now sizes the sketch canvas to the current editor window on render, so opening `scad-sketch-mode` in a split or quarter-screen view no longer requires scrolling to see the sketch.
+* Moved initial rendering until after the editor buffer is displayed, allowing canvas sizing to use the actual destination window instead of the source buffer window.
+* Added a `v` move-utilities prefix map. `v c` centers the selected geometry on the current canvas, and `v m` centers the selected geometry on editor point.
+* Routed selection-centering moves through operation undo entries, so `v c` and `v m` undo like normal geometry movement while preserving editor point as the destination reference.
+
+### Previous Changes
+
 ### 2026 06 06
 
 * Added e editor keybinding to toggle polygon point emission between inline points and a local points variable. Inline polygons can now be rewritten as pts = ...; polygon(pts);, and variable-backed polygons can be forced back inline without rewriting the original source array.
@@ -1149,7 +1164,7 @@ The best user experience is one where generated SCAD remains readable enough tha
 * Added parser support for scalar `square(N)`, canonicalized on write-back as `square([N, N])`.
 * Updated undo snapshots to preserve the session dirty flag, so undoable mark changes remain clean while undoing source edits can restore the correct clean/dirty state.
 
-### Previous Changes
+### First Revisions
 
 * Split editor implementation into focused subsystem files: core, cursor, refs, selection, editing, rendering, and mode assembly.
 * Added parser/session support for primitive `circle`, `square`, and `text` nodes.
