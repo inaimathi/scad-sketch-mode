@@ -24,10 +24,8 @@
 
 (declare-function scad-sketch-session--shape-source-name "scad-sketch-session")
 (declare-function scad-sketch-session--shape-points-var-name "scad-sketch-session")
-(declare-function scad-sketch-session--points-have-radii-p "scad-sketch-session")
 
 ;;; Basic formatting
-
 (defun scad-sketch-session--fmt-num (n)
   "Format number N compactly for OpenSCAD output."
   (let ((x (float n)))
@@ -52,6 +50,13 @@ When FORCE-R is non-nil, always emit the radius component."
       (format "[%s, %s]"
               (scad-sketch-session--fmt-num x)
               (scad-sketch-session--fmt-num y)))))
+
+(defun scad-sketch-session--points-have-radii-p (points)
+  "Return non-nil if any point in POINTS has a positive radius component."
+  (cl-some (lambda (p)
+             (and (nth 2 p)
+                  (> (float (nth 2 p)) 0.0)))
+           points))
 
 (defun scad-sketch-session--points-force-r-p (points &optional force-r)
   "Return non-nil if POINTS should be emitted as [x, y, r]."
@@ -335,8 +340,50 @@ When POLYROUND is non-nil, emit polygon(polyRound(..., POLYROUND))."
          (call        (plist-get parts :call)))
     (scad-sketch-session--join-assignment-and-call assignments call)))
 
-;;; Tree emission
+(defun scad-sketch-session--source-target-replacement (session target)
+  "Return replacement source for source TARGET in SESSION."
+  (let* ((target-id (scad-sketch-target-id target))
+         (shape     (cl-find-if
+                     (lambda (sh)
+                       (eq (scad-sketch-shape-source-target-id sh)
+                           target-id))
+                     (scad-sketch-session-shapes session)))
+         (points    (if shape
+                        (scad-sketch-shape-points shape)
+                      (scad-sketch-session-points session)))
+         (polyround (and shape
+                         (scad-sketch-session--effective-polyround-fn shape)))
+         (force-r   (or polyround
+                        (scad-sketch-session--points-have-radii-p points)))
+         (indent    (scad-sketch-session--target-indent target)))
+    (scad-sketch-session--normalize-replacement
+     (scad-sketch-session--emit-points-assignment
+      (scad-sketch-target-name target)
+      points
+      indent
+      force-r))))
 
+(defun scad-sketch-session--root-target-replacement (session target)
+  "Return replacement source for root TARGET in SESSION."
+  (scad-sketch-session-sync-active-shape-from-points session)
+  (let ((indent (scad-sketch-session--target-indent target)))
+    (scad-sketch-session--normalize-replacement
+     (cond
+      ((scad-sketch-session-tree session)
+       (scad-sketch-session--emit-tree
+        session
+        (scad-sketch-session-tree session)
+        indent))
+
+      ((scad-sketch-session-active-shape session)
+       (scad-sketch-session--emit-shape-source
+        session
+        (scad-sketch-session-active-shape session)
+        indent))
+
+      (t "")))))
+
+;;; Tree emission
 (defun scad-sketch-session--emit-tree (session tree indent)
   "Emit SESSION TREE at INDENT."
   (pcase (and tree (plist-get tree :kind))
@@ -386,6 +433,8 @@ When POLYROUND is non-nil, emit polygon(polyRound(..., POLYROUND))."
          (concat indent "  ")))))
 
     (_ "")))
+
+
 
 (provide 'scad-sketch-session--emit)
 ;;; scad-sketch-session--emit.el ends here

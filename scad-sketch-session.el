@@ -351,7 +351,6 @@ are mirrored with the existing mirrored subtree."
      (list tree (scad-sketch-session--tree-shape shape-id))))))
 
 ;;;; Parser node -> editable tree conversion
-
 (defun scad-sketch-session--conversion-shape-id (state)
   "Return the next shape id and advance STATE."
   (let ((n (plist-get state :shape-index)))
@@ -883,26 +882,6 @@ This is a model-level helper.  It does not select or focus the new shape."
     (scad-sketch-session-add-shape-object session shape)))
 
 ;;;; Formatting / emission
-
-(defun scad-sketch-session--points-have-radii-p (points)
-  "Return non-nil if any point in POINTS has a positive radius component."
-  (cl-some (lambda (p)
-             (and (nth 2 p)
-                  (> (float (nth 2 p)) 0.0)))
-           points))
-
-(defun scad-sketch-session--effective-polyround-fn (shape)
-  "Return effective polyRound fn value for polygon SHAPE.
-
-Preserve explicit polyRound values.  If no explicit value exists but the shape
-has positive point radii, use `scad-sketch-default-polyround-fn'."
-  (let ((explicit (scad-sketch-shape-polyround shape)))
-    (or explicit
-        (and (eq (scad-sketch-shape-kind shape) 'polygon)
-             (scad-sketch-session--points-have-radii-p
-              (scad-sketch-shape-points shape))
-             scad-sketch-default-polyround-fn))))
-
 (defun scad-sketch-session-polygon-extracted-p (session shape)
   "Return non-nil if polygon SHAPE currently emits through a variable.
 
@@ -952,10 +931,6 @@ When SHAPE currently emits inline, extract points into NAME, defaulting to
     (scad-sketch-session-set-polygon-extraction
      session shape (or name "pts"))
     'extracted))
-
-(defun scad-sketch-session--any-radius-p (points)
-  "Return non-nil if POINTS contains any non-zero radius."
-  (cl-some (lambda (p) (and (nth 2 p) (> (nth 2 p) 0))) points))
 
 ;;;; Session construction
 (defun scad-sketch-session--shape-initial-point (shape)
@@ -1335,60 +1310,6 @@ When SHAPE is forced inline, ignore any original variable reference."
                             session target-id))))
       (or (plist-get md :source-name)
           (and target (scad-sketch-target-name target))))))
-
-(defun scad-sketch-session--target-indent (target)
-  "Return indentation string for TARGET's beginning marker."
-  (let ((marker (scad-sketch-target-beg-marker target)))
-    (with-current-buffer (marker-buffer marker)
-      (save-excursion
-        (goto-char marker)
-        (beginning-of-line)
-        (if (looking-at "[ \t]*")
-            (match-string-no-properties 0)
-          "")))))
-
-(defun scad-sketch-session--source-target-replacement (session target)
-  "Return replacement source for source TARGET in SESSION."
-  (let* ((target-id (scad-sketch-target-id target))
-         (shape     (cl-find-if
-                     (lambda (sh)
-                       (eq (scad-sketch-shape-source-target-id sh)
-                           target-id))
-                     (scad-sketch-session-shapes session)))
-         (points    (if shape
-                        (scad-sketch-shape-points shape)
-                      (scad-sketch-session-points session)))
-         (polyround (and shape
-                         (scad-sketch-session--effective-polyround-fn shape)))
-         (force-r   (or polyround
-                        (scad-sketch-session--points-have-radii-p points)))
-         (indent    (scad-sketch-session--target-indent target)))
-    (scad-sketch-session--normalize-replacement
-     (scad-sketch-session--emit-points-assignment
-      (scad-sketch-target-name target)
-      points
-      indent
-      force-r))))
-
-(defun scad-sketch-session--root-target-replacement (session target)
-  "Return replacement source for root TARGET in SESSION."
-  (scad-sketch-session-sync-active-shape-from-points session)
-  (let ((indent (scad-sketch-session--target-indent target)))
-    (scad-sketch-session--normalize-replacement
-     (cond
-      ((scad-sketch-session-tree session)
-       (scad-sketch-session--emit-tree
-        session
-        (scad-sketch-session-tree session)
-        indent))
-
-      ((scad-sketch-session-active-shape session)
-       (scad-sketch-session--emit-shape-source
-        session
-        (scad-sketch-session-active-shape session)
-        indent))
-
-      (t "")))))
 
 (defun scad-sketch-session-preview (session)
   "Return canonical OpenSCAD source for SESSION.
