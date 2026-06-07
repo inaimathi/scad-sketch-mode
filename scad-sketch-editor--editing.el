@@ -19,6 +19,7 @@
 (require 'scad-sketch-editor--refs)
 (require 'scad-sketch-editor--selection)
 (require 'scad-sketch-editor--cursor)    ; for --grid/--fine/--coarse
+(require 'scad-sketch-editor--undo)
 
 ;;; Internal helpers
 (defun scad-sketch--parse-axis-pair (s)
@@ -273,89 +274,150 @@ Text:
                 new)))
     (setf (scad-sketch-session-point session) new)))
 
-(defun scad-sketch--move-selected (dx dy &optional snap)
-  "Move selected vertices/shapes/handles by DX, DY.
+(defun scad-sketch--move-selected-refs (session)
+  "Return selected refs that can be moved in SESSION.
 
-Snap to grid when SNAP is non-nil.  Also move the editor cursor point by the
-same delta so selected geometry stays under the cursor after keyboard movement."
-  (scad-sketch--edit
-   (lambda (s)
-     (let ((mirror-locs (scad-sketch--selected-mirror-locs s))
-           (shape-ids   (scad-sketch--selected-shape-ids s))
-           (locs        (scad-sketch--selected-point-locs s nil))
-           (moved       nil))
+If there is no explicit movable selection, fall back to the active shape."
+  (let ((refs
+         (cl-remove-if-not
+          (lambda (ref)
+            (memq (scad-sketch--ref-kind ref) '(shape point)))
+          (scad-sketch-session-selection session))))
+    (cond
+     (refs refs)
 
+     ((scad-sketch-session-active-shape-id session)
+      (list (scad-sketch--shape-ref
+             (scad-sketch-session-active-shape-id session))))
+
+     (t nil))))
+
+(defun scad-sketch--move-undo-records-for-refs (session refs)
+  "Return shape-state undo records for movable REFS in SESSION.
+
+A point ref mutates its parent shape, even when it is a primitive handle, so the
+undo record captures the parent shape state."
+  (let (shape-ids)
+    (dolist (ref refs)
+      (pcase (scad-sketch--ref-kind ref)
+        ('shape
+         (push (scad-sketch--ref-shape-id ref) shape-ids))
+        ('point
+         (push (scad-sketch--ref-shape-id ref) shape-ids))))
+    (setq shape-ids (delete-dups (delq nil (nreverse shape-ids))))
+    (delq nil
+          (mapcar (lambda (shape-id)
+                    (scad-sketch-undo-capture-shape-state
+                     session shape-id))
+                  shape-ids))))
+
+(defun scad-sketch--move-ref-geometry (session ref dx dy &optional snap)
+  "Move geometry identified by REF in SESSION by DX DY.
+
+Shape refs move whole shapes.  Polygon point refs move one polygon vertex.
+Primitive point refs move the corresponding primitive handle."
+  (pcase (scad-sketch--ref-kind ref)
+    ('shape
+     (let ((shape (scad-sketch-session-shape-by-id
+                   session
+                   (scad-sketch--ref-shape-id ref))))
+       (when shape
+         (scad-sketch--move-shape shape dx dy snap
+                                  (scad-sketch--grid session)))))
+
+    ('point
+     (let* ((shape-id (scad-sketch--ref-shape-id ref))
+            (idx      (scad-sketch--ref-index ref))
+            (shape    (and shape-id
+                            (scad-sketch-session-shape-by-id
+                             session shape-id))))
+       (unless shape
+         (user-error "No shape for point ref: %S" ref))
        (cond
-        (mirror-locs
-         (dolist (loc mirror-locs)
-           (let* ((mirror-id (car loc))
-                  (idx       (cdr loc))
-                  (mirror    (scad-sketch-session--tree-find-mirror
-                              (scad-sketch-session-tree s)
-                              mirror-id))
-                  (old-xy    (and mirror
-                                  (scad-sketch--mirror-handle-xy
-                                   s mirror idx)))
-                  (new-xy    (and old-xy
-                                  (scad-sketch--move-xy old-xy dx dy)))
-                  (snapped   (and new-xy
-                                  (if snap
-                                      (scad-sketch--snap-xy
-                                       new-xy (scad-sketch--grid s))
-                                    new-xy))))
-             (unless mirror
-               (user-error "No such mirror: %s" mirror-id))
-             (scad-sketch--move-mirror-handle-to s mirror-id idx snapped)
-             (setq moved t))))
+        ;; Real polygon vertex.
+        ((eq (scad-sketch-shape-kind shape) 'polygon)
+         (let* ((points (scad-sketch-shape-points shape))
+                (old    (and points (nth idx points))))
+           (unless old
+             (user-error "No polygon point for ref: %S" ref))
+           (let* ((new-xy  (scad-sketch--move-xy
+                            (scad-sketch--point-xy old) dx dy))
+                  (snapped (if snap
+                               (scad-sketch--snap-xy
+                                new-xy
+                                (scad-sketch--grid session))
+                             new-xy))
+                  (new     (scad-sketch--make-model-point snapped old)))
+             (setf (scad-sketch-shape-points shape)
+                   (scad-sketch--replace-nth idx new points)))))
 
-        (shape-ids
-         (dolist (shape-id shape-ids)
-           (let ((shape (scad-sketch-session-shape-by-id s shape-id)))
-             (when shape
-               (scad-sketch--move-shape shape dx dy snap
-                                        (scad-sketch--grid s))
-               (setq moved t)))))
-
-        (locs
-         (dolist (loc locs)
-           (let* ((shape-id (car loc))
-                  (idx      (cdr loc))
-                  (shape    (scad-sketch-session-shape-by-id s shape-id)))
-             (pcase (and shape (scad-sketch-shape-kind shape))
-               ('polygon
-                (let* ((points   (scad-sketch-shape-points shape))
-                       (old      (nth idx points))
-                       (new-xy   (scad-sketch--move-xy
-                                  (scad-sketch--point-xy old) dx dy))
-                       (snapped  (if snap
-                                     (scad-sketch--snap-xy
-                                      new-xy (scad-sketch--grid s))
-                                   new-xy))
-                       (new      (scad-sketch--make-model-point snapped old)))
-                  (setf (scad-sketch-shape-points shape)
-                        (scad-sketch--replace-nth idx new points))
-                  (setq moved t)))
-
-               ((or 'circle 'square 'text)
-                (let* ((old-xy  (scad-sketch--primitive-handle-xy shape idx))
-                       (new-xy  (scad-sketch--move-xy old-xy dx dy))
-                       (snapped (if snap
-                                    (scad-sketch--snap-xy
-                                     new-xy (scad-sketch--grid s))
-                                  new-xy)))
-                  (scad-sketch--move-primitive-handle-to shape idx snapped)
-                  (setq moved t)))))))
-
+        ;; Primitive handle represented as a point ref.
         (t
-         (let ((shape (scad-sketch-session-active-shape s)))
-           (unless shape (user-error "No selected point, shape, or mirror handle"))
-           (scad-sketch--move-shape shape dx dy snap
-                                    (scad-sketch--grid s))
-           (setq moved t))))
+         (unless (and (fboundp 'scad-sketch--primitive-handle-count)
+                      (fboundp 'scad-sketch--primitive-handle-xy)
+                      (fboundp 'scad-sketch--move-primitive-handle-to))
+           (user-error "Primitive handle helpers are not loaded"))
+         (unless (and idx
+                      (>= idx 0)
+                      (< idx (scad-sketch--primitive-handle-count shape)))
+           (user-error "No primitive handle for ref: %S" ref))
+         (let* ((old-xy (scad-sketch--primitive-handle-xy shape idx))
+                (new-xy (scad-sketch--move-xy old-xy dx dy))
+                (new-xy (if snap
+                            (scad-sketch--snap-xy
+                             new-xy
+                             (scad-sketch--grid session))
+                          new-xy)))
+           (scad-sketch--move-primitive-handle-to shape idx new-xy))))))))
 
-       (when moved
-         (scad-sketch--move-session-point-by s dx dy snap)
-         (setf (scad-sketch-session-hover-index s) 0))))))
+(defun scad-sketch--move-selected (dx dy &optional snap)
+  "Move selected vertices/shapes by DX, DY.  Snap to grid when SNAP is non-nil.
+
+Falls back to the active shape when no explicit selection exists.
+
+Movement uses an operation undo entry.  Undo restores the parent shapes changed
+by the move and the editor cursor state."
+  (let ((session (scad-sketch--assert-session)))
+    (scad-sketch-session-sync-active-shape-from-points session)
+    (let* ((refs       (scad-sketch--move-selected-refs session))
+           (records    (and refs
+                            (scad-sketch--move-undo-records-for-refs
+                             session refs)))
+           (old-point  (copy-tree (scad-sketch-session-point session)))
+           (old-hover  (scad-sketch-session-hover-index session))
+           (old-active (scad-sketch-session-active-shape-id session)))
+      (unless records
+        (user-error "No selected point or shape"))
+
+      (scad-sketch--edit-with-undo-action
+       (lambda (s)
+         (dolist (record records)
+           (scad-sketch-undo-restore-state-record s record))
+         (setf (scad-sketch-session-point s) (copy-tree old-point))
+         (setf (scad-sketch-session-hover-index s) old-hover)
+         (setf (scad-sketch-session-active-shape-id s) old-active)
+         (when old-active
+           (scad-sketch-session-set-active-shape s old-active)))
+
+       (lambda (s)
+         (dolist (ref refs)
+           (scad-sketch--move-ref-geometry s ref dx dy snap))
+
+         ;; Existing interaction: selected geometry movement carries point along.
+         (let* ((new (scad-sketch--move-xy
+                      (scad-sketch-session-point s)
+                      dx dy))
+                (new (if snap
+                         (scad-sketch--snap-xy new (scad-sketch--grid s))
+                       new)))
+           (setf (scad-sketch-session-point s) new)
+           (setf (scad-sketch-session-hover-index s) 0))
+
+         (let ((active-id (scad-sketch-session-active-shape-id s)))
+           (when active-id
+             (scad-sketch-session-set-active-shape s active-id))))
+
+       "move selected geometry"))))
 
 ;;; Selected-vertex movement interactive commands
 
@@ -1330,50 +1392,6 @@ source geometry."
        (lambda (s)
          (setf (scad-sketch-session-selection s) nil)
          (setf (scad-sketch-session-hover-index s) 0))))))
-
-;;; Undo restore command
-(defun scad-sketch-undo ()
-  "Undo the most recent editor mutation."
-  (interactive)
-  (let ((session (scad-sketch--assert-session)))
-    (unless (scad-sketch-session-undo-stack session)
-      (user-error "No undo history"))
-    (let ((snap (pop (scad-sketch-session-undo-stack session))))
-      (setf (scad-sketch-session-points session)
-            (copy-tree (plist-get snap :points)))
-      (setf (scad-sketch-session-point session)
-            (copy-tree (plist-get snap :point)))
-      (setf (scad-sketch-session-marks session)
-            (copy-tree (plist-get snap :marks)))
-      (setf (scad-sketch-session-named-marks session)
-            (copy-tree (plist-get snap :named-marks)))
-      (setf (scad-sketch-session-selected-index session)
-            (plist-get snap :selected-index))
-      (setf (scad-sketch-session-closed session)
-            (plist-get snap :closed))
-      (setf (scad-sketch-session-shapes session)
-            (copy-tree (plist-get snap :shapes)))
-      (setf (scad-sketch-session-active-shape-id session)
-            (plist-get snap :active-shape-id))
-      (setf (scad-sketch-session-targets session)
-            (copy-tree (plist-get snap :targets)))
-      (setf (scad-sketch-session-root-target-id session)
-            (plist-get snap :root-target-id))
-      (setf (scad-sketch-session-selection session)
-            (copy-tree (plist-get snap :selection)))
-      (setf (scad-sketch-session-focus-ref session)
-            (copy-tree (plist-get snap :focus-ref)))
-      (when (plist-member snap :tree)
-        (setf (scad-sketch-session-tree session)
-              (copy-tree (plist-get snap :tree))))
-      ;; Older snapshots may not have :dirty.  Treat those as dirty because
-      ;; they were created before clean undo snapshots existed.
-      (setf (scad-sketch-session-dirty session)
-            (if (plist-member snap :dirty)
-                (plist-get snap :dirty)
-              t))
-      (scad-sketch--normalize-attention session)
-      (scad-sketch--render))))
 
 (provide 'scad-sketch-editor--editing)
 ;;; scad-sketch-editor--editing.el ends here

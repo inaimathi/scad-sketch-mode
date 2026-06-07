@@ -20,6 +20,7 @@
 (require 'scad-sketch-editor--refs)
 (require 'scad-sketch-editor--selection)
 (require 'scad-sketch-editor-core)
+(require 'scad-sketch-editor--undo)
 (require 'scad-sketch-editor--cursor)
 (require 'scad-sketch-editor--editing)
 (require 'scad-sketch-editor--rendering)

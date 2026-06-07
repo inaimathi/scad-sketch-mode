@@ -15,6 +15,7 @@
 (require 'scad-sketch-session)
 (require 'scad-sketch-geometry)
 (require 'scad-sketch-editor-core)
+(require 'scad-sketch-editor--undo)
 
 ;;; Step accessors
 

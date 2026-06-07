@@ -27,37 +27,12 @@
 (defvar scad-sketch--editor-buffer-prefix "*scad-sketch: ")
 
 ;;; Session guard
-
 (defun scad-sketch--assert-session ()
   "Return the buffer-local session or signal an error."
   (unless (boundp 'scad-sketch--session)
     (error "No scad-sketch session in this buffer"))
   (or scad-sketch--session
       (error "No scad-sketch session in this buffer")))
-
-;;; Undo primitives
-(defun scad-sketch--push-undo (session)
-  "Push a full snapshot of SESSION state onto the undo stack."
-  (scad-sketch-session-sync-active-shape-from-points session)
-  (push (list :points          (copy-tree (scad-sketch-session-points session))
-              :point           (copy-tree (scad-sketch-session-point  session))
-              :marks           (copy-tree (scad-sketch-session-marks  session))
-              :named-marks     (copy-tree (scad-sketch-session-named-marks session))
-              :selected-index  (scad-sketch-session-selected-index session)
-              :closed          (scad-sketch-session-closed session)
-              :shapes          (copy-tree (scad-sketch-session-shapes session))
-              :active-shape-id (scad-sketch-session-active-shape-id session)
-              :targets         (copy-tree (scad-sketch-session-targets session))
-              :root-target-id  (scad-sketch-session-root-target-id session)
-              :selection       (copy-tree (scad-sketch-session-selection session))
-              :focus-ref       (copy-tree (scad-sketch-session-focus-ref session))
-              :tree            (copy-tree (scad-sketch-session-tree session))
-              :dirty           (scad-sketch-session-dirty session))
-        (scad-sketch-session-undo-stack session)))
-
-(defun scad-sketch--mark-dirty (session)
-  "Mark SESSION as having unsaved edits."
-  (setf (scad-sketch-session-dirty session) t))
 
 ;;; Change dispatch
 

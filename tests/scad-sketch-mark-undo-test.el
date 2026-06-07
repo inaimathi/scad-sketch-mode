@@ -38,6 +38,7 @@
 (smark-test--load "scad-sketch-editor--refs.el"       'scad-sketch-editor--refs)
 (smark-test--load "scad-sketch-editor--selection.el"  'scad-sketch-editor--selection)
 (smark-test--load "scad-sketch-editor-core.el"        'scad-sketch-editor-core)
+(smark-test--load "scad-sketch-editor--undo.el"       'scad-sketch-editor--undo)
 (smark-test--load "scad-sketch-editor--cursor.el"     'scad-sketch-editor--cursor)
 (smark-test--load "scad-sketch-editor--editing.el"    'scad-sketch-editor--editing)
 
