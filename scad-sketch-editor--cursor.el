@@ -24,16 +24,21 @@
 (defun scad-sketch--coarse (s) (float (scad-sketch-session-coarse-step s)))
 
 ;;; Primitive cursor movement
-
 (defun scad-sketch--move-point (dx dy &optional snap)
-  "Move cursor by DX, DY.  When SNAP is non-nil, snap to grid.
+  "Move cursor by DX, DY.  When SNAP is non-nil, snap moved axes to grid.
 
-This is a clean operation: moving the editor cursor does not dirty source."
+This is a clean operation: moving the editor cursor does not dirty source.
+Snapping only applies to the axes that actually moved."
   (scad-sketch--clean-change
    (lambda (s)
-     (let ((new (scad-sketch--move-xy (scad-sketch-session-point s) dx dy)))
-       (setf (scad-sketch-session-point s)
-             (if snap (scad-sketch--snap-xy new (scad-sketch--grid s)) new))
+     (let* ((old   (scad-sketch-session-point s))
+            (delta (scad-sketch--effective-move-delta
+                    old dx dy (scad-sketch--grid s) snap))
+            (new   (scad-sketch--move-xy
+                    old
+                    (nth 0 delta)
+                    (nth 1 delta))))
+       (setf (scad-sketch-session-point s) new)
        (setf (scad-sketch-session-hover-index s) 0)))))
 
 ;;; Cursor movement interactive commands

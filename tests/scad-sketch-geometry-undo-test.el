@@ -243,5 +243,58 @@
                      '(7.0 8.0)))
       (should-not (scad-sketch-session-dirty session)))))
 
+(ert-deftest sgeom-moving-off-grid-selected-shape-up-preserves-x ()
+  "Moving an off-grid selected shape vertically snaps only Y, preserving X."
+  (sgeom-test--with-editor-session
+      "polygon([[0.5,0.5], [10.5,0.5], [10.5,10.5], [0.5,10.5]]);\n"
+      "polygon"
+    (let* ((shape    (sgeom-test--active-shape session))
+           (shape-id (scad-sketch-shape-id shape)))
+      (sgeom-test--select-ref session (scad-sketch--shape-ref shape-id))
+      (sgeom-test--set-point session '(0.5 0.5))
+
+      (scad-sketch-move-selected-up)
+
+      (let ((points (sgeom-test--active-points session)))
+        (should (equal (mapcar #'car points)
+                       '(0.5 10.5 10.5 0.5)))
+        ;; Existing point y=0.5, move up by 1 -> 1.5, snap moved axis to 2.
+        ;; Actual movement is therefore +1.5.
+        (should (equal (mapcar #'cadr points)
+                       '(2.0 2.0 12.0 12.0))))
+
+      (scad-sketch-undo)
+
+      (should (equal (sgeom-test--active-points session)
+                     '((0.5 0.5 0.0)
+                       (10.5 0.5 0.0)
+                       (10.5 10.5 0.0)
+                       (0.5 10.5 0.0)))))))
+
+(ert-deftest sgeom-moving-off-grid-selected-point-up-preserves-x ()
+  "Moving an off-grid selected point vertically snaps only Y, preserving X."
+  (sgeom-test--with-editor-session
+      "polygon([[0.5,0.5], [10,0], [0,10]]);\n"
+      "polygon"
+    (let* ((shape    (sgeom-test--active-shape session))
+           (shape-id (scad-sketch-shape-id shape)))
+      (sgeom-test--select-ref session (scad-sketch--point-ref 0 shape-id))
+      (sgeom-test--set-point session '(0.5 0.5))
+
+      (scad-sketch-move-selected-up)
+
+      (let ((points (sgeom-test--active-points session)))
+        (should (equal (car points) '(0.5 2.0 0.0)))
+        (should (equal (cdr points)
+                       '((10.0 0.0 0.0)
+                         (0.0 10.0 0.0)))))
+
+      (scad-sketch-undo)
+
+      (should (equal (sgeom-test--active-points session)
+                     '((0.5 0.5 0.0)
+                       (10.0 0.0 0.0)
+                       (0.0 10.0 0.0)))))))
+
 (provide 'scad-sketch-geometry-undo-test)
 ;;; scad-sketch-geometry-undo-test.el ends here

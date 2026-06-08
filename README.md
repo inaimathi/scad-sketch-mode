@@ -1152,6 +1152,8 @@ The best user experience is one where generated SCAD remains readable enough tha
 * Moved initial rendering until after the editor buffer is displayed, allowing canvas sizing to use the actual destination window instead of the source buffer window.
 * Added a `v` move-utilities prefix map. `v c` centers the selected geometry on the current canvas, and `v m` centers the selected geometry on editor point.
 * Routed selection-centering moves through operation undo entries, so `v c` and `v m` undo like normal geometry movement while preserving editor point as the destination reference.
+* Bugfix: `i i` point insertion so it inserts after the explicitly selected polygon/array point instead of falling back to append-like behavior; the newly inserted point becomes selected.
+* Bugfix: snapped movement to snaps only the axes being moved, so off-grid points and shapes no longer jump sideways during vertical moves or vertically during horizontal moves.
 
 ### Previous Changes
 

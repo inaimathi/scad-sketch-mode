@@ -46,6 +46,33 @@ Preserves radius from OLD-POINT if provided."
   "Round V to the nearest multiple of GRID."
   (* grid (round (/ v grid))))
 
+(defun scad-sketch--snap-moved-axes (old new dx dy grid)
+  "Snap NEW to GRID only along axes moved by DX/DY.
+
+OLD and NEW are points.  If DX is zero, preserve NEW's X coordinate.  If DY is
+zero, preserve NEW's Y coordinate.  This prevents grid movement from dragging
+off-grid geometry sideways when moving vertically, or vertically when moving
+horizontally."
+  (let ((snapped (scad-sketch--snap-xy new grid)))
+    (list (if (and dx (not (zerop (float dx))))
+              (nth 0 snapped)
+            (nth 0 new))
+          (if (and dy (not (zerop (float dy))))
+              (nth 1 snapped)
+            (nth 1 new)))))
+
+(defun scad-sketch--effective-move-delta (anchor dx dy grid &optional snap)
+  "Return actual movement delta from ANCHOR by DX/DY.
+
+When SNAP is non-nil, snap only the axes being moved.  The returned value is a
+list (ACTUAL-DX ACTUAL-DY)."
+  (let* ((new (scad-sketch--move-xy anchor dx dy))
+         (dst (if snap
+                  (scad-sketch--snap-moved-axes anchor new dx dy grid)
+                new)))
+    (list (- (nth 0 dst) (nth 0 anchor))
+          (- (nth 1 dst) (nth 1 anchor)))))
+
 (defun scad-sketch--snap-xy (xy grid)
   "Snap both coordinates of XY to GRID."
   (list (scad-sketch--snap-to-grid (nth 0 xy) grid)

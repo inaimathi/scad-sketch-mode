@@ -300,8 +300,11 @@ editable shape bounds."
     (refs dx dy &optional snap move-cursor description)
   "Move selected REFS by DX DY.
 
-When SNAP is non-nil, snap movement targets to the current grid.  When
-MOVE-CURSOR is non-nil, carry editor point along with the moved geometry.
+When SNAP is non-nil, snap only the axes being moved, using editor point as the
+movement anchor.  This keeps off-grid geometry from being pulled sideways during
+vertical moves or vertically during horizontal moves.
+
+When MOVE-CURSOR is non-nil, carry editor point along with the moved geometry.
 
 This uses operation undo entries.  Undo restores the changed shapes and the
 previous cursor state."
@@ -312,11 +315,15 @@ previous cursor state."
                              session refs)))
            (old-point  (copy-tree (scad-sketch-session-point session)))
            (old-hover  (scad-sketch-session-hover-index session))
-           (old-active (scad-sketch-session-active-shape-id session)))
+           (old-active (scad-sketch-session-active-shape-id session))
+           (delta      (scad-sketch--effective-move-delta
+                        old-point dx dy (scad-sketch--grid session) snap))
+           (actual-dx  (nth 0 delta))
+           (actual-dy  (nth 1 delta)))
       (unless records
         (user-error "No selected point or shape"))
 
-      (if (scad-sketch--zero-delta-p dx dy)
+      (if (scad-sketch--zero-delta-p actual-dx actual-dy)
           (message "Selection is already centered")
         (scad-sketch--edit-with-undo-action
          (lambda (s)
@@ -330,16 +337,14 @@ previous cursor state."
 
          (lambda (s)
            (dolist (ref refs)
-             (scad-sketch--move-ref-geometry s ref dx dy snap))
+             (scad-sketch--move-ref-geometry
+              s ref actual-dx actual-dy nil))
 
            (when move-cursor
-             (let* ((new (scad-sketch--move-xy
-                          (scad-sketch-session-point s)
-                          dx dy))
-                    (new (if snap
-                             (scad-sketch--snap-xy new (scad-sketch--grid s))
-                           new)))
-               (setf (scad-sketch-session-point s) new)))
+             (setf (scad-sketch-session-point s)
+                   (scad-sketch--move-xy
+                    (scad-sketch-session-point s)
+                    actual-dx actual-dy)))
 
            (setf (scad-sketch-session-hover-index s) 0)
 
@@ -512,18 +517,21 @@ undo record captures the parent shape state."
                      session shape-id))
                   shape-ids))))
 
-(defun scad-sketch--move-ref-geometry (session ref dx dy &optional snap)
+(defun scad-sketch--move-ref-geometry (session ref dx dy &optional _snap)
   "Move geometry identified by REF in SESSION by DX DY.
 
 Shape refs move whole shapes.  Polygon point refs move one polygon vertex.
-Primitive point refs move the corresponding primitive handle."
+Primitive point refs move the corresponding primitive handle.
+
+DX/DY are already the effective movement delta; snapping is handled by the
+caller so all selected geometry moves rigidly together."
   (pcase (scad-sketch--ref-kind ref)
     ('shape
      (let ((shape (scad-sketch-session-shape-by-id
                    session
                    (scad-sketch--ref-shape-id ref))))
        (when shape
-         (scad-sketch--move-shape shape dx dy snap
+         (scad-sketch--move-shape shape dx dy nil
                                   (scad-sketch--grid session)))))
 
     ('point
@@ -535,24 +543,18 @@ Primitive point refs move the corresponding primitive handle."
        (unless shape
          (user-error "No shape for point ref: %S" ref))
        (cond
-        ;; Real polygon vertex.
         ((eq (scad-sketch-shape-kind shape) 'polygon)
          (let* ((points (scad-sketch-shape-points shape))
                 (old    (and points (nth idx points))))
            (unless old
              (user-error "No polygon point for ref: %S" ref))
-           (let* ((new-xy  (scad-sketch--move-xy
-                            (scad-sketch--point-xy old) dx dy))
-                  (snapped (if snap
-                               (scad-sketch--snap-xy
-                                new-xy
-                                (scad-sketch--grid session))
-                             new-xy))
-                  (new     (scad-sketch--make-model-point snapped old)))
+           (let* ((new-xy (scad-sketch--move-xy
+                           (scad-sketch--point-xy old)
+                           dx dy))
+                  (new    (scad-sketch--make-model-point new-xy old)))
              (setf (scad-sketch-shape-points shape)
                    (scad-sketch--replace-nth idx new points)))))
 
-        ;; Primitive handle represented as a point ref.
         (t
          (unless (and (fboundp 'scad-sketch--primitive-handle-count)
                       (fboundp 'scad-sketch--primitive-handle-xy)
@@ -563,12 +565,7 @@ Primitive point refs move the corresponding primitive handle."
                       (< idx (scad-sketch--primitive-handle-count shape)))
            (user-error "No primitive handle for ref: %S" ref))
          (let* ((old-xy (scad-sketch--primitive-handle-xy shape idx))
-                (new-xy (scad-sketch--move-xy old-xy dx dy))
-                (new-xy (if snap
-                            (scad-sketch--snap-xy
-                             new-xy
-                             (scad-sketch--grid session))
-                          new-xy)))
+                (new-xy (scad-sketch--move-xy old-xy dx dy)))
            (scad-sketch--move-primitive-handle-to shape idx new-xy))))))))
 
 (defun scad-sketch--move-selected (dx dy &optional snap)
@@ -689,32 +686,45 @@ This does not move editor point.  The operation is undoable."
       s (scad-sketch--make-model-point (scad-sketch-session-point s))))))
 
 (defun scad-sketch-insert-point-after-selected ()
-  "Insert points after the selected vertex in the active shape.
+  "Insert point/marks after the selected polygon point.
 
-With marks set, inserts each mark (oldest first) then the cursor.
-Without marks, inserts only the cursor."
+If marks are set, insert marks oldest-first, then current cursor point.  The new
+last inserted point becomes selected.  This works for direct arrays, polygons,
+and line-like polygon shapes."
   (interactive)
   (scad-sketch--edit
    (lambda (s)
-     (let* ((shape     (scad-sketch-session-active-shape s))
-            (shape-id  (scad-sketch-shape-id shape))
-            (idx       (or (scad-sketch-session-selected-index s) -1))
-            (points    (scad-sketch-shape-points shape))
-            (insert-at (min (1+ idx) (length points)))
-            (mark-pts  (mapcar (lambda (m) (scad-sketch--make-model-point m))
-                                (reverse (scad-sketch-session-marks s))))
-            (cursor-pt (scad-sketch--make-model-point
-                        (scad-sketch-session-point s)))
-            (new-pts   (append mark-pts (list cursor-pt)))
-            (new-idx   (+ insert-at (length new-pts) -1)))
+     (scad-sketch-session-sync-active-shape-from-points s)
+     (let* ((target-ref (scad-sketch--insert-after-target-ref s))
+            (shape-id   (scad-sketch--ref-shape-id target-ref))
+            (idx        (scad-sketch--ref-index target-ref))
+            (shape      (scad-sketch-session-shape-by-id s shape-id))
+            (points     (scad-sketch-shape-points shape))
+            (insert-xy  (append
+                         ;; marks are a stack; oldest-first is reverse order
+                         (reverse (copy-tree (scad-sketch-session-marks s)))
+                         (list (copy-sequence
+                                (scad-sketch-session-point s)))))
+            (insert-pts (mapcar #'scad-sketch--model-point-from-xy
+                                insert-xy))
+            (insert-at  (1+ idx))
+            (new-index  (+ idx (length insert-pts))))
+       (unless shape
+         (user-error "No polygon shape for selected point"))
+       (unless insert-pts
+         (user-error "No point to insert"))
+
        (setf (scad-sketch-shape-points shape)
              (append (cl-subseq points 0 insert-at)
-                     new-pts
+                     insert-pts
                      (nthcdr insert-at points)))
+
        (scad-sketch-session-set-active-shape s shape-id)
-       (setf (scad-sketch-session-selected-index s) new-idx)
+       (setf (scad-sketch-session-selected-index s) new-index)
        (setf (scad-sketch-session-focus-ref s)
-             (scad-sketch--point-ref new-idx shape-id))))))
+             (scad-sketch--point-ref new-index shape-id))
+       (setf (scad-sketch-session-selection s)
+             (list (scad-sketch--point-ref new-index shape-id)))))))
 
 (defun scad-sketch-delete-selected ()
   "Delete selected vertices.
@@ -764,6 +774,65 @@ active point when no explicit selection exists."
                     (car (scad-sketch-session-points s)))))))))))
 
 ;;; Shape-creation commands
+(defun scad-sketch--polygon-point-ref-p (session ref)
+  "Return non-nil if REF is a polygon point ref in SESSION."
+  (and ref
+       (eq (scad-sketch--ref-kind ref) 'point)
+       (let ((shape (scad-sketch-session-shape-by-id
+                     session
+                     (scad-sketch--ref-shape-id ref))))
+         (and shape
+              (eq (scad-sketch-shape-kind shape) 'polygon)
+              (let ((idx (scad-sketch--ref-index ref)))
+                (and idx
+                     (>= idx 0)
+                     (< idx (length (scad-sketch-shape-points shape)))))))))
+
+(defun scad-sketch--selected-polygon-point-refs (session)
+  "Return explicitly selected polygon point refs in SESSION."
+  (cl-remove-if-not
+   (lambda (ref)
+     (scad-sketch--polygon-point-ref-p session ref))
+   (scad-sketch-session-selection session)))
+
+(defun scad-sketch--insert-after-target-ref (session)
+  "Return polygon point ref after which insertion should occur.
+
+Priority:
+  1. exactly one explicitly selected polygon point
+  2. current attention, if it is a polygon point
+  3. active polygon's selected-index"
+  (let ((selected (scad-sketch--selected-polygon-point-refs session)))
+    (cond
+     ((= (length selected) 1)
+      (car selected))
+
+     ((> (length selected) 1)
+      (user-error "Select exactly one polygon point to insert after"))
+
+     ((scad-sketch--polygon-point-ref-p
+       session
+       (scad-sketch--attention-ref session))
+      (scad-sketch--attention-ref session))
+
+     ((and (scad-sketch-session-active-shape-id session)
+           (scad-sketch-session-selected-index session))
+      (let* ((shape-id (scad-sketch-session-active-shape-id session))
+             (idx      (scad-sketch-session-selected-index session))
+             (ref      (scad-sketch--point-ref idx shape-id)))
+        (if (scad-sketch--polygon-point-ref-p session ref)
+            ref
+          (user-error "No selected polygon point"))))
+
+     (t
+      (user-error "No selected polygon point")))))
+
+(defun scad-sketch--model-point-from-xy (xy)
+  "Return model point from XY with default zero radius."
+  (list (float (nth 0 xy))
+        (float (nth 1 xy))
+        0.0))
+
 (defun scad-sketch--marks-oldest-first (session)
   "Return SESSION marks in geometry order, oldest first."
   (reverse (scad-sketch-session-marks session)))
