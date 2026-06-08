@@ -49,7 +49,11 @@
   (goto-char (+ (match-beginning 0) (or offset 0))))
 
 (defmacro sinsert-test--with-editor-session (source needle &rest body)
-  "Create a session from SOURCE at NEEDLE and run BODY in fake editor buffer."
+  "Create a session from SOURCE at NEEDLE and run BODY in fake editor buffer.
+
+Within BODY, `session' is bound and `scad-sketch--session' is buffer-local.
+Rendering is stubbed because these tests exercise insertion/editing behavior,
+not SVG image display support."
   (declare (indent 2))
   `(with-temp-buffer
      (insert ,source)
@@ -57,7 +61,9 @@
      (let ((session (scad-sketch-session-at-point)))
        (with-temp-buffer
          (setq-local scad-sketch--session session)
-         ,@body))))
+         (cl-letf (((symbol-function 'scad-sketch--render)
+                    (lambda () nil)))
+           ,@body)))))
 
 (defun sinsert-test--active-shape (session)
   "Return SESSION's active shape."
